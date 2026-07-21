@@ -1,0 +1,168 @@
+{
+  "paths": {
+    "input_dir": "data/07-10",
+    "output_dir": "outputs/07-10"
+  },
+  "files": {
+    "data_pattern": "Run*[Ll]ist.dat",
+    "recursive": false
+  },
+  "runs": {
+    "include": [],
+    "overwrite": []
+  },
+  "tasks": {
+    "streaming_pulse_decode": {
+      "enabled": true,
+      "overwrite": false
+    },
+    "candidate_preprocessing": {
+      "enabled": true,
+      "overwrite": false
+    },
+    "energy_selection": {
+      "enabled": true,
+      "overwrite": false
+    },
+    "matching_training": {
+      "enabled": true,
+      "overwrite": false
+    },
+    "matching_model": {
+      "enabled": true,
+      "overwrite": false
+    },
+    "preprocessing": {
+      "enabled": true,
+      "overwrite": false
+    },
+    "selection": {
+      "enabled": true,
+      "overwrite": false
+    },
+    "fit": {
+      "enabled": true,
+      "overwrite": false
+    }
+  },
+  "channels": {
+    "signal_a": 1,
+    "time_a": 3,
+    "signal_b": 5,
+    "time_b": 7
+  },
+  "preprocessing": {
+    "streaming_physical_time": {
+      "enabled": true,
+      "require_same_board": true,
+      "energy_leading_pair_window_ns": 5.0
+    },
+    "pulse_reconstruction": {
+      "deduplicate_exact_edges": true,
+      "minimum_tot_ns": 0.0,
+      "maximum_energy_tot_ns": 200.0,
+      "tot_lead_match_tolerance_ns": 0.05,
+      "fallback_when_tot_missing": true,
+      "fallback_when_tot_inconsistent": false
+    }
+  },
+  "peak_selection": {
+    "min_events": 50,
+    "kde_grid_points": 4096,
+    "kde_bandwidth_factor": 0.35,
+    "min_peak_height_fraction": 0.12,
+    "peak_choice": "rightmost_significant",
+    "left_sigma_multiplier": 2.5,
+    "right_sigma_multiplier": 4.0,
+    "minimum_events_in_interval": 5
+  },
+  "alignment_filter": {
+    "enabled": true,
+    "method": "robust_mad",
+    "z_threshold": 5.0,
+    "minimum_scale_lsb": 2.0,
+    "minimum_events": 20
+  },
+  "fit": {
+    "min_events": 20,
+    "min_histogram_bins": 8,
+    "max_histogram_bins": 160,
+    "min_bin_width_lsb": 2,
+    "target_events_per_bin": 35.0,
+    "smooth_sigma_bins": 1.0,
+    "initial_half_width_sigma": 2.5,
+    "refit_half_width_sigma": 2.5,
+    "iterations": 3,
+    "minimum_fit_bins": 6,
+    "minimum_fit_events": 15,
+    "minimum_sigma_bin_fraction": 0.25,
+    "maximum_sigma_range_fraction": 0.5,
+    "optimizer_maxiter": 3000,
+    "outlier_z_threshold": 5.0,
+    "outlier_minimum_scale_lsb": 2.0,
+    "outlier_bin_width_lsb": 8,
+    "outlier_seed_half_width_bins": 3,
+    "outlier_minimum_core_events": 20
+  },
+  "bootstrap": {
+    "enabled": true,
+    "overwrite": false,
+    "replicates": 100,
+    "seed": 12345,
+    "workers": 0,
+    "chunksize": 8,
+    "plots": false,
+    "mode": "full_analysis"
+  },
+  "plots": {
+    "matching_train": {
+      "enabled": true,
+      "overwrite": false
+    },
+    "matching_total": {
+      "enabled": true,
+      "overwrite": false
+    },
+    "peak_selection": {
+      "enabled": true,
+      "overwrite": true
+    },
+    "timing_fit": {
+      "enabled": true,
+      "overwrite": true
+    },
+    "bootstrap": {
+      "enabled": false,
+      "overwrite": false
+    },
+    "dpi": 180,
+    "max_histogram_bins": 120,
+    "matching_curve_points": 1000
+  },
+  "thresholds": {
+    "consistency": "error"
+  },
+  "matching_model": {
+    "method": "average_delay",
+    "training": {
+      "window_ns": 10.0,
+      "minimum_samples": 100
+    },
+    "average_delay": {
+      "outlier_filter": {
+        "enabled": true,
+        "z_threshold": 3.5,
+        "max_iterations": 8,
+        "minimum_scale_lsb": 2.0
+      }
+    },
+    "inference": {
+      "candidate_window_ns": 10.0,
+      "maximum_deviation_ns": null
+    }
+  },
+  "analysis_output": {
+    "large_table_format": "csv",
+    "diagnostic_mode": "compact"
+  }
+}
