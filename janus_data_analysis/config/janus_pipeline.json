@@ -1,7 +1,7 @@
 {
   "paths": {
-    "input_dir": "data/07-10",
-    "output_dir": "outputs/07-10"
+    "input_dir": "data/07-13",
+    "output_dir": "outputs/07-13"
   },
   "files": {
     "data_pattern": "Run*[Ll]ist.dat",
@@ -42,7 +42,7 @@
     },
     "fit": {
       "enabled": true,
-      "overwrite": false
+      "overwrite": true
     }
   },
   "channels": {
@@ -72,7 +72,7 @@
     "kde_bandwidth_factor": 0.35,
     "min_peak_height_fraction": 0.12,
     "peak_choice": "rightmost_significant",
-    "left_sigma_multiplier": 2.5,
+    "left_sigma_multiplier": 2.0,
     "right_sigma_multiplier": 4.0,
     "minimum_events_in_interval": 5
   },
@@ -104,16 +104,6 @@
     "outlier_seed_half_width_bins": 3,
     "outlier_minimum_core_events": 20
   },
-  "bootstrap": {
-    "enabled": true,
-    "overwrite": false,
-    "replicates": 100,
-    "seed": 12345,
-    "workers": 0,
-    "chunksize": 8,
-    "plots": false,
-    "mode": "full_analysis"
-  },
   "plots": {
     "matching_train": {
       "enabled": true,
@@ -131,10 +121,6 @@
       "enabled": true,
       "overwrite": true
     },
-    "bootstrap": {
-      "enabled": false,
-      "overwrite": false
-    },
     "dpi": 180,
     "max_histogram_bins": 120,
     "matching_curve_points": 1000
@@ -146,7 +132,7 @@
     "method": "average_delay",
     "training": {
       "window_ns": 10.0,
-      "minimum_samples": 100
+      "minimum_samples": 20
     },
     "average_delay": {
       "outlier_filter": {

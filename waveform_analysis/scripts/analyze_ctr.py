@@ -13,16 +13,16 @@ PROJECT = Path(__file__).resolve().parents[1]
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
-from waveform_analysis.config import config_copy, load_config
-from waveform_analysis.fit import FitResult, choose_best, scan_timing_grid
-from waveform_analysis.io import event_count, read_metadata
-from waveform_analysis.pipeline import (
+from utils.config import config_copy, load_config
+from utils.fit import FitResult, choose_best, scan_timing_grid
+from utils.io import event_count, read_metadata
+from utils.pipeline import (
     build_selection,
     extract_features,
     load_features,
     save_features,
 )
-from waveform_analysis.plots import (
+from utils.plots import (
     plot_best_fit,
     plot_energy_correlation,
     plot_energy_photopeaks,

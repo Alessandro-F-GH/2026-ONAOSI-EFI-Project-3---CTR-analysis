@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
-from scipy.optimize import minimize
+from scipy.optimize import curve_fit
 from scipy.stats import norm
 
 from .tabular import read_table, write_table
@@ -117,9 +117,9 @@ def _reject_outliers(values_lsb: np.ndarray, cfg: dict) -> np.ndarray:
     return filtered if filtered.size >= int(cfg["min_events"]) else values
 
 
-def _expected(edges: np.ndarray, area: float, mean: float, sigma: float) -> np.ndarray:
+def _gaussian(x: np.ndarray, area: float, mean: float, sigma: float) -> np.ndarray:
     sigma = max(float(sigma), 1e-12)
-    return area * np.diff(norm.cdf(edges, loc=mean, scale=sigma))
+    return area * np.diff(norm.cdf(x, loc=mean, scale=sigma))
 
 
 def _fit_quality(
@@ -142,34 +142,6 @@ def _fit_quality(
     return chi_square, ndof, reduced
 
 
-def _numerical_hessian(function, point: np.ndarray) -> np.ndarray:
-    point = np.asarray(point, dtype=float)
-    steps = np.asarray([
-        1e-4 * max(1.0, abs(point[0])),
-        1e-5 * max(1.0, abs(point[1])),
-        1e-4 * max(1.0, abs(point[2])),
-    ])
-    size = point.size
-    result = np.zeros((size, size), dtype=float)
-    base = float(function(point))
-    for i in range(size):
-        ei = np.zeros(size)
-        ei[i] = steps[i]
-        result[i, i] = (function(point + ei) - 2.0 * base + function(point - ei)) / (steps[i] ** 2)
-        for j in range(i + 1, size):
-            ej = np.zeros(size)
-            ej[j] = steps[j]
-            value = (
-                function(point + ei + ej)
-                - function(point + ei - ej)
-                - function(point - ei + ej)
-                + function(point - ei - ej)
-            ) / (4.0 * steps[i] * steps[j])
-            result[i, j] = value
-            result[j, i] = value
-    return result
-
-
 def _fit_range(
     edges: np.ndarray,
     counts: np.ndarray,
@@ -180,55 +152,120 @@ def _fit_range(
     sigma_seed: float,
     cfg: dict,
 ) -> dict[str, Any]:
+    """
+    Perform a single Gaussian fit within a specified histogram range.
+
+    Inputs:
+    - edges: histogram bin edges (global).
+    - counts: histogram bin counts corresponding to 'edges'.
+    - low, high: numeric limits defining the portion of the histogram to fit.
+    - area_seed, mean_seed, sigma_seed: initial guesses for Gaussian parameters.
+    - cfg: configuration dictionary controlling limits and optimizer behavior.
+
+    Returns:
+    A dictionary with:
+    - success/status: fit outcome.
+    - area/mean/sigma + their errors.
+    - mask: boolean mask of bins used.
+    - low/high: actual numeric range used for the fit.
+    """
+    # Compute bin centers from edges to determine which bins fall within [low, high]
     centers = 0.5 * (edges[:-1] + edges[1:])
     mask = (centers >= low) & (centers <= high)
+
+    # Ensure we have at least the minimum number of bins to attempt a reliable fit
     if np.count_nonzero(mask) < int(cfg["minimum_fit_bins"]):
         raise RuntimeError("Fit range contains too few bins")
+
+    # Build a local array of edges corresponding to the selected bins.
+    # For N selected bins, we need N+1 edges: first left edge + all right edges.
     local_edges = np.concatenate(([edges[:-1][mask][0]], edges[1:][mask]))
+    # Observed counts for the selected bins, cast to float for fitting
     observed = counts[mask].astype(float)
+
+    # Ensure there are enough events in the chosen range
     if observed.sum() < int(cfg["minimum_fit_events"]):
         raise RuntimeError("Fit range contains too few events")
+
+    # Estimate a representative bin width for the whole histogram
     bin_width = float(np.median(np.diff(edges)))
+
+    # Define minimum and maximum allowed sigma in terms of bin width and range
     minimum_sigma = max(float(cfg.get("minimum_sigma_bin_fraction", 0.25)) * bin_width, 1e-9)
-    maximum_sigma = max(minimum_sigma * 2.0, float(cfg.get("maximum_sigma_range_fraction", 0.5)) * (local_edges[-1] - local_edges[0]))
+    maximum_sigma = max(
+        minimum_sigma * 2.0,
+        float(cfg.get("maximum_sigma_range_fraction", 0.5)) * (local_edges[-1] - local_edges[0]),
+    )
+
+    # Clamp sigma seed into [minimum_sigma, maximum_sigma]
     sigma_seed = min(max(sigma_seed, minimum_sigma), maximum_sigma)
+
+    # Clamp mean seed to lie within the local fit range
     mean_seed = min(max(mean_seed, local_edges[0]), local_edges[-1])
+
+    # Ensure area seed is at least the total observed counts and at least 1
     area_seed = max(area_seed, observed.sum(), 1.0)
 
-    def objective(parameters: np.ndarray) -> float:
-        area = math.exp(float(parameters[0]))
-        mean = float(parameters[1])
-        sigma = math.exp(float(parameters[2]))
-        expected = np.clip(_expected(local_edges, area, mean, sigma), 1e-12, None)
-        return float(np.sum(expected - observed * np.log(expected)))
+    # x: bin edges used by the model; y: observed counts
+    x = local_edges
+    y = observed
 
-    initial = np.asarray([math.log(area_seed), mean_seed, math.log(sigma_seed)], dtype=float)
-    result = minimize(
-        objective,
-        initial,
-        method="L-BFGS-B",
-        bounds=[
-            (math.log(max(1e-6, observed.sum() * 0.1)), math.log(max(10.0, observed.sum() * 100.0))),
-            (float(local_edges[0]), float(local_edges[-1])),
-            (math.log(minimum_sigma), math.log(maximum_sigma)),
-        ],
-        options={"maxiter": int(cfg["optimizer_maxiter"]), "ftol": 1e-12},
-    )
-    transformed = np.asarray(result.x, dtype=float)
-    area = math.exp(float(transformed[0]))
-    mean = float(transformed[1])
-    sigma = math.exp(float(transformed[2]))
-    area_error = mean_error = sigma_error = math.nan
+    # Per-bin uncertainty: sqrt(count), but at least 1 to avoid zero uncertainty
+    uncertainty = np.sqrt(np.maximum(y, 1.0))
+
+    # Initial parameter vector for the optimizer
+    p0 = [area_seed, mean_seed, sigma_seed]
+
     try:
-        covariance = np.linalg.inv(_numerical_hessian(objective, transformed))
-        area_error = area * math.sqrt(max(0.0, float(covariance[0, 0])))
-        mean_error = math.sqrt(max(0.0, float(covariance[1, 1])))
-        sigma_error = sigma * math.sqrt(max(0.0, float(covariance[2, 2])))
-    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
-        pass
+        # Perform bounded non-linear least-squares fit using scipy.curve_fit.
+        # _gaussian converts (area, mean, sigma) and edges x into expected counts.
+        parameters, covariance = curve_fit(
+            _gaussian,
+            x,
+            y,
+            p0=p0,
+            sigma=uncertainty,
+            absolute_sigma=True,
+            bounds=(
+                [
+                    max(1e-6, observed.sum() * 0.1),  # lower bound for area
+                    float(local_edges[0]),           # lower bound for mean
+                    minimum_sigma,                   # lower bound for sigma
+                ],
+                [
+                    max(10.0, observed.sum() * 100.0),  # upper bound for area
+                    float(local_edges[-1]),             # upper bound for mean
+                    maximum_sigma,                      # upper bound for sigma
+                ],
+            ),
+            maxfev=int(cfg["optimizer_maxiter"]),
+        )
+        success = True
+        status = "Converged successfully."
+    except Exception as exc:
+        # If the optimizer fails, fall back to the seed values and mark the fit as unsuccessful
+        parameters = np.array([area_seed, mean_seed, sigma_seed], dtype=float)
+        covariance = None
+        success = False
+        status = str(exc)
+
+    # Unpack fitted parameters
+    area, mean, sigma = [float(item) for item in parameters]
+
+    # Default parameter uncertainties to NaN; will update if covariance is valid
+    area_error = mean_error = sigma_error = math.nan
+    if covariance is not None and covariance.shape == (3, 3):
+        # Parameter errors are sqrt of covariance diagonal, with NaN for negative entries
+        diagonal = np.diag(covariance)
+        errors = np.sqrt(np.where(diagonal >= 0, diagonal, np.nan))
+        area_error = float(errors[0])
+        mean_error = float(errors[1])
+        sigma_error = float(errors[2])
+
+    # Return all relevant fit info; low/high correspond to the first/last local edge used
     return {
-        "success": bool(result.success),
-        "status": str(result.message),
+        "success": success,
+        "status": status,
         "mask": mask,
         "area": area,
         "area_error": area_error,
@@ -240,37 +277,88 @@ def _fit_range(
         "high": float(local_edges[-1]),
     }
 
-
 def fit_timing(values_lsb: np.ndarray, cfg: dict) -> FitResult:
+    """
+    Fit a Gaussian distribution to timing values (expressed in LSB units).
+
+    Overall steps:
+    - Validate that there are enough events.
+    - Remove outliers from the input values.
+    - Build a histogram with an automatically chosen binning.
+    - Derive initial estimates (seeds) for mean and sigma from the histogram.
+    - Define an initial fit range around the seed mean.
+    - Iteratively refine the Gaussian fit and adjust the fit range until converged
+      or until the maximum number of iterations is reached.
+    - Compute expected histogram counts and chi-square quality metrics.
+    - Return all fit results and diagnostics packed in a FitResult object.
+    """
+    # Ensure we have a NumPy array of integers for the timing values
     values = np.asarray(values_lsb, dtype=np.int64)
+
+    # Check that we have at least the minimum number of events required to attempt a fit
     if values.size < int(cfg["min_events"]):
         raise RuntimeError(f"Only {values.size} timing values available for fit")
+
+    # Apply outlier rejection according to configuration; this yields the data to be fitted
     fit_values = _reject_outliers(values, cfg)
+
+    # Build histogram bin edges and bin width for the filtered values
     edges, bin_width = quantized_edges(fit_values, cfg)
+
+    # Compute histogram counts for the filtered values using the chosen edges
     counts, _ = np.histogram(fit_values, bins=edges)
+
+    # Derive initial mean and sigma estimates from the histogram shape
     mean_seed, sigma_seed = _seed_from_histogram(edges, counts, float(cfg["smooth_sigma_bins"]))
+
+    # Initial fit window around the seed mean: +/- initial_half_width_sigma * sigma
     low = mean_seed - float(cfg["initial_half_width_sigma"]) * sigma_seed
     high = mean_seed + float(cfg["initial_half_width_sigma"]) * sigma_seed
+
+    # Enforce a minimum window size in terms of a number of bins
     minimum_half_width = 0.5 * int(cfg["minimum_fit_bins"]) * bin_width
     low = min(low, mean_seed - minimum_half_width)
     high = max(high, mean_seed + minimum_half_width)
+
+    # Initial guess for total area (number of events under the Gaussian)
     area_seed = float(fit_values.size)
+
+    # Will hold the result of the last successful _fit_range call
     final: dict[str, Any] | None = None
+
+    # Iteratively refine the fit: each iteration adjusts the fit window around updated mean/sigma
     for _ in range(int(cfg["iterations"])):
+        # Perform a Gaussian fit in the current [low, high] window
         final = _fit_range(edges, counts, low, high, area_seed, mean_seed, sigma_seed, cfg)
+
+        # Update seeds with the results of the current fit
         area_seed = final["area"]
         mean_seed = final["mean"]
         sigma_seed = final["sigma"]
+
+        # Define a new fit window around the updated mean and sigma
         next_low = mean_seed - float(cfg["refit_half_width_sigma"]) * sigma_seed
         next_high = mean_seed + float(cfg["refit_half_width_sigma"]) * sigma_seed
+
+        # Again enforce at least the minimum half-width in bins
         next_low = min(next_low, mean_seed - minimum_half_width)
         next_high = max(next_high, mean_seed + minimum_half_width)
+
+        # Check for convergence: if the window changes less than 5% of a bin width, stop iterating
         if abs(next_low - low) <= 0.05 * bin_width and abs(next_high - high) <= 0.05 * bin_width:
             break
+
+        # Otherwise, continue with the updated window
         low, high = next_low, next_high
+
+    # If no fit was performed (should not happen), raise an error
     if final is None:
         raise RuntimeError("Gaussian fit did not run")
-    expected = _expected(edges, final["area"], final["mean"], final["sigma"])
+
+    # Compute expected counts per bin from the final Gaussian parameters
+    expected = _gaussian(edges, final["area"], final["mean"], final["sigma"])
+
+    # Evaluate chi-square, degrees of freedom, and reduced chi-square over the final fit range
     chi_square, ndof, reduced_chi_square = _fit_quality(
         edges,
         counts,
@@ -278,6 +366,8 @@ def fit_timing(values_lsb: np.ndarray, cfg: dict) -> FitResult:
         final["low"],
         final["high"],
     )
+
+    # Package all results and diagnostics into a FitResult dataclass instance
     return FitResult(
         success=final["success"],
         status=final["status"],
@@ -297,7 +387,6 @@ def fit_timing(values_lsb: np.ndarray, cfg: dict) -> FitResult:
         ndof=ndof,
         reduced_chi_square=reduced_chi_square,
     )
-
 
 def fit_to_row(fit: FitResult, diagnostic_mode: str = "compact") -> dict[str, Any]:
     row = {
@@ -361,7 +450,7 @@ def load_fit_csv(path: str | Path) -> FitResult:
     if row.get("expected_counts", "") != "":
         expected = np.asarray(json.loads(row["expected_counts"]), dtype=float)
     else:
-        expected = _expected(
+        expected = _gaussian(
             edges,
             float(row["area_events"]),
             float(row["mean_lsb"]),

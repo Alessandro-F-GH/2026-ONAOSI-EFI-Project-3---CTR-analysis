@@ -72,9 +72,6 @@ def _apply_defaults_and_migrations(cfg: dict[str, Any]) -> None:
     reconstruction.setdefault("fallback_when_tot_missing", True)
     reconstruction.setdefault("fallback_when_tot_inconsistent", False)
 
-    bootstrap = cfg.setdefault("bootstrap", {})
-    bootstrap.setdefault("mode", "full_analysis")
-
 def load_config(path: str | Path, root: str | Path) -> dict[str, Any]:
     path = Path(path)
     with path.open("r", encoding="utf-8") as handle:
@@ -105,7 +102,6 @@ def validate_config(cfg: dict[str, Any]) -> None:
         "peak_selection",
         "alignment_filter",
         "fit",
-        "bootstrap",
         "plots",
         "thresholds",
         "analysis_output",
@@ -352,29 +348,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
         1e-9,
     )
 
-    bootstrap = cfg["bootstrap"]
-    for flag in ("enabled", "overwrite", "plots"):
-        if not isinstance(bootstrap.get(flag), bool):
-            raise ConfigError(f"bootstrap.{flag} must be true or false")
-    _positive_int(bootstrap.get("replicates"), "bootstrap.replicates", 1)
-    _positive_int(bootstrap.get("workers"), "bootstrap.workers", 0)
-    _positive_int(bootstrap.get("chunksize"), "bootstrap.chunksize", 1)
-    _positive_int(bootstrap.get("seed"), "bootstrap.seed", 0)
-    if str(bootstrap.get("mode", "")).strip().lower() not in {
-        "full_analysis",
-        "fixed_photopeak",
-    }:
-        raise ConfigError(
-            "bootstrap.mode must be full_analysis or fixed_photopeak"
-        )
-
     plots = cfg["plots"]
     for key in (
         "matching_train",
         "matching_total",
         "peak_selection",
         "timing_fit",
-        "bootstrap",
     ):
         item = plots.get(key)
         if not isinstance(item, dict):
@@ -473,25 +452,12 @@ def stage_config(cfg: dict[str, Any], stage: str) -> dict[str, Any]:
         }
     if stage == "fit":
         return {"fit": cfg["fit"], "analysis_output": _stage_output_config(cfg)}
-    if stage == "bootstrap":
-        return {
-            "peak_selection": cfg["peak_selection"],
-            "alignment_filter": cfg["alignment_filter"],
-            "fit": cfg["fit"],
-            "analysis_output": _stage_output_config(cfg),
-            "bootstrap": {
-                key: cfg["bootstrap"][key]
-                for key in ("replicates", "seed", "mode")
-            },
-            "version": 2,
-        }
     if stage.startswith("plot_"):
         versions = {
             "plot_matching_train": 8,
             "plot_matching_total": 9,
             "plot_peak_selection": 3,
-            "plot_timing_fit": 2,
-            "plot_bootstrap": 1,
+            "plot_timing_fit": 2
         }
         plot_key = stage.removeprefix("plot_")
         result = {

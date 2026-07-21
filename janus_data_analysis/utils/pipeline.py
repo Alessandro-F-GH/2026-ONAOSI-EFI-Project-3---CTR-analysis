@@ -35,7 +35,6 @@ from .matching import (
 )
 from .models import EnergySelectionResult, PeakSelection, SelectionResult
 from .plotting import (
-    plot_bootstrap,
     plot_matching_total,
     plot_matching_training,
     plot_peak_selection,

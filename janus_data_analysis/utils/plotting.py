@@ -61,7 +61,7 @@ def plot_peak_selection(
         )
         axis.text(0.02, 0.92, label, transform=axis.transAxes, ha="left", va="top", fontsize=18)
         axis.set_ylabel("Events", fontsize=18)
-        axis.set_xlim(60, 110)  # Imposta intervallo X
+        #axis.set_xlim(20, 110)  # Imposta intervallo X
         axis.grid(alpha=0.2)
     axes[-1].set_xlabel("Energy-pulse duration [ns]", fontsize=18)
     fig.suptitle(f"{run_id} — Energy-duration peak selection", fontsize=20)
