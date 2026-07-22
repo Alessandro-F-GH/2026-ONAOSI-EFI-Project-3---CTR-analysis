@@ -111,6 +111,67 @@ def validate_config(config: dict[str, Any]) -> None:
     if int(fit["min_events"]) < 3:
         raise ConfigError("fit.min_events must be at least three")
 
+    ml_dataset = root.get("ml_dataset")
+    if ml_dataset is not None:
+        dataset = _require_mapping(ml_dataset, "ml_dataset")
+        if float(dataset["led_threshold_mV"]) <= 0:
+            raise ConfigError("ml_dataset.led_threshold_mV must be positive")
+        if float(dataset["crossing_step_ps"]) <= 0:
+            raise ConfigError("ml_dataset.crossing_step_ps must be positive")
+        if float(dataset["timing_window_width_ns"]) <= 0:
+            raise ConfigError("ml_dataset.timing_window_width_ns must be positive")
+
+        for name in ("led_search_ns", "energy_search_ns"):
+            search = _require_mapping(dataset.get(name), f"ml_dataset.{name}")
+            if float(search["before"]) <= 0 or float(search["after"]) <= 0:
+                raise ConfigError(f"ml_dataset.{name} widths must be positive")
+
+        polynomial = _require_mapping(dataset.get("polynomial"), "ml_dataset.polynomial")
+        if int(polynomial["degree"]) < 0:
+            raise ConfigError("ml_dataset.polynomial.degree must be non-negative")
+        if float(polynomial["l2_regularization"]) < 0:
+            raise ConfigError(
+                "ml_dataset.polynomial.l2_regularization must be non-negative"
+            )
+        if float(polynomial["resample_step_ps"]) <= 0:
+            raise ConfigError("ml_dataset.polynomial.resample_step_ps must be positive")
+        number_of_samples = (
+            float(dataset["timing_window_width_ns"]) * 1000.0
+            / float(polynomial["resample_step_ps"])
+        ) + 1.0
+        if number_of_samples < int(polynomial["degree"]) + 1:
+            raise ConfigError(
+                "timing window/resampling does not provide enough samples for "
+                "the configured polynomial degree"
+            )
+
+        fractions = dataset.get("energy_fractions")
+        if not isinstance(fractions, list) or len(fractions) < 1:
+            raise ConfigError("ml_dataset.energy_fractions must be a non-empty list")
+        numeric_fractions = [float(item) for item in fractions]
+        if any(not 0.0 < item < 1.0 for item in numeric_fractions):
+            raise ConfigError(
+                "ml_dataset.energy_fractions values must be strictly between 0 and 1"
+            )
+        if len(set(numeric_fractions)) != len(numeric_fractions):
+            raise ConfigError("ml_dataset.energy_fractions must not contain duplicates")
+
+        parallel = _require_mapping(dataset.get("parallel"), "ml_dataset.parallel")
+        if int(parallel.get("workers", 0)) < 0:
+            raise ConfigError("ml_dataset.parallel.workers must be non-negative")
+        if int(parallel.get("max_auto_workers", 1)) < 1:
+            raise ConfigError("ml_dataset.parallel.max_auto_workers must be positive")
+        if int(parallel.get("map_chunksize", 1)) < 1:
+            raise ConfigError("ml_dataset.parallel.map_chunksize must be positive")
+        if int(parallel.get("progress_every", 1)) < 1:
+            raise ConfigError("ml_dataset.parallel.progress_every must be positive")
+
+        target = _require_mapping(dataset.get("target"), "ml_dataset.target")
+        if str(target.get("center", "mean")).lower() not in {"mean", "median"}:
+            raise ConfigError("ml_dataset.target.center must be 'mean' or 'median'")
+        if not str(target.get("column_name", "")).strip():
+            raise ConfigError("ml_dataset.target.column_name must be non-empty")
+
 
 def grid_from_config(grid: dict[str, Any]) -> list[float]:
     start = float(grid["start"])

@@ -161,3 +161,140 @@ python tests\test_photopeak.py
 - The CFD implementation matches the original digital method: each fraction is converted to an absolute threshold using the maximum of the cropped, spline-resampled pulse, then the same leading-edge crossing routine is used.
 - No SNR/reliability filter changes which parameter is selected. Crossing efficiency and fit diagnostics are still written to CSV so pathological results remain visible.
 - The photopeak is fitted automatically; there are no hardcoded voltage-specific peak centers.
+
+## Generate the ML timing-correction dataset
+
+The repository also contains a dataset-generation stage for testing whether simple
+models can predict the waveform-dependent component of the LED time difference.
+It reuses the **same photopeak, trigger-position, timing-noise, and valid-trigger
+selection** as `analyze_ctr.py`.
+
+The implementation uses two passes:
+
+1. a lightweight pass extracts only amplitudes, baseline RMS values, and trigger
+   indices, then applies the existing event selection;
+2. a second pass rereads only selected events and extracts the ML features. The
+   expensive second pass can run in parallel.
+
+Run it from the repository root:
+
+```powershell
+python scripts\generate_ml_dataset.py `
+  --input "C:\Users\aless\Desktop\UChicago\Prj_3\oscilloscope\converted_runs\45V-400mV.root" `
+  --config "config\analysis.json" `
+  --output "results\45V-400mV_ml"
+```
+
+For a quick serial test:
+
+```powershell
+python scripts\generate_ml_dataset.py `
+  --input "C:\path\to\45V-400mV.root" `
+  --config "config\analysis.json" `
+  --output "results\45V-400mV_ml_test" `
+  --max-events 500 `
+  --workers 1
+```
+
+To reuse the lightweight first-pass cache:
+
+```powershell
+python scripts\generate_ml_dataset.py `
+  --input "C:\path\to\45V-400mV.root" `
+  --config "config\analysis.json" `
+  --output "results\45V-400mV_ml" `
+  --reuse-selection-features
+```
+
+### Timing waveform representation
+
+Each timing channel is aligned at its configurable LED crossing, with defaults:
+
+```text
+LED threshold:       7 mV
+window width:        5 ns, centered on the LED crossing
+polynomial degree:   4
+ridge regularization: 1e-4
+resampling step:     10 ps
+```
+
+The polynomial uses the normalized coordinate
+
+```text
+x = (t - t_LED) / (window_width / 2),   x in [-1, 1]
+```
+
+and is stored in increasing-power order:
+
+```text
+y(x) = c0 + c1*x + c2*x^2 + ... + c_degree*x^degree
+```
+
+The fitted objective is the mean squared waveform residual plus the configured
+L2 penalty. By normalizing time and the residual term, the regularization value
+remains comparable when the resampling step changes. The CSV includes the
+coefficients and fit diagnostics (`poly_rmse_mV`, `poly_r2`) rather than all
+ordered waveform samples.
+
+### Energy-channel features
+
+For each energy channel, the dataset stores:
+
+- maximum baseline-corrected amplitude;
+- baseline RMS noise;
+- proportional-threshold crossing offsets relative to the LED crossing of the
+  paired timing channel;
+- rise-time intervals between every configured pair of proportional thresholds.
+
+With the default fractions `[0.05, 0.50]`, examples are:
+
+```text
+energy_ch1_t05_minus_timing_ch3_led_ps
+energy_ch1_t50_minus_timing_ch3_led_ps
+energy_ch1_rise_t05_to_t50_ps
+```
+
+No absolute timestamp or inter-detector timing difference is written as an input
+feature. Identifier columns are prefixed with `meta_` and must not be passed to a
+model. The only event-level time-difference quantity in the CSV is the target:
+
+```text
+target_led_residual_ps = LED(ch3) - LED(ch4) - mean_selected_LED_difference
+```
+
+The center value is written to `dataset_summary.json`, not as a CSV feature.
+When a later training pipeline uses grouped train/validation/test splits, the
+strictest evaluation should recompute the center using the training group only.
+
+### Parallel settings
+
+The `ml_dataset.parallel` section controls multiprocessing:
+
+```json
+"parallel": {
+  "workers": 0,
+  "max_auto_workers": 8,
+  "map_chunksize": 16,
+  "progress_every": 500
+}
+```
+
+`workers: 0` selects up to `max_auto_workers`, while `workers: 1` disables
+multiprocessing. Progress is printed to the terminal and saved in
+`dataset_generation.log`.
+
+### Dataset outputs
+
+```text
+results\45V-400mV_ml\
+├── ml_dataset.csv
+├── selection_features.npz
+├── config_used.json
+├── dataset_cutflow.json
+├── dataset_summary.json
+└── dataset_generation.log
+```
+
+Dataset-specific channel-level rejection reasons for invalid timing or energy
+feature extraction are counted in `dataset_cutflow.json`; expected numerical
+processing failures are counted separately without terminating the full run.
