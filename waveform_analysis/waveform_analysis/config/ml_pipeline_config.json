@@ -1,0 +1,98 @@
+{
+  "data": {
+    "input_root": "processed_data/converted_runs_07-13/45V-400mV.root",
+    "true_tof_ps": 0.0
+  },
+  "channels": {
+    "energy": [1, 2],
+    "polarities": [1, 1]
+  },
+  "io": {
+    "step_size": "128 MB",
+    "max_events": 0,
+    "progress_every": 1000
+  },
+  "waveform": {
+    "baseline_samples": 500,
+    "search_trigger_threshold_mV": 10.0,
+    "analysis_crop_ns": {
+      "before": 7.0,
+      "after": 41.0
+    },
+    "upsample_step_ps": 2.5,
+    "led_threshold_mV": 10.0,
+    "cfd_fraction": 0.045,
+    "ml_window_ns": {
+      "before": 5.0,
+      "after": 40.0
+    },
+    "subsample_factor": 2
+  },
+  "selection": {
+    "energy_noise_max_mV": null,
+    "energy_trigger_index_range": null,
+    "minimum_events_per_split": 100
+  },
+  "photopeak": {
+    "enabled": true,
+    "histogram_bin_mV": 1.0,
+    "search_quantile_min": 0.55,
+    "smoothing_sigma_bins": 2.0,
+    "initial_half_width_mV": 15.0,
+    "iteration_sigma": 2.5,
+    "max_iterations": 6,
+    "convergence_tolerance_mV": 0.01,
+    "selection_sigma_low": -2.0,
+    "selection_sigma_high": 4.0
+  },
+  "split": {
+    "strategy": "event",
+    "seed": 20260724,
+    "train_fraction": 0.8,
+    "validation_fraction": 0.1,
+    "test_fraction": 0.1
+  },
+  "parallelization": {
+    "preprocessing_backend": "process",
+    "preprocessing_workers": 4,
+    "preprocessing_chunksize": 8,
+    "training_num_workers": 0,
+    "prefetch_factor": null,
+    "persistent_workers": false,
+    "pin_memory": false,
+    "torch_num_threads": 0,
+    "torch_num_interop_threads": 0
+  },
+  "paths": {
+    "work_dir": "results/energy_ml_cnn",
+    "dataset_cache_dir": "results/energy_ml_cnn/cache/energy_dataset",
+    "split_dir": "results/energy_ml_cnn/cache/split",
+    "checkpoint_dir": "results/energy_ml_cnn/checkpoints",
+    "plot_dir": "results/energy_ml_cnn/plots",
+    "log_dir": "results/energy_ml_cnn/logs"
+  },
+  "cache": {
+    "reuse": true,
+    "normalization_chunk_size": 2048
+  },
+  "fit": {
+    "histogram_range_ps": [-5000.0, 5000.0],
+    "histogram_bin_ps": 10.0,
+    "initial_half_width_ps": 500.0,
+    "iteration_sigma": 2.5,
+    "max_iterations": 6,
+    "convergence_tolerance_ps": 0.01,
+    "min_events": 100,
+    "minimum_fit_bins": 9,
+    "minimum_sigma_bins": 0.5
+  },
+  "plotting": {
+    "dpi": 180
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "evaluation": {
+    "swap_tolerance_ps": 1e-5
+  }
+}

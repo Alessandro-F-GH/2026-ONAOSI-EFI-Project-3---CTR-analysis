@@ -1,0 +1,39 @@
+{
+  "architecture": {
+    "conv_channels": [16, 32, 64],
+    "kernel_sizes": [9, 7, 5],
+    "pool_sizes": [1, 2, 2],
+    "batch_norm": true,
+    "activation": "relu",
+    "dropout": 0.01,
+    "dense_units": [32],
+    "max_abs_single_channel_output_ps": 1000.0
+  },
+  "optimizer": {
+    "name": "adamw",
+    "learning_rate": 0.1,
+    "weight_decay": 0.0001
+  },
+  "scheduler": {
+    "name": "reduce_on_plateau",
+    "factor": 0.5,
+    "patience": 4,
+    "minimum_learning_rate": 1e-6
+  },
+  "training": {
+    "device": "auto",
+    "seed": 20260724,
+    "epochs": 100,
+    "batch_size": 128,
+    "mixed_precision": true,
+    "gradient_clip_norm": 5.0,
+    "log_every_batches": 20,
+    "fit_metrics_every_epochs": 1,
+    "monitor": "validation_loss",
+    "early_stopping_patience": 12,
+    "early_stopping_min_delta": 1e-5
+  },
+  "checkpointing": {
+    "every_batches": 256
+  }
+}

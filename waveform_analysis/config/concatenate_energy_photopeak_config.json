@@ -1,0 +1,58 @@
+{
+  "input": {
+    "folder": "processed_data/converted_runs_07-13",
+    "pattern": "*.root",
+    "recursive": true,
+    "exclude_names": []
+  },
+  "output": {
+    "root_file": "processed_data/combined/energy_photopeak_all_bias.root",
+    "manifest_json": "processed_data/combined/energy_photopeak_all_bias_manifest.json",
+    "overwrite": false
+  },
+  "channels": {
+    "energy": [1, 2],
+    "polarities": [1, 1]
+  },
+  "waveform": {
+    "baseline_samples": 500
+  },
+  "photopeak": {
+    "histogram_bin_mV": 1.0,
+    "search_quantile_min": 0.55,
+    "smoothing_sigma_bins": 2.0,
+    "initial_half_width_mV": 15.0,
+    "iteration_sigma": 2.5,
+    "max_iterations": 6,
+    "convergence_tolerance_mV": 0.01,
+    "selection_sigma_low": -2.0,
+    "selection_sigma_high": 4.0
+  },
+  "selection": {
+    "minimum_selected_events_per_run": 100,
+    "on_fit_failure": "error"
+  },
+  "metadata": {
+    "bias_voltage_regex": "(?:^|[\\\\/])(?P<bias_voltage>\\d+(?:\\.\\d+)?)V(?:-|[\\\\/])",
+    "require_bias_voltage": false
+  },
+  "io": {
+    "step_size": "128 MB",
+    "max_events_per_file": 0,
+    "progress_every_events": 5000
+  },
+  "parallelization": {
+    "backend": "thread",
+    "workers": 4,
+    "chunksize": 16
+  },
+  "plotting": {
+    "save_photopeak_plots": true,
+    "plot_dir": "results/concatenation_photopeaks",
+    "dpi": 180,
+    "fallback_bins": 250
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}

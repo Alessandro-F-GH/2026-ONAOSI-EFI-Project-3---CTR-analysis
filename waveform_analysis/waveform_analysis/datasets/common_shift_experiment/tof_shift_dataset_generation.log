@@ -1,0 +1,65 @@
+2026-07-22 17:06:59 | INFO | Input ROOT: processed_data\converted_runs_07-13\45V-400mV.root
+2026-07-22 17:06:59 | INFO | Output directory: datasets\common_shift_experiment
+2026-07-22 17:06:59 | INFO | Selection pass: extracting amplitudes, noise, and trigger indices
+2026-07-22 17:07:02 | INFO | Selection pass processed 1000 events
+2026-07-22 17:07:03 | INFO | Selection pass processed 2000 events
+2026-07-22 17:07:04 | INFO | Selection pass processed 3000 events
+2026-07-22 17:07:05 | INFO | Selection pass processed 4000 events
+2026-07-22 17:07:05 | INFO | Selection pass processed 5000 events
+2026-07-22 17:07:06 | INFO | Selection pass processed 6000 events
+2026-07-22 17:07:07 | INFO | Selection pass processed 7000 events
+2026-07-22 17:07:08 | INFO | Selection pass processed 8000 events
+2026-07-22 17:07:08 | INFO | Selection pass processed 9000 events
+2026-07-22 17:07:09 | INFO | Selection pass processed 10000 events
+2026-07-22 17:07:10 | INFO | Selection pass processed 11000 events
+2026-07-22 17:07:11 | INFO | Selection pass processed 12000 events
+2026-07-22 17:07:11 | INFO | Selection pass processed 13000 events
+2026-07-22 17:07:12 | INFO | Selection pass processed 14000 events
+2026-07-22 17:07:13 | INFO | Selection pass processed 15000 events
+2026-07-22 17:07:14 | INFO | Selection pass processed 16000 events
+2026-07-22 17:07:14 | INFO | Selection pass processed 17000 events
+2026-07-22 17:07:15 | INFO | Selection pass processed 18000 events
+2026-07-22 17:07:16 | INFO | Selection pass processed 19000 events
+2026-07-22 17:07:17 | INFO | Selection pass processed 20000 events
+2026-07-22 17:07:17 | INFO | Selection pass complete: 20135 events
+2026-07-22 17:07:17 | INFO | Selection cache written: datasets\common_shift_experiment\selection_features.npz
+2026-07-22 17:07:17 | INFO | Selected events before shift-specific validity checks: 6736/20135
+2026-07-22 17:07:17 | INFO | Variance match: discrete Var=4266.667 ps^2; exact b=112.638190 ps; integer-uniform b=113 ps gives Var=4294.000 ps^2
+2026-07-22 17:07:17 | INFO | Discrete shift allocation: -80 ps -> 2246, +0 ps -> 2245, +80 ps -> 2245
+2026-07-22 17:07:17 | INFO | Continuous shift range observed: [-113, 113] ps; configured support=[-113, +113] ps
+2026-07-22 17:07:17 | INFO | Shift dataset pass: selected=6736, workers=8, window=[-40.000, -20.000] ns, step=20.000 ps
+2026-07-22 17:07:17 | INFO | Features: catch22(timing ch3-ch4), timing delta at 7.000 mV, energy threshold 10.000 mV
+2026-07-22 17:07:22 | INFO | Shift dataset pass processed 250/6736; paired accepted=250
+2026-07-22 17:07:22 | INFO | Shift dataset pass processed 500/6736; paired accepted=500
+2026-07-22 17:07:23 | INFO | Shift dataset pass processed 750/6736; paired accepted=750
+2026-07-22 17:07:24 | INFO | Shift dataset pass processed 1000/6736; paired accepted=1000
+2026-07-22 17:07:24 | INFO | Shift dataset pass processed 1250/6736; paired accepted=1250
+2026-07-22 17:07:25 | INFO | Shift dataset pass processed 1500/6736; paired accepted=1500
+2026-07-22 17:07:26 | INFO | Shift dataset pass processed 1750/6736; paired accepted=1750
+2026-07-22 17:07:26 | INFO | Shift dataset pass processed 2000/6736; paired accepted=2000
+2026-07-22 17:07:27 | INFO | Shift dataset pass processed 2250/6736; paired accepted=2250
+2026-07-22 17:07:28 | INFO | Shift dataset pass processed 2500/6736; paired accepted=2500
+2026-07-22 17:07:29 | INFO | Shift dataset pass processed 2750/6736; paired accepted=2750
+2026-07-22 17:07:29 | INFO | Shift dataset pass processed 3000/6736; paired accepted=3000
+2026-07-22 17:07:30 | INFO | Shift dataset pass processed 3250/6736; paired accepted=3250
+2026-07-22 17:07:31 | INFO | Shift dataset pass processed 3500/6736; paired accepted=3499
+2026-07-22 17:07:31 | INFO | Shift dataset pass processed 3750/6736; paired accepted=3749
+2026-07-22 17:07:32 | INFO | Shift dataset pass processed 4000/6736; paired accepted=3998
+2026-07-22 17:07:33 | INFO | Shift dataset pass processed 4250/6736; paired accepted=4248
+2026-07-22 17:07:33 | INFO | Shift dataset pass processed 4500/6736; paired accepted=4498
+2026-07-22 17:07:35 | INFO | Shift dataset pass processed 4750/6736; paired accepted=4748
+2026-07-22 17:07:35 | INFO | Shift dataset pass processed 5000/6736; paired accepted=4998
+2026-07-22 17:07:36 | INFO | Shift dataset pass processed 5250/6736; paired accepted=5248
+2026-07-22 17:07:37 | INFO | Shift dataset pass processed 5500/6736; paired accepted=5498
+2026-07-22 17:07:37 | INFO | Shift dataset pass processed 5750/6736; paired accepted=5748
+2026-07-22 17:07:38 | INFO | Shift dataset pass processed 6000/6736; paired accepted=5998
+2026-07-22 17:07:39 | INFO | Shift dataset pass processed 6250/6736; paired accepted=6247
+2026-07-22 17:07:39 | INFO | Shift dataset pass processed 6500/6736; paired accepted=6497
+2026-07-22 17:07:40 | INFO | Shift dataset pass complete: paired accepted=6733, rejected=3
+2026-07-22 17:07:40 | INFO | LED MAD filter: retained 6573/6733 paired events; rejected=160; threshold=5
+2026-07-22 17:07:46 | INFO | Largest LED MAD outlier plot: datasets\common_shift_experiment\largest_led_mad_outlier_waveforms.png
+2026-07-22 17:07:46 | INFO | Discrete dataset written: datasets\common_shift_experiment\tof_discrete.csv
+2026-07-22 17:07:46 | INFO | Continuous dataset written: datasets\common_shift_experiment\tof_continuous.csv
+2026-07-22 17:07:46 | INFO | Empirical target variances: discrete=4268.211 ps^2, continuous=4282.027 ps^2
+2026-07-22 17:07:46 | INFO | Paired accepted rows per dataset: 6573
+2026-07-22 17:07:46 | INFO | Dataset generation complete

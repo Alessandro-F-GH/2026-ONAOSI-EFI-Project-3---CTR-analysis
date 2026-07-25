@@ -1,0 +1,512 @@
+from __future__ import annotations
+
+import os
+import shutil
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+import awkward as ak
+import numpy as np
+from numpy.lib.format import open_memmap
+
+from utils.photopeak import fit_photopeak, photopeak_mask
+from utils.signal import INVALID_TIME_FS
+
+from .common import atomic_json, canonical_hash, read_json, source_signature
+from .energy_io import energy_event_count, iterate_energy_chunks
+from .signal import extract_channel, relative_window_grid_ps
+
+CACHE_FORMAT_VERSION = 1
+SPLIT_FORMAT_VERSION = 1
+
+
+@dataclass(frozen=True)
+class EnergyCache:
+    directory: Path
+    manifest: dict[str, Any]
+    event_id: np.ndarray
+    event_index: np.ndarray
+    source_file_id: np.ndarray
+    amplitude_mV: np.ndarray
+    noise_rms_mV: np.ndarray
+    trigger_index: np.ndarray
+    led_time_fs: np.ndarray
+    cfd_time_fs: np.ndarray
+    windows_mV: np.ndarray
+    valid: np.ndarray
+    relative_time_ps: np.ndarray
+
+
+@dataclass(frozen=True)
+class SplitData:
+    train: np.ndarray
+    validation: np.ndarray
+    test: np.ndarray
+    manifest: dict[str, Any]
+
+
+def _preprocessing_relevant(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "channels": config["channels"],
+        "waveform": config["waveform"],
+        "io": {
+            "max_events": int(config.get("io", {}).get("max_events", 0)),
+        },
+    }
+
+
+def dataset_fingerprint(input_path: Path, config: dict[str, Any]) -> str:
+    return canonical_hash(
+        {
+            "format_version": CACHE_FORMAT_VERSION,
+            "source": source_signature(input_path),
+            "preprocessing": _preprocessing_relevant(config),
+        }
+    )
+
+
+def _array_paths(directory: Path) -> dict[str, Path]:
+    names = (
+        "event_id",
+        "event_index",
+        "source_file_id",
+        "amplitude_mV",
+        "noise_rms_mV",
+        "trigger_index",
+        "led_time_fs",
+        "cfd_time_fs",
+        "windows_mV",
+        "valid",
+        "relative_time_ps",
+    )
+    return {name: directory / f"{name}.npy" for name in names}
+
+
+def load_energy_cache(directory: Path, input_path: Path, config: dict[str, Any]) -> EnergyCache:
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Energy cache manifest not found: {manifest_path}")
+    manifest = read_json(manifest_path)
+    expected = dataset_fingerprint(input_path, config)
+    if manifest.get("fingerprint") != expected:
+        raise ValueError(
+            "Energy cache fingerprint differs from input/preprocessing configuration; "
+            "rebuild the cache"
+        )
+    paths = _array_paths(directory)
+    missing = [str(path) for path in paths.values() if not path.is_file()]
+    if missing:
+        raise ValueError("Energy cache is incomplete: " + ", ".join(missing))
+    return EnergyCache(
+        directory=directory,
+        manifest=manifest,
+        event_id=np.load(paths["event_id"], mmap_mode="r"),
+        event_index=np.load(paths["event_index"], mmap_mode="r"),
+        source_file_id=np.load(paths["source_file_id"], mmap_mode="r"),
+        amplitude_mV=np.load(paths["amplitude_mV"], mmap_mode="r"),
+        noise_rms_mV=np.load(paths["noise_rms_mV"], mmap_mode="r"),
+        trigger_index=np.load(paths["trigger_index"], mmap_mode="r"),
+        led_time_fs=np.load(paths["led_time_fs"], mmap_mode="r"),
+        cfd_time_fs=np.load(paths["cfd_time_fs"], mmap_mode="r"),
+        windows_mV=np.load(paths["windows_mV"], mmap_mode="r"),
+        valid=np.load(paths["valid"], mmap_mode="r"),
+        relative_time_ps=np.load(paths["relative_time_ps"], mmap_mode="r"),
+    )
+
+
+def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
+    (
+        event_index,
+        event_id,
+        source_file_id,
+        raw_a,
+        raw_b,
+        gains,
+        offsets,
+        intervals,
+        horizontal_offsets,
+        polarities,
+        waveform_config,
+        relative_grid_ps,
+    ) = payload
+    outputs = []
+    for channel_position, raw in enumerate((raw_a, raw_b)):
+        outputs.append(
+            extract_channel(
+                np.asarray(raw, dtype=np.int16),
+                vertical_gain_v_per_count=float(gains[channel_position]),
+                vertical_offset_v=float(offsets[channel_position]),
+                horizontal_interval_s=float(intervals[channel_position]),
+                horizontal_offset_s=float(horizontal_offsets[channel_position]),
+                polarity=int(polarities[channel_position]),
+                waveform_config=waveform_config,
+                relative_grid_ps=relative_grid_ps,
+            )
+        )
+    return (
+        int(event_index),
+        int(event_id),
+        np.asarray(source_file_id, dtype=np.int64),
+        np.asarray([item.amplitude_mV for item in outputs], dtype=np.float32),
+        np.asarray([item.noise_rms_mV for item in outputs], dtype=np.float32),
+        np.asarray([item.trigger_index for item in outputs], dtype=np.int32),
+        np.asarray([item.led_time_fs for item in outputs], dtype=np.int64),
+        np.asarray([item.cfd_time_fs for item in outputs], dtype=np.int64),
+        np.stack([item.window_mV for item in outputs]).astype(np.float32),
+        bool(all(item.valid for item in outputs)),
+    )
+
+
+def _executor_map(
+    payloads: list[tuple[Any, ...]], parallel: dict[str, Any]
+) -> Iterable[tuple[Any, ...]]:
+    workers = int(parallel.get("preprocessing_workers", 0))
+    backend = str(parallel.get("preprocessing_backend", "process"))
+    chunksize = max(1, int(parallel.get("preprocessing_chunksize", 8)))
+    if workers <= 0 or backend == "serial":
+        return map(_process_event, payloads)
+    executor_class = ProcessPoolExecutor if backend == "process" else ThreadPoolExecutor
+    executor = executor_class(max_workers=workers)
+    # The generator owns the executor and shuts it down once consumed.
+    def generate() -> Iterable[tuple[Any, ...]]:
+        try:
+            yield from executor.map(_process_event, payloads, chunksize=chunksize)
+        finally:
+            executor.shutdown(wait=True, cancel_futures=False)
+    return generate()
+
+
+def prepare_energy_cache(
+    input_path: Path,
+    directory: Path,
+    config: dict[str, Any],
+    *,
+    rebuild: bool,
+    logger: Any,
+) -> EnergyCache:
+    input_path = input_path.resolve()
+    expected_fingerprint = dataset_fingerprint(input_path, config)
+    if directory.is_dir() and not rebuild:
+        try:
+            cache = load_energy_cache(directory, input_path, config)
+            logger.info("Reusing energy-only preprocessing cache: %s", directory)
+            return cache
+        except (FileNotFoundError, ValueError) as exc:
+            logger.warning("Cannot reuse preprocessing cache: %s", exc)
+
+    total_root = energy_event_count(input_path)
+    max_events = int(config.get("io", {}).get("max_events", 0))
+    n_events = min(total_root, max_events) if max_events > 0 else total_root
+    if n_events <= 0:
+        raise RuntimeError("Input ROOT file contains no events")
+    relative_grid = relative_window_grid_ps(config["waveform"])
+
+    temporary = directory.with_name(directory.name + ".building")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True, exist_ok=True)
+    paths = _array_paths(temporary)
+    arrays = {
+        "event_id": open_memmap(paths["event_id"], mode="w+", dtype=np.int64, shape=(n_events,)),
+        "event_index": open_memmap(paths["event_index"], mode="w+", dtype=np.int64, shape=(n_events,)),
+        "source_file_id": open_memmap(paths["source_file_id"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
+        "amplitude_mV": open_memmap(paths["amplitude_mV"], mode="w+", dtype=np.float32, shape=(n_events, 2)),
+        "noise_rms_mV": open_memmap(paths["noise_rms_mV"], mode="w+", dtype=np.float32, shape=(n_events, 2)),
+        "trigger_index": open_memmap(paths["trigger_index"], mode="w+", dtype=np.int32, shape=(n_events, 2)),
+        "led_time_fs": open_memmap(paths["led_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
+        "cfd_time_fs": open_memmap(paths["cfd_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
+        "windows_mV": open_memmap(paths["windows_mV"], mode="w+", dtype=np.float32, shape=(n_events, 2, relative_grid.size)),
+        "valid": open_memmap(paths["valid"], mode="w+", dtype=np.bool_, shape=(n_events,)),
+    }
+    np.save(paths["relative_time_ps"], relative_grid.astype(np.float32))
+
+    energy_channels = tuple(int(item) for item in config["channels"]["energy"])
+    polarities = tuple(int(item) for item in config["channels"]["polarities"])
+    io_config = config.get("io", {})
+    parallel = config["parallelization"]
+    progress_every = max(1, int(io_config.get("progress_every", 1000)))
+    written = 0
+
+    logger.info(
+        "Building energy-only cache from branches samples_ch%d and samples_ch%d",
+        energy_channels[0],
+        energy_channels[1],
+    )
+    try:
+        for chunk in iterate_energy_chunks(
+            input_path,
+            energy_channels_one_based=energy_channels,
+            step_size=io_config.get("step_size", "128 MB"),
+            entry_stop=n_events,
+        ):
+            payloads: list[tuple[Any, ...]] = []
+            for row in range(chunk.event_id.size):
+                raw_a = np.asarray(ak.to_numpy(chunk.samples[0][row]), dtype=np.int16)
+                raw_b = np.asarray(ak.to_numpy(chunk.samples[1][row]), dtype=np.int16)
+                payloads.append(
+                    (
+                        chunk.event_index[row],
+                        chunk.event_id[row],
+                        chunk.source_file_id[row],
+                        raw_a,
+                        raw_b,
+                        chunk.vertical_gain_v_per_count[row],
+                        chunk.vertical_offset_v[row],
+                        chunk.horizontal_interval_s[row],
+                        chunk.horizontal_offset_s[row],
+                        polarities,
+                        config["waveform"],
+                        relative_grid,
+                    )
+                )
+            for result in _executor_map(payloads, parallel):
+                if written >= n_events:
+                    break
+                (
+                    event_index,
+                    event_id,
+                    source_id,
+                    amplitude,
+                    noise,
+                    trigger,
+                    led,
+                    cfd,
+                    windows,
+                    valid,
+                ) = result
+                arrays["event_index"][written] = event_index
+                arrays["event_id"][written] = event_id
+                arrays["source_file_id"][written] = source_id
+                arrays["amplitude_mV"][written] = amplitude
+                arrays["noise_rms_mV"][written] = noise
+                arrays["trigger_index"][written] = trigger
+                arrays["led_time_fs"][written] = led
+                arrays["cfd_time_fs"][written] = cfd
+                arrays["windows_mV"][written] = windows
+                arrays["valid"][written] = valid
+                written += 1
+                if written % progress_every == 0 or written == n_events:
+                    logger.info("Preprocessed %d/%d events", written, n_events)
+        if written != n_events:
+            raise RuntimeError(f"Expected {n_events} events but wrote {written}")
+        for array in arrays.values():
+            array.flush()
+        valid_events = int(np.count_nonzero(arrays["valid"]))
+        manifest = {
+            "format_version": CACHE_FORMAT_VERSION,
+            "fingerprint": expected_fingerprint,
+            "source": source_signature(input_path),
+            "event_count": n_events,
+            "energy_channels_one_based": list(energy_channels),
+            "branches_read": [f"samples_ch{channel}" for channel in energy_channels],
+            "timing_channel_branches_read": [],
+            "relative_window_points": int(relative_grid.size),
+            "relative_time_ps_start": float(relative_grid[0]),
+            "relative_time_ps_stop": float(relative_grid[-1]),
+            "upsample_step_ps": float(config["waveform"]["upsample_step_ps"]),
+            "subsample_factor": int(config["waveform"]["subsample_factor"]),
+            "effective_window_step_ps": float(
+                config["waveform"]["upsample_step_ps"]
+            ) * int(config["waveform"]["subsample_factor"]),
+            "valid_events": valid_events,
+            "preprocessing": _preprocessing_relevant(config),
+        }
+        atomic_json(temporary / "manifest.json", manifest)
+        # Close memory maps before renaming the directory (required on Windows).
+        for array in arrays.values():
+            mmap = getattr(array, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+        arrays.clear()
+        if directory.exists():
+            shutil.rmtree(directory)
+        os.replace(temporary, directory)
+    except BaseException:
+        logger.exception("Energy preprocessing failed; incomplete cache kept at %s", temporary)
+        raise
+    logger.info("Energy-only preprocessing cache written to %s", directory)
+    return load_energy_cache(directory, input_path, config)
+
+
+def _source_group_split(
+    groups: np.ndarray, fractions: tuple[float, float, float], seed: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    keys = np.asarray([f"{int(a)}:{int(b)}" for a, b in groups], dtype=object)
+    unique = np.unique(keys)
+    if unique.size < 3:
+        raise ValueError(
+            "source_file split requires at least three distinct energy-channel source-file pairs"
+        )
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique)
+    target = np.asarray(fractions) * keys.size
+    split_lists: list[list[str]] = [[], [], []]
+    counts = np.zeros(3, dtype=np.int64)
+    for key in unique:
+        size = int(np.count_nonzero(keys == key))
+        deficits = target - counts
+        destination = int(np.argmax(deficits))
+        split_lists[destination].append(str(key))
+        counts[destination] += size
+    masks = [np.isin(keys, split_keys) for split_keys in split_lists]
+    return tuple(np.flatnonzero(mask).astype(np.int64) for mask in masks)  # type: ignore[return-value]
+
+
+def _event_split(
+    n_events: int, fractions: tuple[float, float, float], seed: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(n_events)
+    n_train = int(np.floor(fractions[0] * n_events))
+    n_validation = int(np.floor(fractions[1] * n_events))
+    train = order[:n_train]
+    validation = order[n_train : n_train + n_validation]
+    test = order[n_train + n_validation :]
+    return train.astype(np.int64), validation.astype(np.int64), test.astype(np.int64)
+
+
+def _noise_limits(value: Any) -> tuple[float, float] | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        if len(value) != 2:
+            raise ValueError("selection.energy_noise_max_mV list must contain two values")
+        return float(value[0]), float(value[1])
+    number = float(value)
+    return number, number
+
+
+def prepare_splits(
+    cache: EnergyCache,
+    directory: Path,
+    config: dict[str, Any],
+    *,
+    rebuild: bool,
+    logger: Any,
+) -> SplitData:
+    relevant = {
+        "format_version": SPLIT_FORMAT_VERSION,
+        "dataset_fingerprint": cache.manifest["fingerprint"],
+        "split": config["split"],
+        "selection": config["selection"],
+        "photopeak": config["photopeak"],
+    }
+    fingerprint = canonical_hash(relevant)
+    manifest_path = directory / "manifest.json"
+    indices_path = directory / "indices.npz"
+    if not rebuild and manifest_path.is_file() and indices_path.is_file():
+        manifest = read_json(manifest_path)
+        if manifest.get("fingerprint") == fingerprint:
+            with np.load(indices_path, allow_pickle=False) as loaded:
+                logger.info("Reusing frozen train/validation/test split: %s", directory)
+                return SplitData(
+                    train=loaded["train"].astype(np.int64),
+                    validation=loaded["validation"].astype(np.int64),
+                    test=loaded["test"].astype(np.int64),
+                    manifest=manifest,
+                )
+
+    n_events = int(cache.event_id.shape[0])
+    split_config = config["split"]
+    fractions = (
+        float(split_config["train_fraction"]),
+        float(split_config["validation_fraction"]),
+        float(split_config["test_fraction"]),
+    )
+    seed = int(split_config["seed"])
+    if split_config.get("strategy", "event") == "source_file":
+        candidates = _source_group_split(cache.source_file_id, fractions, seed)
+    else:
+        candidates = _event_split(n_events, fractions, seed)
+    train_candidate, validation_candidate, test_candidate = candidates
+
+    # Copy the read-only memory map before combining selection masks.
+    # cache.valid already guarantees finite fixed-length windows for both channels.
+    base_valid = np.array(cache.valid, dtype=bool, copy=True)
+    base_valid &= np.all(np.asarray(cache.led_time_fs) != INVALID_TIME_FS, axis=1)
+    base_valid &= np.all(np.asarray(cache.cfd_time_fs) != INVALID_TIME_FS, axis=1)
+
+    selection_config = config["selection"]
+    trigger_range = selection_config.get("energy_trigger_index_range")
+    if trigger_range is not None:
+        low, high = int(trigger_range[0]), int(trigger_range[1])
+        triggers = np.asarray(cache.trigger_index)
+        base_valid &= np.all((triggers > low) & (triggers < high), axis=1)
+
+    limits = _noise_limits(selection_config.get("energy_noise_max_mV"))
+    if limits is not None:
+        noise = np.asarray(cache.noise_rms_mV)
+        base_valid &= (noise[:, 0] < limits[0]) & (noise[:, 1] < limits[1])
+
+    amplitudes = np.asarray(cache.amplitude_mV)
+    photopeak_results = []
+    if bool(config["photopeak"].get("enabled", True)):
+        fit_indices = train_candidate[base_valid[train_candidate]]
+        for channel_position, channel_number in enumerate(
+            cache.manifest["energy_channels_one_based"]
+        ):
+            result = fit_photopeak(
+                amplitudes[fit_indices, channel_position],
+                channel=int(channel_number),
+                config=config["photopeak"],
+            )
+            if not result.success:
+                raise RuntimeError(
+                    f"Training-only photopeak fit failed for channel {channel_number}: "
+                    f"{result.message}"
+                )
+            photopeak_results.append(result)
+            base_valid &= photopeak_mask(amplitudes[:, channel_position], result)
+
+    train = train_candidate[base_valid[train_candidate]]
+    validation = validation_candidate[base_valid[validation_candidate]]
+    test = test_candidate[base_valid[test_candidate]]
+    minimum = int(selection_config.get("minimum_events_per_split", 1))
+    for name, values in (("train", train), ("validation", validation), ("test", test)):
+        if values.size < minimum:
+            raise RuntimeError(
+                f"Only {values.size} selected events in {name}; need at least {minimum}"
+            )
+
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = indices_path.with_suffix(".npz.tmp")
+    with temporary.open("wb") as stream:
+        np.savez_compressed(stream, train=train, validation=validation, test=test)
+    os.replace(temporary, indices_path)
+    manifest = {
+        "format_version": SPLIT_FORMAT_VERSION,
+        "fingerprint": fingerprint,
+        "dataset_fingerprint": cache.manifest["fingerprint"],
+        "strategy": split_config.get("strategy", "event"),
+        "seed": seed,
+        "fractions": {
+            "train": fractions[0],
+            "validation": fractions[1],
+            "test": fractions[2],
+        },
+        "candidate_counts": {
+            "train": int(train_candidate.size),
+            "validation": int(validation_candidate.size),
+            "test": int(test_candidate.size),
+        },
+        "selected_counts": {
+            "train": int(train.size),
+            "validation": int(validation.size),
+            "test": int(test.size),
+        },
+        "selection_is_energy_only": True,
+        "same_event_set_for_led_cfd_and_corrected": True,
+        "photopeak_fit_scope": "training split only",
+        "photopeak": [result.as_dict() for result in photopeak_results],
+        "selection": config["selection"],
+    }
+    atomic_json(manifest_path, manifest)
+    logger.info(
+        "Selected events — train: %d, validation: %d, blind test: %d",
+        train.size,
+        validation.size,
+        test.size,
+    )
+    return SplitData(train=train, validation=validation, test=test, manifest=manifest)

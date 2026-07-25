@@ -786,6 +786,127 @@ def _target_center(values: np.ndarray, method: str) -> float:
     raise ValueError(f"unsupported target center method: {method}")
 
 
+
+def filter_rows_by_led_mad(
+    rows: list[dict[str, Any]],
+    *,
+    threshold: float = 5.0,
+) -> tuple[list[dict[str, Any]], dict[str, Any], int | None]:
+    """Filter rows using robust distance of the unshifted LED TOF.
+
+    The robust distance is |x-median(x)| / (1.4826 * MAD). Rows with a
+    distance greater than ``threshold`` are rejected. The worst event index is
+    returned before filtering so the caller can create a waveform diagnostic.
+    """
+    if not rows:
+        return [], {
+            "enabled": True,
+            "threshold": float(threshold),
+            "events_before": 0,
+            "events_after": 0,
+            "events_rejected": 0,
+        }, None
+    values = np.asarray([float(row["_led_tof_ps"]) for row in rows], dtype=np.float64)
+    finite = np.isfinite(values)
+    if not np.all(finite):
+        raise ValueError("non-finite _led_tof_ps found before MAD filtering")
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    robust_scale = 1.4826 * mad
+    if robust_scale > 0.0 and np.isfinite(robust_scale):
+        distances = np.abs(values - median) / robust_scale
+    else:
+        distances = np.zeros_like(values)
+    worst_position = int(np.argmax(distances)) if distances.size else None
+    worst_event_index = (
+        int(rows[worst_position]["meta_event_index"])
+        if worst_position is not None
+        else None
+    )
+    keep = distances <= float(threshold)
+    filtered = [row for row, accepted in zip(rows, keep, strict=True) if bool(accepted)]
+    summary = {
+        "enabled": True,
+        "threshold": float(threshold),
+        "median_led_tof_ps": median,
+        "mad_led_tof_ps": mad,
+        "robust_scale_ps": robust_scale,
+        "events_before": int(values.size),
+        "events_after": int(np.count_nonzero(keep)),
+        "events_rejected": int(np.count_nonzero(~keep)),
+        "worst_event_index": worst_event_index,
+        "worst_event_id": (
+            int(rows[worst_position]["meta_event_id"])
+            if worst_position is not None
+            else None
+        ),
+        "worst_led_tof_ps": (float(values[worst_position]) if worst_position is not None else None),
+        "worst_mad_distance": (
+            float(distances[worst_position]) if worst_position is not None else None
+        ),
+    }
+    return filtered, summary, worst_event_index
+
+
+def plot_event_waveforms(
+    input_path: Path,
+    event_index: int,
+    config: dict[str, Any],
+    output_path: Path,
+    *,
+    title: str | None = None,
+) -> None:
+    """Plot baseline-corrected waveforms of all four channels for one event."""
+    import matplotlib.pyplot as plt
+
+    max_events = int(config["io"].get("max_events", 0))
+    entry_stop = max_events if max_events > 0 else None
+    polarities = [int(item) for item in config["channels"]["polarities"]]
+    found = False
+    for chunk in iterate_chunks(
+        input_path,
+        step_size=config["io"].get("step_size", "128 MB"),
+        entry_stop=entry_stop,
+    ):
+        matches = np.flatnonzero(np.asarray(chunk.event_index) == int(event_index))
+        if matches.size == 0:
+            continue
+        row = int(matches[0])
+        fig, axes = plt.subplots(4, 1, figsize=(11, 10), sharex=True)
+        for channel in range(4):
+            raw = np.asarray(ak.to_numpy(chunk.samples[channel][row]), dtype=np.int16)
+            voltage_mV = decode_voltage_mV(
+                raw,
+                float(chunk.vertical_gain_v_per_count[row, channel]),
+                float(chunk.vertical_offset_v[row, channel]),
+            )
+            basic = baseline_and_basic_features(
+                voltage_mV,
+                baseline_samples=int(config["waveform"]["baseline_samples"]),
+                polarity=polarities[channel],
+                trigger_threshold_mV=float(config["waveform"]["trigger_threshold_mV"]),
+                horizontal_interval_s=float(chunk.horizontal_interval_s[row, channel]),
+                horizontal_offset_s=float(chunk.horizontal_offset_s[row, channel]),
+            )
+            time_ns = (
+                float(chunk.horizontal_offset_s[row, channel])
+                + np.arange(voltage_mV.size, dtype=np.float64)
+                * float(chunk.horizontal_interval_s[row, channel])
+            ) * 1.0e9
+            axes[channel].plot(time_ns, basic.corrected_signal_mV, linewidth=1.0)
+            axes[channel].set_ylabel(f"Ch {channel + 1} [mV]")
+            axes[channel].grid(alpha=0.25)
+        axes[-1].set_xlabel("Time [ns]")
+        fig.suptitle(title or f"Largest LED MAD outlier — event index {event_index}")
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=int(config.get("plot", {}).get("dpi", 180)))
+        plt.close(fig)
+        found = True
+        break
+    if not found:
+        raise ValueError(f"event_index {event_index} was not found in {input_path}")
+
 def finalize_and_write_dataset(
     rows: list[dict[str, Any]],
     output_csv: Path,

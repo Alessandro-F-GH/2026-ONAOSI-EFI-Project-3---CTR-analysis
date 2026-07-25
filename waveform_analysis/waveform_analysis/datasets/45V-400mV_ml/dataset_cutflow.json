@@ -1,0 +1,14 @@
+{
+  "total": 20135,
+  "photopeak_ch_a": 11748,
+  "photopeak_ch_b": 12522,
+  "photopeak_and": 7273,
+  "energy_trigger": 7266,
+  "timing_noise": 6736,
+  "timing_trigger": 6736,
+  "selected": 6736,
+  "rejected": 13399,
+  "dataset_waveform_valid": 6736,
+  "dataset_waveform_rejected": 0,
+  "dataset_rejection_reasons": {}
+}

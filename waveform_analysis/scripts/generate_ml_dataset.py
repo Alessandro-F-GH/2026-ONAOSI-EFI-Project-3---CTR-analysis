@@ -17,10 +17,12 @@ from utils.config import config_copy, load_config
 from utils.ml_dataset import (
     extract_selection_features,
     finalize_and_write_dataset,
+    filter_rows_by_led_mad,
     generate_dataset_rows,
     load_selection_features,
     save_selection_features,
     select_events,
+    plot_event_waveforms,
 )
 
 
@@ -140,11 +142,44 @@ def main() -> None:
         config,
         workers_override=args.workers,
     )
+
+    mad_config = config.get("led_mad_filter", {})
+    mad_threshold = float(mad_config.get("threshold", 5.0))
+    rows, mad_summary, worst_event_index = filter_rows_by_led_mad(
+        rows, threshold=mad_threshold
+    )
+    logger.info(
+        "LED MAD filter: retained %d/%d events; rejected=%d; threshold=%.3g",
+        mad_summary["events_after"],
+        mad_summary["events_before"],
+        mad_summary["events_rejected"],
+        mad_threshold,
+    )
+    if worst_event_index is not None:
+        outlier_plot_path = args.output / str(
+            mad_config.get("largest_outlier_plot", "largest_led_mad_outlier_waveforms.png")
+        )
+        plot_event_waveforms(
+            args.input,
+            worst_event_index,
+            config,
+            outlier_plot_path,
+            title=(
+                "Largest LED MAD outlier | "
+                f"event={worst_event_index} | "
+                f"distance={mad_summary['worst_mad_distance']:.3f} | "
+                f"TOF={mad_summary['worst_led_tof_ps']:.3f} ps"
+            ),
+        )
+        mad_summary["largest_outlier_plot"] = str(outlier_plot_path)
+        logger.info("Largest LED MAD outlier plot: %s", outlier_plot_path)
+
     dataset_filename = str(config["ml_dataset"].get("filename", "ml_dataset.csv"))
     dataset_path = args.output / dataset_filename
     dataset_summary = finalize_and_write_dataset(rows, dataset_path, config)
 
     cutflow = dict(selection.cutflow)
+    cutflow["led_mad_filter"] = mad_summary
     cutflow["dataset_waveform_valid"] = len(rows)
     cutflow["dataset_waveform_rejected"] = int(sum(dataset_rejections.values()))
     cutflow["dataset_rejection_reasons"] = dict(sorted(dataset_rejections.items()))
@@ -156,6 +191,7 @@ def main() -> None:
         "selection_cache": str(cache_path),
         "cutflow": cutflow,
         "photopeak": [item.as_dict() for item in selection.photopeak_results],
+        "led_mad_filter": mad_summary,
         "dataset": dataset_summary,
     }
     with (args.output / "dataset_summary.json").open("w", encoding="utf-8") as stream:

@@ -1,0 +1,31 @@
+{
+  "total": 20135,
+  "photopeak_ch_a": 11748,
+  "photopeak_ch_b": 12522,
+  "photopeak_and": 7273,
+  "energy_trigger": 7266,
+  "timing_noise": 6736,
+  "timing_trigger": 6736,
+  "selected": 6736,
+  "rejected": 13399,
+  "led_mad_filter": {
+    "enabled": true,
+    "threshold": 5.0,
+    "median_led_tof_ps": 74.65400182321247,
+    "mad_led_tof_ps": 19.172392024628948,
+    "robust_scale_ps": 28.42498841571488,
+    "events_before": 6733,
+    "events_after": 6573,
+    "events_rejected": 160,
+    "worst_event_index": 17917,
+    "worst_event_id": 17917,
+    "worst_led_tof_ps": 15735.765676174797,
+    "worst_mad_distance": 550.9628164243427,
+    "largest_outlier_plot": "datasets\\common_shift_experiment\\largest_led_mad_outlier_waveforms.png"
+  },
+  "paired_shift_dataset_valid": 6573,
+  "paired_shift_dataset_rejected": 3,
+  "shift_dataset_rejection_reasons": {
+    "base_led_invalid": 3
+  }
+}

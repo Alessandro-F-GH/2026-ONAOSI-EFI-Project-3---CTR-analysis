@@ -96,3 +96,21 @@ class DatasetWritingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_filter_rows_by_led_mad_rejects_largest_outlier():
+    from utils.ml_dataset import filter_rows_by_led_mad
+
+    values = [0.0, 1.0, -1.0, 0.5, -0.5, 100.0]
+    rows = [
+        {
+            "meta_event_index": index,
+            "meta_event_id": 1000 + index,
+            "_led_tof_ps": value,
+        }
+        for index, value in enumerate(values)
+    ]
+    filtered, summary, worst = filter_rows_by_led_mad(rows, threshold=5.0)
+    assert worst == 5
+    assert summary["events_rejected"] == 1
+    assert [row["meta_event_index"] for row in filtered] == [0, 1, 2, 3, 4]
