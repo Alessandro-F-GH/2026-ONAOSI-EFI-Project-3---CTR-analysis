@@ -92,11 +92,12 @@ def set_global_seed(seed: int) -> None:
         pass
 
 
-def append_csv(path: Path, row: dict[str, Any]) -> None:
+def write_csv_rows(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.is_file() and path.stat().st_size > 0
-    with path.open("a", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(row.keys()))
-        if not exists:
-            writer.writeheader()
-        writer.writerow(json_safe(row))
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows([json_safe(row) for row in rows])

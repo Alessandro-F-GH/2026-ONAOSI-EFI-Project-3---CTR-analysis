@@ -1,0 +1,137 @@
+{
+  "name": "mlp_optuna",
+  "dataset": "datasets/central_source_47V/train_validation",
+  "output_dir": "results/47V/experiments/mlp_optuna",
+  "cross_validation": {
+    "enabled": false,
+    "n_splits": 5,
+    "shuffle": true,
+    "random_state": 20260727
+  },
+  "window_search": {
+    "enabled": true,
+    "window_before_ns": [
+      4.0
+    ],
+    "window_after_ns": [
+      50.0
+    ]
+  },
+  "repetitions": {
+    "seeds": [
+      1
+    ]
+  },
+  "search": {
+    "method": "optuna_tpe",
+    "n_trials": 50,
+    "random_state": 20260728,
+    "parameters": {
+      "model.hidden_units": {
+        "type": "categorical",
+        "values": [
+          [
+            128
+          ],
+          [
+            32,
+            4
+          ],
+          [
+            32,
+            16
+          ],
+          [
+            32,
+            16,
+            4
+          ],
+          [
+            4,
+            32,
+            4
+          ],
+          [
+            16,
+            32
+          ]
+        ]
+      },
+      "model.activation": {
+        "type": "categorical",
+        "values": [
+          "identity",
+          "silu",
+          "relu"
+        ]
+      },
+      "optimizer.learning_rate": {
+        "type": "loguniform",
+        "low": 0.0001,
+        "high": 0.1
+      },
+      "optimizer.weight_decay": {
+        "type": "loguniform",
+        "low": 1e-06,
+        "high": 0.01
+      },
+      "training.batch_size": {
+        "type": "categorical",
+        "values": [
+          1,
+          8,
+          64,
+          256
+        ]
+      },
+      "model.loss.type": {
+        "type": "categorical",
+        "values": [
+          "mse",
+          "mse_bias"
+        ]
+      },
+      "model.loss.bias_weight": {
+        "type": "loguniform",
+        "low": 0.001,
+        "high": 10.0
+      }
+    }
+  },
+  "base_train_config": {
+    "model": {
+      "type": "mlp_regressor",
+      "name": "mlp_regressor",
+      "dropout": 0.0,
+      "hidden_units": [
+        16
+      ],
+      "activation": "identity",
+      "loss": {
+        "type": "mse"
+      }
+    },
+    "optimizer": {
+      "learning_rate": 0.005,
+      "weight_decay": 0.001
+    },
+    "training": {
+      "epochs": 500,
+      "batch_size": 128,
+      "normalization_chunk_size": 2048,
+      "selection_metric": "validation_rmse",
+      "early_stopping_patience": 20,
+      "early_stopping_min_delta_ps": 0.01
+    },
+    "fit": {
+      "histogram_bin_ps": 10.0,
+      "initial_half_width_ps": 500.0,
+      "iteration_sigma": 2.5,
+      "max_iterations": 3,
+      "min_events": 50,
+      "minimum_fit_bins": 5
+    },
+    "plotting": {},
+    "logging": {}
+  }
+}

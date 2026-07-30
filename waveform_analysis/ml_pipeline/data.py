@@ -16,10 +16,11 @@ from utils.signal import INVALID_TIME_FS
 
 from .common import atomic_json, canonical_hash, read_json, source_signature
 from .energy_io import energy_event_count, iterate_energy_chunks
-from .signal import extract_channel, relative_window_grid_ps
+from .signal import extract_channel, extract_timing_reference, relative_window_grid_ps
+from .splitting import contiguous_block_split
 
-CACHE_FORMAT_VERSION = 1
-SPLIT_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
+SPLIT_FORMAT_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,8 @@ class EnergyCache:
     event_id: np.ndarray
     event_index: np.ndarray
     source_file_id: np.ndarray
+    source_run_index: np.ndarray
+    bias_voltage_V: np.ndarray
     amplitude_mV: np.ndarray
     noise_rms_mV: np.ndarray
     trigger_index: np.ndarray
@@ -72,6 +75,8 @@ def _array_paths(directory: Path) -> dict[str, Path]:
         "event_id",
         "event_index",
         "source_file_id",
+        "source_run_index",
+        "bias_voltage_V",
         "amplitude_mV",
         "noise_rms_mV",
         "trigger_index",
@@ -105,6 +110,8 @@ def load_energy_cache(directory: Path, input_path: Path, config: dict[str, Any])
         event_id=np.load(paths["event_id"], mmap_mode="r"),
         event_index=np.load(paths["event_index"], mmap_mode="r"),
         source_file_id=np.load(paths["source_file_id"], mmap_mode="r"),
+        source_run_index=np.load(paths["source_run_index"], mmap_mode="r"),
+        bias_voltage_V=np.load(paths["bias_voltage_V"], mmap_mode="r"),
         amplitude_mV=np.load(paths["amplitude_mV"], mmap_mode="r"),
         noise_rms_mV=np.load(paths["noise_rms_mV"], mmap_mode="r"),
         trigger_index=np.load(paths["trigger_index"], mmap_mode="r"),
@@ -121,34 +128,64 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
         event_index,
         event_id,
         source_file_id,
-        raw_a,
-        raw_b,
-        gains,
-        offsets,
-        intervals,
-        horizontal_offsets,
-        polarities,
+        source_run_index,
+        bias_voltage_V,
+        energy_raw_a,
+        energy_raw_b,
+        energy_gains,
+        energy_offsets,
+        energy_intervals,
+        energy_horizontal_offsets,
+        energy_polarities,
+        use_timing_channel_led,
+        timing_raw_a,
+        timing_raw_b,
+        timing_gains,
+        timing_offsets,
+        timing_intervals,
+        timing_horizontal_offsets,
+        timing_polarities,
         waveform_config,
         relative_grid_ps,
     ) = payload
+
+    timing_references = [None, None]
+    if use_timing_channel_led:
+        timing_references = []
+        for channel_position, raw in enumerate((timing_raw_a, timing_raw_b)):
+            timing_references.append(
+                extract_timing_reference(
+                    np.asarray(raw, dtype=np.int16),
+                    vertical_gain_v_per_count=float(timing_gains[channel_position]),
+                    vertical_offset_v=float(timing_offsets[channel_position]),
+                    horizontal_interval_s=float(timing_intervals[channel_position]),
+                    horizontal_offset_s=float(timing_horizontal_offsets[channel_position]),
+                    polarity=int(timing_polarities[channel_position]),
+                    waveform_config=waveform_config,
+                )
+            )
+
     outputs = []
-    for channel_position, raw in enumerate((raw_a, raw_b)):
+    for channel_position, raw in enumerate((energy_raw_a, energy_raw_b)):
         outputs.append(
             extract_channel(
                 np.asarray(raw, dtype=np.int16),
-                vertical_gain_v_per_count=float(gains[channel_position]),
-                vertical_offset_v=float(offsets[channel_position]),
-                horizontal_interval_s=float(intervals[channel_position]),
-                horizontal_offset_s=float(horizontal_offsets[channel_position]),
-                polarity=int(polarities[channel_position]),
+                vertical_gain_v_per_count=float(energy_gains[channel_position]),
+                vertical_offset_v=float(energy_offsets[channel_position]),
+                horizontal_interval_s=float(energy_intervals[channel_position]),
+                horizontal_offset_s=float(energy_horizontal_offsets[channel_position]),
+                polarity=int(energy_polarities[channel_position]),
                 waveform_config=waveform_config,
                 relative_grid_ps=relative_grid_ps,
+                timing_reference=timing_references[channel_position],
             )
         )
     return (
         int(event_index),
         int(event_id),
         np.asarray(source_file_id, dtype=np.int64),
+        int(source_run_index),
+        float(bias_voltage_V),
         np.asarray([item.amplitude_mV for item in outputs], dtype=np.float32),
         np.asarray([item.noise_rms_mV for item in outputs], dtype=np.float32),
         np.asarray([item.trigger_index for item in outputs], dtype=np.int32),
@@ -191,7 +228,7 @@ def prepare_energy_cache(
     if directory.is_dir() and not rebuild:
         try:
             cache = load_energy_cache(directory, input_path, config)
-            logger.info("Reusing energy-only preprocessing cache: %s", directory)
+            logger.info("Reusing waveform preprocessing cache: %s", directory)
             return cache
         except (FileNotFoundError, ValueError) as exc:
             logger.warning("Cannot reuse preprocessing cache: %s", exc)
@@ -212,6 +249,8 @@ def prepare_energy_cache(
         "event_id": open_memmap(paths["event_id"], mode="w+", dtype=np.int64, shape=(n_events,)),
         "event_index": open_memmap(paths["event_index"], mode="w+", dtype=np.int64, shape=(n_events,)),
         "source_file_id": open_memmap(paths["source_file_id"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
+        "source_run_index": open_memmap(paths["source_run_index"], mode="w+", dtype=np.int32, shape=(n_events,)),
+        "bias_voltage_V": open_memmap(paths["bias_voltage_V"], mode="w+", dtype=np.float64, shape=(n_events,)),
         "amplitude_mV": open_memmap(paths["amplitude_mV"], mode="w+", dtype=np.float32, shape=(n_events, 2)),
         "noise_rms_mV": open_memmap(paths["noise_rms_mV"], mode="w+", dtype=np.float32, shape=(n_events, 2)),
         "trigger_index": open_memmap(paths["trigger_index"], mode="w+", dtype=np.int32, shape=(n_events, 2)),
@@ -223,40 +262,108 @@ def prepare_energy_cache(
     np.save(paths["relative_time_ps"], relative_grid.astype(np.float32))
 
     energy_channels = tuple(int(item) for item in config["channels"]["energy"])
-    polarities = tuple(int(item) for item in config["channels"]["polarities"])
+    energy_polarities = tuple(int(item) for item in config["channels"]["polarities"])
+    timing_led_config = config["waveform"].get("timing_channel_led", {})
+    use_timing_channel_led = bool(timing_led_config.get("enabled", False))
+    timing_channels = (
+        tuple(int(item) for item in config["channels"]["timing"])
+        if use_timing_channel_led
+        else None
+    )
+    timing_polarities = (
+        tuple(int(item) for item in config["channels"]["timing_polarities"])
+        if use_timing_channel_led
+        else (1, 1)
+    )
     io_config = config.get("io", {})
     parallel = config["parallelization"]
     progress_every = max(1, int(io_config.get("progress_every", 1000)))
     written = 0
 
     logger.info(
-        "Building energy-only cache from branches samples_ch%d and samples_ch%d",
+        "Building preprocessing cache | ML waveform branches samples_ch%d/samples_ch%d",
         energy_channels[0],
         energy_channels[1],
     )
+    if use_timing_channel_led:
+        assert timing_channels is not None
+        logger.info(
+            "Timing-channel LED mode enabled | LED and ML-window alignment from "
+            "samples_ch%d/samples_ch%d | timing waveforms are not saved as ML inputs",
+            timing_channels[0],
+            timing_channels[1],
+        )
+    else:
+        logger.info("Energy-channel LED mode enabled | LED/CFD and alignment from ML channels")
+    denoising = config["waveform"].get("denoising", {})
+    if bool(denoising.get("enabled", False)):
+        logger.info(
+            "Waveform denoising enabled | method %s | cutoff %.6g GHz | order %d",
+            denoising.get("method", "butterworth_lowpass"),
+            float(denoising["cutoff_GHz"]),
+            int(denoising.get("order", 4)),
+        )
     try:
         for chunk in iterate_energy_chunks(
             input_path,
             energy_channels_one_based=energy_channels,
+            timing_channels_one_based=timing_channels,
             step_size=io_config.get("step_size", "128 MB"),
             entry_stop=n_events,
         ):
             payloads: list[tuple[Any, ...]] = []
             for row in range(chunk.event_id.size):
-                raw_a = np.asarray(ak.to_numpy(chunk.samples[0][row]), dtype=np.int16)
-                raw_b = np.asarray(ak.to_numpy(chunk.samples[1][row]), dtype=np.int16)
+                energy_raw_a = np.asarray(
+                    ak.to_numpy(chunk.samples[0][row]), dtype=np.int16
+                )
+                energy_raw_b = np.asarray(
+                    ak.to_numpy(chunk.samples[1][row]), dtype=np.int16
+                )
+                if use_timing_channel_led:
+                    assert chunk.timing_samples is not None
+                    assert chunk.timing_vertical_gain_v_per_count is not None
+                    assert chunk.timing_vertical_offset_v is not None
+                    assert chunk.timing_horizontal_interval_s is not None
+                    assert chunk.timing_horizontal_offset_s is not None
+                    timing_raw_a = np.asarray(
+                        ak.to_numpy(chunk.timing_samples[0][row]), dtype=np.int16
+                    )
+                    timing_raw_b = np.asarray(
+                        ak.to_numpy(chunk.timing_samples[1][row]), dtype=np.int16
+                    )
+                    timing_gains = chunk.timing_vertical_gain_v_per_count[row]
+                    timing_offsets = chunk.timing_vertical_offset_v[row]
+                    timing_intervals = chunk.timing_horizontal_interval_s[row]
+                    timing_horizontal_offsets = chunk.timing_horizontal_offset_s[row]
+                else:
+                    timing_raw_a = np.empty(0, dtype=np.int16)
+                    timing_raw_b = np.empty(0, dtype=np.int16)
+                    timing_gains = np.zeros(2, dtype=np.float64)
+                    timing_offsets = np.zeros(2, dtype=np.float64)
+                    timing_intervals = np.ones(2, dtype=np.float64)
+                    timing_horizontal_offsets = np.zeros(2, dtype=np.float64)
                 payloads.append(
                     (
                         chunk.event_index[row],
                         chunk.event_id[row],
                         chunk.source_file_id[row],
-                        raw_a,
-                        raw_b,
+                        chunk.source_run_index[row],
+                        chunk.bias_voltage_V[row],
+                        energy_raw_a,
+                        energy_raw_b,
                         chunk.vertical_gain_v_per_count[row],
                         chunk.vertical_offset_v[row],
                         chunk.horizontal_interval_s[row],
                         chunk.horizontal_offset_s[row],
-                        polarities,
+                        energy_polarities,
+                        use_timing_channel_led,
+                        timing_raw_a,
+                        timing_raw_b,
+                        timing_gains,
+                        timing_offsets,
+                        timing_intervals,
+                        timing_horizontal_offsets,
+                        timing_polarities,
                         config["waveform"],
                         relative_grid,
                     )
@@ -268,6 +375,8 @@ def prepare_energy_cache(
                     event_index,
                     event_id,
                     source_id,
+                    source_run_index,
+                    bias_voltage_V,
                     amplitude,
                     noise,
                     trigger,
@@ -279,6 +388,8 @@ def prepare_energy_cache(
                 arrays["event_index"][written] = event_index
                 arrays["event_id"][written] = event_id
                 arrays["source_file_id"][written] = source_id
+                arrays["source_run_index"][written] = source_run_index
+                arrays["bias_voltage_V"][written] = bias_voltage_V
                 arrays["amplitude_mV"][written] = amplitude
                 arrays["noise_rms_mV"][written] = noise
                 arrays["trigger_index"][written] = trigger
@@ -300,8 +411,34 @@ def prepare_energy_cache(
             "source": source_signature(input_path),
             "event_count": n_events,
             "energy_channels_one_based": list(energy_channels),
-            "branches_read": [f"samples_ch{channel}" for channel in energy_channels],
-            "timing_channel_branches_read": [],
+            "timing_channels_one_based": (
+                list(timing_channels) if timing_channels is not None else []
+            ),
+            "branches_read": [
+                *[f"samples_ch{channel}" for channel in energy_channels],
+                *(
+                    [f"samples_ch{channel}" for channel in timing_channels]
+                    if timing_channels is not None
+                    else []
+                ),
+            ],
+            "ml_input_channel_branches": [
+                f"samples_ch{channel}" for channel in energy_channels
+            ],
+            "timing_channel_branches_read": (
+                [f"samples_ch{channel}" for channel in timing_channels]
+                if timing_channels is not None
+                else []
+            ),
+            "timing_channel_waveforms_saved": False,
+            "led_timestamp_source": (
+                "timing_channels" if use_timing_channel_led else "energy_channels"
+            ),
+            "cfd_timestamp_source": "energy_channels",
+            "ml_window_alignment_source": (
+                "timing_channel_led" if use_timing_channel_led else "energy_channel_led"
+            ),
+            "optional_metadata_cached": ["source_run_index", "bias_voltage_V"],
             "relative_window_points": int(relative_grid.size),
             "relative_time_ps_start": float(relative_grid[0]),
             "relative_time_ps_stop": float(relative_grid[-1]),
@@ -324,9 +461,9 @@ def prepare_energy_cache(
             shutil.rmtree(directory)
         os.replace(temporary, directory)
     except BaseException:
-        logger.exception("Energy preprocessing failed; incomplete cache kept at %s", temporary)
+        logger.exception("Waveform preprocessing failed; incomplete cache kept at %s", temporary)
         raise
-    logger.info("Energy-only preprocessing cache written to %s", directory)
+    logger.info("Waveform preprocessing cache written to %s", directory)
     return load_energy_cache(directory, input_path, config)
 
 
@@ -365,6 +502,46 @@ def _event_split(
     validation = order[n_train : n_train + n_validation]
     test = order[n_train + n_validation :]
     return train.astype(np.int64), validation.astype(np.int64), test.astype(np.int64)
+
+
+
+
+def _stratified_event_split(
+    labels: np.ndarray,
+    fractions: tuple[float, float, float],
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    values = np.asarray(labels, dtype=np.float64).reshape(-1)
+    # Treat unavailable voltage metadata as one explicit stratum so the function
+    # remains usable with ordinary single-run files.
+    keys = np.where(np.isfinite(values), values, np.inf)
+    rng = np.random.default_rng(seed)
+    parts: list[list[np.ndarray]] = [[], [], []]
+    for key in np.unique(keys):
+        indices = np.flatnonzero(keys == key).astype(np.int64)
+        rng.shuffle(indices)
+        n_train = int(np.floor(fractions[0] * indices.size))
+        n_validation = int(np.floor(fractions[1] * indices.size))
+        parts[0].append(indices[:n_train])
+        parts[1].append(indices[n_train : n_train + n_validation])
+        parts[2].append(indices[n_train + n_validation :])
+    outputs = []
+    for group in parts:
+        merged = np.concatenate(group) if group else np.empty(0, dtype=np.int64)
+        rng.shuffle(merged)
+        outputs.append(merged.astype(np.int64, copy=False))
+    return outputs[0], outputs[1], outputs[2]
+
+
+def _voltage_counts(cache: EnergyCache, indices: np.ndarray) -> dict[str, int]:
+    values = np.asarray(cache.bias_voltage_V[indices], dtype=np.float64)
+    result: dict[str, int] = {}
+    for value in np.unique(values[np.isfinite(values)]):
+        result[f"{float(value):g}"] = int(np.count_nonzero(np.isclose(values, value)))
+    missing = int(np.count_nonzero(~np.isfinite(values)))
+    if missing:
+        result["unknown"] = missing
+    return result
 
 
 def _noise_limits(value: Any) -> tuple[float, float] | None:
@@ -416,8 +593,16 @@ def prepare_splits(
         float(split_config["test_fraction"]),
     )
     seed = int(split_config["seed"])
-    if split_config.get("strategy", "event") == "source_file":
+    strategy = str(split_config.get("strategy", "event"))
+    guard_gap_events = int(split_config.get("guard_gap_events", 0))
+    if strategy == "source_file":
         candidates = _source_group_split(cache.source_file_id, fractions, seed)
+    elif strategy == "stratified_event":
+        candidates = _stratified_event_split(cache.bias_voltage_V, fractions, seed)
+    elif strategy == "contiguous_blocks":
+        candidates = contiguous_block_split(
+            n_events, fractions, guard_gap_events
+        )
     else:
         candidates = _event_split(n_events, fractions, seed)
     train_candidate, validation_candidate, test_candidate = candidates
@@ -538,8 +723,12 @@ def prepare_splits(
         "format_version": SPLIT_FORMAT_VERSION,
         "fingerprint": fingerprint,
         "dataset_fingerprint": cache.manifest["fingerprint"],
-        "strategy": split_config.get("strategy", "event"),
+        "strategy": strategy,
         "seed": seed,
+        "guard_gap_events": guard_gap_events if strategy == "contiguous_blocks" else 0,
+        "guard_events_excluded_total": (
+            2 * guard_gap_events if strategy == "contiguous_blocks" else 0
+        ),
         "fractions": {
             "train": fractions[0],
             "validation": fractions[1],
@@ -554,6 +743,11 @@ def prepare_splits(
             "train": int(train.size),
             "validation": int(validation.size),
             "test": int(test.size),
+        },
+        "bias_voltage_counts": {
+            "train": _voltage_counts(cache, train),
+            "validation": _voltage_counts(cache, validation),
+            "test": _voltage_counts(cache, test),
         },
         "selection_is_energy_only": True,
         "same_event_set_for_led_cfd_and_corrected": True,

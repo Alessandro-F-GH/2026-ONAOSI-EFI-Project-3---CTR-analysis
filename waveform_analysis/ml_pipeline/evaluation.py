@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import csv
+import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -8,322 +9,306 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from utils.fit import FitResult, fit_delta_times_integer_fs
+from utils.fit import FitResult
+from utils.plots import plot_best_fit
 
-from .common import atomic_json, json_safe
-from .data import EnergyCache, SplitData
-from .model import (
-    build_correction_model,
-    model_label,
-    model_output_path,
-    model_type,
+from .common import atomic_json, write_csv_rows
+from .dataset import (
+    PreparedDataset,
+    load_prepared_dataset,
+    prepared_dataset_view,
+    window_slice_indices,
 )
-from .plots import plot_method_fit, plot_metric_comparison
+from .metrics import distribution_metrics, fit_times_ps
+from .models import build_model
+from .standard_methods import cfd_delta_ps, led_delta_ps, load_linear_spline_artifact, predict_linear_spline
+from .plots import plot_metric_bars
 from .torch_data import CorrectionDataset, Normalization
-from .training import _loader_kwargs, _resolve_device, predict_loader
+from .training_utils import predict_loader, resolve_device
 
 
-def _delta_ps(times_fs: np.ndarray) -> np.ndarray:
-    values = np.asarray(times_fs, dtype=np.int64)
-    return (values[:, 0] - values[:, 1]).astype(np.float64) / 1000.0
+@dataclass(frozen=True)
+class TrainedModel:
+    model_name: str
+    model_type: str
+    checkpoint: Path
+    validation_rmse_ps: float
+    train_dir: Path
 
 
-def _fit(values_ps: np.ndarray, method: str, fit_config: dict[str, Any]) -> FitResult:
-    values_fs = np.rint(np.asarray(values_ps, dtype=np.float64) * 1000.0).astype(np.int64)
-    return fit_delta_times_integer_fs(
-        values_fs,
-        method=method,
-        parameter=0.0,
-        n_total=int(values_fs.size),
-        n_selected=int(values_fs.size),
-        config=fit_config,
+def _read_summary(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid training summary: {path}")
+    return value
+
+
+def _model_from_summary(summary_path: Path) -> TrainedModel | None:
+    summary = _read_summary(summary_path)
+    if "best_checkpoint" not in summary or "model_type" not in summary:
+        return None
+    checkpoint = Path(summary["best_checkpoint"]).resolve()
+    if not checkpoint.is_file():
+        return None
+    return TrainedModel(
+        model_name=str(summary["model_name"]),
+        model_type=str(summary["model_type"]),
+        checkpoint=checkpoint,
+        validation_rmse_ps=float(summary.get("best_validation_rmse_ps", float("nan"))),
+        train_dir=summary_path.parent.resolve(),
     )
 
 
-def _calibrate_from_training_fit(
-    train_values_ps: np.ndarray,
-    *,
-    true_tof_ps: float,
-    method: str,
-    fit_config: dict[str, Any],
-) -> tuple[float, FitResult]:
-    result = _fit(train_values_ps, method + " calibration", fit_config)
-    if not result.success:
-        raise RuntimeError(f"Calibration Gaussian fit failed for {method}: {result.message}")
-    offset = float(result.mean_ps - true_tof_ps)
-    return offset, result
+def _model_from_checkpoint(checkpoint: Path) -> TrainedModel:
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    context = payload.get("context", {})
+    model_type = str(context.get("model_type", "")).strip()
+    if not model_type:
+        raise ValueError(f"Checkpoint does not contain model_type metadata: {checkpoint}")
+    return TrainedModel(
+        model_name=str(context.get("model_name", checkpoint.stem)),
+        model_type=model_type,
+        checkpoint=checkpoint.resolve(),
+        validation_rmse_ps=float("nan"),
+        train_dir=checkpoint.parent.parent.resolve(),
+    )
+
+
+def discover_models(config: dict[str, Any], logger: Any) -> list[TrainedModel]:
+    explicit = [Path(value) for value in config.get("models", [])]
+    candidates: list[TrainedModel] = []
+    if explicit:
+        for path in explicit:
+            if path.is_dir():
+                summary_path = path / "training_summary.json"
+                if not summary_path.is_file():
+                    raise FileNotFoundError(f"Training summary not found in explicit model directory: {path}")
+                model = _model_from_summary(summary_path)
+                if model is not None:
+                    candidates.append(model)
+            elif path.name == "training_summary.json":
+                model = _model_from_summary(path)
+                if model is not None:
+                    candidates.append(model)
+            elif path.suffix == ".pt":
+                candidates.append(_model_from_checkpoint(path))
+            else:
+                raise ValueError(f"Unsupported model path: {path}")
+        return candidates
+
+    search_dir = Path(config["model_search_dir"])
+    summaries = sorted(search_dir.rglob("training_summary.json")) if search_dir.is_dir() else []
+    if not summaries:
+        return []
+    grouped: dict[str, TrainedModel] = {}
+    for summary_path in summaries:
+        candidate = _model_from_summary(summary_path)
+        if candidate is None:
+            continue
+        previous = grouped.get(candidate.model_name)
+        if previous is None or candidate.validation_rmse_ps < previous.validation_rmse_ps:
+            grouped[candidate.model_name] = candidate
+    models = sorted(grouped.values(), key=lambda item: item.model_name)
+    logger.info("Automatically selected %d best model checkpoint(s) from %s", len(models), search_dir)
+    return models
+
+
+def _filename(value: str) -> str:
+    text = "".join(character.lower() if character.isalnum() else "_" for character in value)
+    return "_".join(part for part in text.split("_") if part)
 
 
 def _metric_row(
-    method: str,
-    fit: FitResult,
-    true_tof_ps: float,
-    offset_ps: float,
-    calibration_source: str,
-) -> dict[str, Any]:
-    if not fit.success:
-        raise RuntimeError(f"Final Gaussian fit failed for {method}: {fit.message}")
-    return {
-        "method": method,
-        "bias_ps": float(fit.mean_ps - true_tof_ps),
-        "ctr_ps": float(fit.ctr_ps),
-        "ctr_error_ps": float(fit.ctr_error_ps),
-        "fitted_mean_ps": float(fit.mean_ps),
-        "fitted_mean_error_ps": float(fit.mean_error_ps),
-        "fitted_sigma_ps": float(fit.sigma_ps),
-        "calibration_offset_ps": float(offset_ps),
-        "calibration_source": calibration_source,
-        "true_tof_ps": float(true_tof_ps),
-        "chi2": float(fit.chi2),
-        "ndof": int(fit.ndof),
-        "chi2_ndof": float(fit.chi2_ndof),
-        "n_test": int(fit.n_valid),
-        "fit_low_ps": float(fit.fit_low_ps),
-        "fit_high_ps": float(fit.fit_high_ps),
-    }
-
-
-@torch.no_grad()
-def _swapped_corrections(
-    model: torch.nn.Module, loader: DataLoader, device: torch.device
-) -> np.ndarray:
-    model.eval()
-    values: list[np.ndarray] = []
-    for waveforms, _, _ in loader:
-        swapped = waveforms[:, [1, 0], :].to(device, non_blocking=True)
-        correction = model(swapped)
-        values.append(correction.cpu().numpy().astype(np.float64))
-    return np.concatenate(values)
-
-
-def evaluate_final_test(
-    cache: EnergyCache,
-    splits: SplitData,
-    pipeline_config: dict[str, Any],
-    model_config: dict[str, Any],
     *,
-    checkpoint_path: Path | None,
-    logger: Any,
+    blind_name: str,
+    method: str,
+    values_ps: np.ndarray,
+    true_tof_ps: float,
+    fit: FitResult,
+    model: TrainedModel | None,
 ) -> dict[str, Any]:
-    if model_type(model_config) == "catch22_random_forest":
-        from .catch22_random_forest import evaluate_catch22_random_forest
-
-        return evaluate_catch22_random_forest(
-            cache,
-            splits,
-            pipeline_config,
-            model_config,
-            checkpoint_path=checkpoint_path,
-            logger=logger,
-        )
-
-    checkpoint_dir = model_output_path(pipeline_config, "checkpoint_dir", model_config)
-    checkpoint_path = checkpoint_path or checkpoint_dir / "best_validation.pt"
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
-    device = _resolve_device(model_config["training"].get("device", "auto"))
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    context = checkpoint["context"]
-    expected = {
-        "pipeline_config_hash": pipeline_config["_config_hash"],
-        "model_config_hash": model_config["_config_hash"],
-        "dataset_fingerprint": cache.manifest["fingerprint"],
-        "split_fingerprint": splits.manifest["fingerprint"],
+    row = {
+        "blind_test": blind_name,
+        "method": method,
+        "model_name": "" if model is None else model.model_name,
+        "model_type": "" if model is None else model.model_type,
+        "checkpoint": "" if model is None else str(model.checkpoint),
+        "true_tof_ps": float(true_tof_ps),
     }
-    for key, value in expected.items():
-        if context.get(key) != value:
-            raise RuntimeError(f"Checkpoint mismatch for {key}")
+    metrics = distribution_metrics(values_ps, true_value_ps=true_tof_ps, fit=fit)
+    metrics["true_tof_ps"] = metrics.pop("true_value_ps")
+    row.update(metrics)
+    return row
 
+
+def _make_loader(dataset: PreparedDataset, normalization: Normalization, config: dict[str, Any], device: torch.device) -> DataLoader:
+    evaluation_dataset = CorrectionDataset(dataset, dataset.evaluation, normalization)
+    workers = int(config.get("num_workers", 0))
+    kwargs: dict[str, Any] = {
+        "batch_size": int(config.get("batch_size", 512)),
+        "shuffle": False,
+        "drop_last": False,
+        "num_workers": workers,
+        "pin_memory": bool(config.get("pin_memory", device.type == "cuda")),
+    }
+    if workers > 0:
+        kwargs["persistent_workers"] = bool(config.get("persistent_workers", False))
+        kwargs["prefetch_factor"] = int(config.get("prefetch_factor", 2))
+    return DataLoader(evaluation_dataset, **kwargs)
+
+
+def _evaluate_model(
+    trained: TrainedModel,
+    dataset: PreparedDataset,
+    config: dict[str, Any],
+    device: torch.device,
+) -> np.ndarray:
+    payload = torch.load(trained.checkpoint, map_location=device, weights_only=False)
+    context = payload.get("context", {})
+    checkpoint_contract = context.get("dataset_contract")
+    if isinstance(checkpoint_contract, dict):
+        for field in (
+            "led_timestamp_source",
+            "cfd_timestamp_source",
+            "ml_window_alignment_source",
+            "timing_channel_waveforms_saved",
+        ):
+            expected = checkpoint_contract.get(field)
+            actual = dataset.manifest.get(field)
+            if expected != actual:
+                raise ValueError(
+                    f"Model {trained.model_name} was trained with {field}={expected!r}, "
+                    f"but evaluation dataset {dataset.directory} has {field}={actual!r}. "
+                    "Do not mix energy-LED and timing-LED preprocessing products."
+                )
+    input_length = int(context["input_length"])
+    data_view = dict(context.get("data_view", {}))
+    if "window_before_ns" in data_view and "window_after_ns" in data_view:
+        start, stop = window_slice_indices(
+            dataset,
+            float(data_view["window_before_ns"]),
+            float(data_view["window_after_ns"]),
+        )
+        dataset = prepared_dataset_view(
+            dataset,
+            window_start=start,
+            window_stop=stop,
+        )
+    if input_length != dataset.input_length:
+        raise ValueError(
+            f"Model {trained.model_name} expects {input_length} samples, "
+            f"but the resolved blind-data window has {dataset.input_length}"
+        )
     normalization = Normalization(
         mean_mV=float(context["normalization"]["mean_mV"]),
         std_mV=float(context["normalization"]["std_mV"]),
     )
-    led_center_ps = float(context["led_center_ps"])
-    batch_size = int(model_config["training"]["batch_size"])
-    train_dataset = CorrectionDataset(
-        cache, splits.train, normalization, led_center_ps
-    )
-    test_dataset = CorrectionDataset(cache, splits.test, normalization, led_center_ps)
-    common = _loader_kwargs(pipeline_config, device)
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=False, drop_last=False, **common
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, drop_last=False, **common
-    )
-
-    model = build_correction_model(
-        model_config, input_length=int(cache.windows_mV.shape[2])
+    model = build_model(
+        str(context["model_type"]),
+        dict(context["model_config"]),
+        input_length,
     ).to(device)
-    model.load_state_dict(checkpoint["model_state"])
-    train_prediction = predict_loader(model, train_loader, device)
-    test_prediction = predict_loader(model, test_loader, device)
+    model.load_state_dict(payload["model_state"])
+    loader = _make_loader(dataset, normalization, config, device)
+    prediction = predict_loader(model, loader, device)
+    return np.asarray(prediction["corrected_ps"], dtype=np.float64)
 
-    train_led = _delta_ps(cache.led_time_fs[splits.train])
-    test_led = _delta_ps(cache.led_time_fs[splits.test])
-    train_cfd = _delta_ps(cache.cfd_time_fs[splits.train])
-    test_cfd = _delta_ps(cache.cfd_time_fs[splits.test])
-    train_corrected = train_led - np.asarray(
-        train_prediction["correction_ps"], dtype=np.float64
-    )
-    test_correction = np.asarray(test_prediction["correction_ps"], dtype=np.float64)
-    test_corrected = test_led - test_correction
 
-    true_tof_ps = float(pipeline_config["data"]["true_tof_ps"])
-    fit_config = pipeline_config["fit"]
-    led_offset, led_calibration_fit = _calibrate_from_training_fit(
-        train_led,
-        true_tof_ps=true_tof_ps,
-        method="Energy LED standard",
-        fit_config=fit_config,
-    )
-    cfd_offset, cfd_calibration_fit = _calibrate_from_training_fit(
-        train_cfd,
-        true_tof_ps=true_tof_ps,
-        method="Energy CFD standard",
-        fit_config=fit_config,
-    )
-    # The corrected estimator is TOF_LED - C_LED - y_theta.  Reuse the frozen
-    # LED calibration offset so a non-zero-mean learned correction remains visible
-    # as bias instead of being silently recalibrated away.
-    corrected_method = f"Energy LED + {model_label(model_config)} correction"
-    methods = [
-        (
-            "Energy LED standard",
-            test_led,
-            led_offset,
-            "training Energy LED Gaussian fit",
-        ),
-        (
-            "Energy CFD standard",
-            test_cfd,
-            cfd_offset,
-            "training Energy CFD Gaussian fit",
-        ),
-        (
-            corrected_method,
-            test_corrected,
-            led_offset,
-            "same frozen Energy LED calibration offset",
-        ),
-    ]
-    metrics: list[dict[str, Any]] = []
-    fits: dict[str, FitResult] = {}
-    calibration_fits: dict[str, FitResult] = {
-        "Energy LED standard": led_calibration_fit,
-        "Energy CFD standard": cfd_calibration_fit,
-    }
-    plot_dir = model_output_path(pipeline_config, "plot_dir", model_config) / "final_evaluation"
-    dpi = int(pipeline_config["plotting"].get("dpi", 180))
 
-    for method, testing_values, offset, calibration_source in methods:
-        calibrated = testing_values - offset
-        final_fit = _fit(calibrated, method, fit_config)
-        row = _metric_row(
-            method, final_fit, true_tof_ps, offset, calibration_source
-        )
-        metrics.append(row)
-        fits[method] = final_fit
-        filename = (
-            method.lower()
-            .replace(" ", "_")
-            .replace("+", "plus")
-            .replace("-", "_")
-        )
-        plot_method_fit(
-            final_fit,
-            plot_dir / f"{filename}_gaussian_fit.png",
-            true_tof_ps=true_tof_ps,
-            bias_ps=float(row["bias_ps"]),
-            dpi=dpi,
-        )
-        logger.info(
-            "%s | bias %.3f ps | CTR %.3f ± %.3f ps",
-            method,
-            row["bias_ps"],
-            row["ctr_ps"],
-            row["ctr_error_ps"],
-        )
+def _view_for_time_grid(dataset: PreparedDataset, expected: np.ndarray) -> PreparedDataset:
+    expected = np.asarray(expected, dtype=np.float64)
+    current = np.asarray(dataset.relative_time_ps, dtype=np.float64)
+    if current.shape == expected.shape and np.allclose(current, expected, rtol=0.0, atol=1e-9):
+        return dataset
+    if expected.size > current.size:
+        raise ValueError("Standard-method artifact uses a longer time grid than the blind dataset")
+    for start in range(0, current.size - expected.size + 1):
+        stop = start + expected.size
+        if np.allclose(current[start:stop], expected, rtol=0.0, atol=1e-9):
+            return prepared_dataset_view(dataset, window_start=start, window_stop=stop)
+    raise ValueError("Standard-method artifact time grid is not present in the blind dataset")
 
-    plot_metric_comparison(metrics, plot_dir / "method_comparison.png", dpi)
+def evaluate_models(config: dict[str, Any], *, logger: Any) -> dict[str, Any]:
+    output_root = Path(config["output"]["evaluation_dir"])
+    output_root.mkdir(parents=True, exist_ok=True)
+    models = discover_models(config, logger)
+    device = resolve_device(config.get("device", "auto"))
+    dpi = int(config["plotting"].get("dpi", 180))
+    all_rows: list[dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
 
-    swapped_correction = _swapped_corrections(model, test_loader, device)
-    swapped_raw_led = -test_led
-    swapped_corrected = swapped_raw_led - swapped_correction
-    corrected_offset = led_offset
-    swapped_calibrated = swapped_corrected + corrected_offset
-    swapped_true_tof = -true_tof_ps
-    swapped_fit = _fit(
-        swapped_calibrated, f"{corrected_method} (swapped)", fit_config
-    )
-    if not swapped_fit.success:
-        raise RuntimeError(f"Swap-test Gaussian fit failed: {swapped_fit.message}")
-    canonical_fit = fits[corrected_method]
-    swap_test = {
-        "correction_antisymmetry_mae_ps": float(
-            np.mean(np.abs(test_correction + swapped_correction))
-        ),
-        "correction_antisymmetry_max_abs_ps": float(
-            np.max(np.abs(test_correction + swapped_correction))
-        ),
-        "corrected_estimator_sign_mae_ps": float(
-            np.mean(np.abs(test_corrected + swapped_corrected))
-        ),
-        "canonical_ctr_ps": float(canonical_fit.ctr_ps),
-        "swapped_ctr_ps": float(swapped_fit.ctr_ps),
-        "ctr_absolute_difference_ps": float(
-            abs(canonical_fit.ctr_ps - swapped_fit.ctr_ps)
-        ),
-        "canonical_bias_ps": float(canonical_fit.mean_ps - true_tof_ps),
-        "swapped_bias_ps": float(swapped_fit.mean_ps - swapped_true_tof),
-        "swapped_true_tof_ps": float(swapped_true_tof),
-        "passed": bool(
-            np.mean(np.abs(test_correction + swapped_correction))
-            <= float(pipeline_config["evaluation"].get("swap_tolerance_ps", 1e-5))
-        ),
-    }
-    plot_method_fit(
-        swapped_fit,
-        plot_dir / "swap_test_gaussian_fit.png",
-        true_tof_ps=swapped_true_tof,
-        bias_ps=float(swap_test["swapped_bias_ps"]),
-        dpi=dpi,
-    )
+    for blind in config["blind_tests"]:
+        blind_name = str(blind["name"])
+        dataset = load_prepared_dataset(blind["dataset"])
+        if dataset.evaluation.size == 0:
+            raise RuntimeError(f"Blind dataset has no evaluation events: {dataset.directory}")
+        output_dir = output_root / _filename(blind_name)
+        plot_dir = output_dir / "plots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        indices = dataset.evaluation
+        led_values = led_delta_ps(dataset, indices)
+        cfd_values = cfd_delta_ps(dataset, indices)
+        method_values: list[tuple[str, np.ndarray, TrainedModel | None]] = []
+        std_cfg = config.get("standard_methods", {})
+        if std_cfg.get("led", True):
+            method_values.append(("LED", led_values, None))
+        if std_cfg.get("cfd", True):
+            method_values.append(("CFD", cfd_values, None))
+        spline_cfg = std_cfg.get("linear_spline", {})
+        if spline_cfg.get("enabled", False):
+            artifact = load_linear_spline_artifact(Path(spline_cfg["artifact"]))
+            spline_dataset = _view_for_time_grid(dataset, artifact.relative_time_ps)
+            correction = predict_linear_spline(artifact, spline_dataset, indices)
+            method_values.append(("LED + linear_spline correction", led_values - correction, None))
 
-    output_dir = model_output_path(pipeline_config, "work_dir", model_config)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = output_dir / "final_metrics.csv"
-    with metrics_path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(metrics[0].keys()))
-        writer.writeheader()
-        writer.writerows([json_safe(row) for row in metrics])
+        for trained in models:
+            corrected = _evaluate_model(trained, dataset, config, device)
+            method_values.append((f"LED + {trained.model_name} correction", corrected, trained))
 
-    summary = {
-        "comparison": f"Energy LED standard vs Energy CFD standard vs {corrected_method}",
-        "model_type": model_type(model_config),
-        "model_label": model_label(model_config),
-        "metrics_requested": ["bias_ps", "ctr_ps"],
-        "all_methods_use_same_selected_blind_test_events": True,
-        "all_ctr_values_use_same_iterative_gaussian_fit": True,
-        "calibration": {
-            "scope": "training split only",
-            "strategy": (
-                "LED offset from the training Energy LED Gaussian fit; CFD offset "
-                "from the training Energy CFD Gaussian fit; corrected LED reuses "
-                "the frozen LED offset"
-            ),
-            "test_recentering": False,
-        },
-        "true_tof_ps": true_tof_ps,
-        "test_event_count": int(splits.test.size),
-        "checkpoint": str(checkpoint_path),
-        "metrics": metrics,
-        "calibration_fits": {
-            key: value.as_dict() for key, value in calibration_fits.items()
-        },
-        "final_fits": {key: value.as_dict() for key, value in fits.items()},
-        "swap_test": swap_test,
-    }
-    atomic_json(output_dir / "final_evaluation.json", summary)
-    logger.info("Final evaluation written to %s", output_dir)
-    return summary
+        rows: list[dict[str, Any]] = []
+        fit_details: dict[str, Any] = {}
+        for method, values, trained in method_values:
+            fit = fit_times_ps(values, method, config["fit"])
+            row = _metric_row(
+                blind_name=blind_name,
+                method=method,
+                values_ps=values,
+                true_tof_ps=dataset.true_tof_ps,
+                fit=fit,
+                model=trained,
+            )
+            rows.append(row)
+            fit_details[method] = fit.as_dict()
+            plot_best_fit(fit, plot_dir / f"gaussian_fit_{_filename(method)}.png", dpi=dpi)
+            logger.info(
+                "%s | %s | CTR %.3f ps | Gaussian bias %.3f ps",
+                blind_name, method, row["ctr_ps"], row["gaussian_bias_ps"],
+            )
+
+        write_csv_rows(output_dir / "metrics.csv", rows)
+        plot_metric_bars(rows, plot_dir, dpi)
+        summary = {
+            "blind_test": blind_name,
+            "dataset": str(dataset.directory),
+            "dataset_fingerprint": dataset.manifest["fingerprint"],
+            "models": [
+                {
+                    "model_name": model.model_name,
+                    "model_type": model.model_type,
+                    "checkpoint": str(model.checkpoint),
+                    "selected_validation_rmse_ps": model.validation_rmse_ps,
+                }
+                for model in models
+            ],
+            "metrics": rows,
+            "fit_details": fit_details,
+        }
+        atomic_json(output_dir / "evaluation_summary.json", summary)
+        summaries.append(summary)
+        all_rows.extend(rows)
+
+    write_csv_rows(output_root / "all_metrics.csv", all_rows)
+    result = {"evaluation_dir": str(output_root), "blind_tests": summaries}
+    atomic_json(output_root / "evaluation_index.json", result)
+    return result

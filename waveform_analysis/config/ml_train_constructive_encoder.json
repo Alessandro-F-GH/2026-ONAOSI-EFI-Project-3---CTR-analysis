@@ -1,0 +1,68 @@
+{
+  "datasets": [
+    "datasets/central_source_all/train_validation"
+  ],
+  "model": {
+    "type": "constructive_mlp_encoder",
+    "name": "constructive_identity_encoder",
+    "activation": "identity",
+    "max_units": 32,
+    "unit_bias": true,
+    "max_abs_single_channel_output_ps": null,
+    "loss": {
+      "type": "mse"
+    }
+  },
+  "optimizer": {
+    "learning_rate": 0.001,
+    "weight_decay": 0.0
+  },
+  "training": {
+    "device": "auto",
+    "seed": 20260725,
+    "data_seed": 20260725,
+    "initialization_seed": 10000,
+    "epochs_per_unit": 50,
+    "unit_early_stopping_patience": 8,
+    "unit_early_stopping_min_delta_ps": 0.0,
+    "min_unit_improvement_ps": 0.2,
+    "min_relative_unit_improvement": 0.001,
+    "selection_metric": "validation_rmse",
+    "batch_size": 32,
+    "random_pair_swap": false,
+    "normalization_chunk_size": 2048,
+    "num_workers": 0,
+    "pin_memory": false,
+    "mixed_precision": false,
+    "gradient_clip_norm": 5.0
+  },
+  "output": {
+    "train_dir": "results/all/train/constructive_identity_encoder"
+  },
+  "fit": {
+    "histogram_range_ps": [
+      -5000.0,
+      5000.0
+    ],
+    "histogram_bin_ps": 10.0,
+    "initial_half_width_ps": 500.0,
+    "iteration_sigma": 2.5,
+    "max_iterations": 6,
+    "convergence_tolerance_ps": 0.01,
+    "min_events": 100,
+    "minimum_fit_bins": 9,
+    "minimum_sigma_bins": 0.5
+  },
+  "plotting": {
+    "dpi": 180
+  },
+  "artifacts": {
+    "save_history": true,
+    "save_plots": true,
+    "save_last_checkpoint": true,
+    "save_summary": true
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}

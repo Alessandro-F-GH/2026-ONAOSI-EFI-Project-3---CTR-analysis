@@ -1,374 +1,286 @@
-# Energy-only antisymmetric ML correction pipeline
+# ML pipeline architecture
 
-This is a **new and separate pipeline**. The existing classical pipeline (`scripts/analyze_ctr.py` and the existing `utils/` analysis code) is unchanged.
+## Optional timing-channel LED preprocessing
 
-The ML pipeline reads only the two configured energy waveform branches (by default `samples_ch1` and `samples_ch2`). It never requests timing-channel waveforms, and its selection uses only energy-channel quantities.
+The preprocessing layer supports two explicitly recorded conventions:
 
-## Selectable models
+- `energy_channel_led`: channels 1 and 2 provide LED timestamps and window alignment;
+- `timing_channel_led`: channels 3 and 4 provide LED timestamps and window alignment,
+  while channels 1 and 2 remain the only ML inputs.
 
-Three correction models are implemented:
-
-1. **1D CNN** — `config/cnn_config.json`
-2. **Fixed-window time-series MLP** — `config/time_series_regressor_config.json`
-3. **Catch22 random forest** — `config/catch22_random_forest_config.json`
-
-All three preserve the shared antisymmetric estimator
+In timing-channel mode the event flow is:
 
 ```text
-y_theta(s1, s2) = g_theta(s1) - g_theta(s2)
+channel 3/4 waveform -> timing LED timestamp only
+channel 1/2 waveform + timing LED timestamp -> aligned energy ML window
 ```
 
-so that
+The timing waveform is never written to the prepared dataset. Energy-channel
+CFD, amplitude, noise and trigger metadata remain unchanged. The prepared
+dataset manifest records `led_timestamp_source`, `cfd_timestamp_source`,
+`ml_window_alignment_source`, and `timing_channel_waveforms_saved` so downstream
+runs cannot silently confuse the two preprocessing conventions.
+
+## Trainable models
+
+Every model is self-contained in `ml_pipeline/models/<model>.py` and exposes a
+`MODEL_SPEC`. Automatic discovery is implemented by
+`ml_pipeline/models/registry.py`.
+
+A model module owns architecture construction, validation, training and
+checkpoint-compatible configuration. The shared training entry point prepares
+datasets, normalization, output paths and the `TrainingContext`.
+
+## Shared position-aware shapelet regressor
+
+The model type `shapelet_regressor` implements:
 
 ```text
-y_theta(s2, s1) = -y_theta(s1, s2)
-y_theta(s, s) = 0
+correction(s1, s2) = g(s1) - g(s2)
 ```
 
-The CNN and MLP learn `g_theta` directly from normalized waveform samples. The random-forest model first converts each single-channel waveform into Catch22 features, then learns the same shared single-channel map in feature space:
+The same shapelet bank and regression head are applied to both channels. This
+enforces exact ordered-pair antisymmetry by construction.
 
-```text
-g_theta(s) = g_theta(catch22(s))
-```
+### Why shapelets
 
-## Common target and loss
+The previous CART strategy summarized fixed waveform partitions and then fitted
+a non-differentiable tree. The shapelet model instead learns localized pulse
+motifs and their useful temporal scale directly from data. It preserves local
+waveform morphology without treating more than 20,000 adjacent samples as
+independent tabular columns.
 
-The training target is computed only from the training split:
+### Nanosecond-based temporal controls
 
-```text
-target = TOF_LED - mean_train(TOF_LED)
-```
-
-Every model is selected using the same calibration-invariant standard-deviation
-loss, expressed directly in ps:
-
-```text
-residual = y_theta(s1, s2) - target
-loss_ps = sqrt(mean((residual - mean(residual))^2))
-```
-
-Subtracting the residual mean makes the objective insensitive to a constant
-calibration offset. The log therefore reports values such as `val std loss
-62.3 ps`, rather than an MSE in ps².
-
-Because the optimized quantity and checkpoint-selection metric changed, do not
-resume checkpoints produced by the older MSE version. Start the model again with
-`--restart`.
-
-The corrected estimator is
-
-```text
-TOF_corrected = TOF_LED - C_LED - y_theta(s1, s2)
-```
-
-where `C_LED` is obtained only from the training split.
-
-### How the random forest fits the shared map
-
-A standard random forest predicts one target from one feature vector. To retain the exact shared form `g(s1)-g(s2)`, the implementation uses staged residual fitting.
-
-At a given stage, with pair residual
-
-```text
-residual = target - (g(s1) - g(s2))
-```
-
-the same forest is trained on both channels with pseudo-targets
-
-```text
-channel 1 -> +residual / 2
-channel 2 -> -residual / 2
-```
-
-The stage is added to the shared map `g`. Validation and checkpoint selection
-always use the actual pairwise standard-deviation loss above, not the internal
-random-forest split criterion. Before fitting each residual stage, its mean is
-removed so the forest learns event-wise variation rather than calibration bias.
-
-## Catch22 feature behavior
-
-The default configuration uses Catch24:
+Temporal settings are defined in physical units:
 
 ```json
-"catch24": true
+"shapelets": {
+  "lengths_ns": [0.08, 0.16, 0.32, 0.64],
+  "count_per_length": [8, 8, 8, 8],
+  "search_region_ns": {"start": -1.0, "stop": 3.0},
+  "stride_ns": 0.02,
+  "softmin_temperature": 0.05
+}
 ```
 
-This includes the 22 Catch22 dynamical features plus waveform mean and standard
-deviation. The two additional scale features are useful here because LED time
-walk can depend on pulse amplitude. A strict morphology-only Catch22 ablation is
-still available with
+The trainer infers the sampling step from the prepared dataset's
+`relative_time_ps` grid. It verifies uniform sampling, converts each requested
+length and stride to samples, and rejects configurations that do not fit in the
+requested search region. The resolved values are embedded in the checkpoint.
 
-```json
-"catch24": false
-```
+This means `0.16 ns` keeps the same physical interpretation when the acquisition
+sampling step changes, while the corresponding number of samples changes
+automatically.
 
-Catch22/Catch24 extraction is performed only for the frozen selected events in
-the train, validation, and blind-test splits, after the energy-only quality cuts
-and the training-fitted photopeak selection. Rejected events in the raw waveform
-cache are not transformed. Features are cached in resumable chunks under the
-energy dataset cache; changing the split, selection, or feature settings creates
-a new fingerprinted cache.
+### Differentiable shapelet matching
 
-## Final comparison
-
-On the untouched blind test set, the pipeline compares:
-
-1. Energy LED standard
-2. Energy CFD standard
-3. Energy LED corrected by the selected model
-
-Every CTR uses the same iterative Gaussian-fit method. Final outputs include bias, CTR, fit plots, comparison plots, and the channel-swap test.
-
-## Data separation
-
-Default split:
+For each normalized shapelet `q_k` and each candidate waveform window, the model
+computes normalized correlation using `conv1d`. The normalized squared distance
+is:
 
 ```text
-80% training
-10% validation
-10% blind final test
+distance = 2 - 2 * correlation
 ```
 
-Photopeak parameters, LED centering, timing calibration, neural input normalization, and model fitting use training data only. Catch22 extraction is deterministic and may be cached for all events, but test features and labels are not used to fit or select the random forest.
+A soft minimum over candidate positions provides differentiable match weights.
+Each shapelet can emit:
 
-## Installation
+- `distance`;
+- `position_ns`;
+- `local_mean`;
+- `local_std`;
+- `correlation`.
 
-From the repository root:
+`position_ns` is the physical starting time of the matched subsequence, not a
+sample index or normalized fraction.
 
-```bash
-python -m venv .venv
-```
+### Pairwise objective
 
-Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements_ml.txt
-```
-
-Linux/macOS:
-
-```bash
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements_ml.txt
-```
-
-The Catch22 implementation uses `aeon`, avoiding the need to compile the `pycatch22` C extension on Python 3.11 Windows.
-
-## Shared configuration
-
-Data, selection, waveform processing, parallelization, output paths, logging, and Gaussian fitting are configured in:
+The model is optimized directly with:
 
 ```text
-config/ml_pipeline_config.json
+MSE(g(s1) - g(s2), LED_delta - true_TOF)
 ```
 
-`waveform.subsample_factor` affects only model inputs. LED and CFD crossings are calculated first at full configured interpolation resolution.
+The optional bias-aware objective remains available through
+`model.loss.type = "mse_bias"`. A shapelet-diversity penalty can be enabled with
+`shapelets.diversity_weight_ps2` to discourage duplicate motifs.
 
-## Catch22 random-forest configuration
+### Initialization
+
+The default initialization copies normalized subsequences from actual training
+waveforms inside the configured search region. This avoids beginning with
+patterns unrelated to detector pulses. `random_normal` initialization remains
+available for controlled comparisons.
+
+### Head
+
+The default head is linear and maps shapelet features to a single-channel
+correction `g(s)`. This makes coefficients directly inspectable in
+`shapelet_head_features.csv`. An MLP head can be selected with:
 
 ```json
-{
-  "model_type": "catch22_random_forest",
-  "features": {
-    "implementation": "aeon",
-    "catch24": true,
-    "outlier_norm": true,
-    "replace_non_finite": true,
-    "chunk_events": 512,
-    "n_jobs": 4,
-    "parallel_backend": "threading"
-  },
-  "random_forest": {
-    "n_estimators": 200,
-    "max_depth": null,
-    "min_samples_split": 4,
-    "min_samples_leaf": 2,
-    "max_features": 0.75,
-    "bootstrap": true,
-    "max_samples": 0.8,
-    "n_jobs": -1
-  },
-  "training": {
-    "stages": 3,
-    "stage_learning_rate": 0.5,
-    "monitor": "validation_loss"
-  },
-  "checkpointing": {
-    "every_trees": 50
+"head": {
+  "type": "mlp",
+  "hidden_units": [64, 16],
+  "activation": "relu",
+  "dropout": 0.0
+}
+```
+
+### Scaling with long waveforms
+
+The memory-heavy object is the batched distance map, whose approximate size is
+proportional to:
+
+```text
+batch_size * shapelet_count * search_positions
+```
+
+It is not proportional to a materialized `events x 20000` feature table. Reduce
+`batch_size`, increase `stride_ns`, narrow `search_region_ns`, or reduce the
+shapelet count when GPU/CPU memory is limiting.
+
+### Artifacts
+
+- `checkpoints/best.pt`: common evaluator-compatible checkpoint;
+- `training_metrics.csv`: pairwise train/validation history;
+- `learned_shapelets.npz`: learned normalized motifs;
+- `shapelet_metadata.csv`: requested/actual lengths and search timing;
+- `shapelet_head_features.csv`: physical feature names and linear coefficients;
+- `plots/shapelets_bank_*.png`: learned motifs by physical length.
+
+## Random ordered-pair swap augmentation
+
+Trainable gradient-based models can randomly reverse the two time-channel
+signals for each training event:
+
+```json
+"training": {
+  "random_pair_swap": true
+}
+```
+
+A swap negates the target, LED difference, CFD difference and true TOF so the
+ordered-pair convention remains physically consistent.
+
+## Optional waveform denoising
+
+High-frequency components can be attenuated during preprocessing with a
+zero-phase Butterworth low-pass filter:
+
+```json
+"waveform": {
+  "denoising": {
+    "enabled": true,
+    "method": "butterworth_lowpass",
+    "cutoff_GHz": 1.0,
+    "order": 4
   }
 }
 ```
 
-Parallelization is independently configurable for:
+The filter is applied before trigger, LED/CFD and ML-window extraction.
 
-- Catch22 feature extraction: `features.n_jobs` and `features.parallel_backend`
-- Random-forest construction: `random_forest.n_jobs`
-- ROOT waveform preprocessing: `ml_pipeline_config.json`
+## Experiments
 
-On Windows, `parallel_backend: "threading"` is usually safer than process spawning.
+`ml_pipeline/experiments.py` remains model-neutral and supports grid, random and
+Optuna-TPE search, cross-validation, repeated seeds, waveform-window views and
+final refitting. The shapelet experiment searches physical lengths, shapelet
+counts, scan stride and soft-min temperature.
 
-## Symmetric channel-swap training augmentation
+## Standard methods
 
-The pipeline configuration contains:
+LED, CFD and linear spline remain under `ml_pipeline/standard_methods/` and are
+excluded from the trainable-model registry.
+
+## Constructive identity MLP encoder
+
+`constructive_mlp_encoder` grows a shared single-channel encoder one scalar unit
+at a time. Unit `k` receives the normalized raw waveform and the outputs of all
+previous frozen units:
+
+```text
+h_k(s) = identity(W_raw,k s + W_hidden,k [h_1(s), ..., h_{k-1}(s)] + b_k)
+```
+
+The pair correction remains antisymmetric:
+
+```text
+prediction = g(s1) - g(s2)
+g(s) = sum_k output_weight_k * h_k(s)
+```
+
+Training begins with one unit. After the best checkpoint for that unit is found,
+its input weights and output coefficient are frozen. A new unit is appended and
+only that unit plus its new output coefficient are optimized. Growth stops when
+the validation-RMSE improvement is below both the configured absolute and
+relative thresholds.
+
+Train with:
+
+```bash
+python scripts/ml_train.py \
+  --config config/ml_train_constructive_encoder.json \
+  --restart
+```
+
+Important mathematical limitation: because every activation is identity, the
+complete cascade is affine in the normalized waveform. More units create a
+supervised low-dimensional basis and a greedy optimization path, but they do not
+add nonlinear expressive power over a single linear regressor.
+
+### Constructive artifacts
+
+- `constructive_growth.csv`: accepted/rejected unit history;
+- `plots/constructive_growth.png`: train/validation RMSE versus accepted units;
+- `encoder_effective_weights.npy`: equivalent raw-waveform projection for each unit;
+- `encoder_effective_bias.npy`: equivalent affine bias for each unit;
+- `encoder_output_weights.npy`: frozen scalar readout coefficients;
+- `overall_effective_weight.npy`: the complete predictor collapsed to one raw-input vector;
+- `encoder_units.csv`: unit norms and readout weights.
+
+### Exporting compressed datasets
+
+Use the frozen hidden-unit values as a reduced representation:
+
+```bash
+python scripts/ml_encode_constructive.py \
+  --checkpoint results/47V/train/constructive_identity_encoder/checkpoints/best.pt \
+  --dataset datasets/central_source_47V/train_validation \
+  --dataset datasets/central_source_47V/blind_test \
+  --output-root datasets_encoded/constructive_identity_encoder \
+  --batch-size 256 \
+  --overwrite
+```
+
+For `K` accepted units, each output dataset contains:
+
+- `encoded_channels.npy` with shape `[events, 2, K]`;
+- `encoded_pair_difference.npy` with shape `[events, K]`;
+- `predicted_led_correction_ps.npy`;
+- `target_led_correction_ps.npy`;
+- original event identifiers and split indices;
+- a manifest tying the representation to the exact checkpoint and normalization.
+
+## Configurable Gaussian-fit cadence during training
+
+The iterative Gaussian fit used to estimate CTR can be skipped on most epochs when checkpoint selection uses RMSE, loss, or arithmetic bias. Configure it under `training`:
 
 ```json
-"channel_swap_augmentation": {
-  "enabled": true,
-  "paired_batches": true
+{
+  "fit_interval_epochs": 10,
+  "fit_train_during_training": false,
+  "fit_validation_during_training": true
 }
 ```
 
-When enabled, each **training** event `(s1, s2)` is accompanied by a virtual
-copy `(s2, s1)`.  The signed quantities are reversed without recomputing LED:
+- `fit_interval_epochs: 1` preserves the original every-epoch behavior.
+- `fit_interval_epochs: 10` fits only on epochs 10, 20, 30, ... .
+- `fit_interval_epochs: 0` disables Gaussian fits during iterative training.
+- Skipped epochs still compute predictions, RMSE, arithmetic bias, and the configured loss; CTR and Gaussian bias are stored as `NaN`.
+- Final train and validation fits are always run after restoring the best checkpoint.
+- If `selection_metric` is `validation_ctr`, validation fitting is forced every epoch because CTR is required for checkpoint selection. Train fitting remains configurable.
 
-```text
-(s1, s2),  LED,  target   ->   (s2, s1),  -LED,  -target
-```
-
-For CNN and MLP training, `paired_batches=true` places every canonical event and
-its swapped copy in the same optimization batch.  Validation metrics, training
-metrics, and blind-test metrics are still evaluated exactly once on the
-canonical channel order.  The existing final swap test remains a separate
-diagnostic.  Catch24 features are not extracted again: the cached feature pair
-is only reversed in memory.
-
-This augmentation is training-only and does not change the frozen split, the
-photopeak selection, or the physical calibration convention.
-
-For a canonical residual `e`, the swapped copy has residual `-e`.  Therefore the
-standard deviation over the paired symmetric batch is
-
-```text
-std([e, -e]) = sqrt(mean(e^2))
-```
-
-which is the canonical residual RMSE in ps.  Unlike the canonical-only standard
-deviation, this includes the squared residual mean and therefore penalizes a
-learned constant bias.  Epoch metrics and checkpoint selection compute this
-same value from the canonical predictions only, so validation/test inference is
-not duplicated.
-
-## Terminal execution
-
-### 1. Prepare the shared energy-only waveform cache and frozen split
-
-```bash
-python scripts/ml_prepare.py --pipeline-config config/ml_pipeline_config.json
-```
-
-### 2. Train a model
-
-CNN:
-
-```bash
-python scripts/ml_train.py --pipeline-config config/ml_pipeline_config.json --model-config config/cnn_config.json
-```
-
-Time-series MLP:
-
-```bash
-python scripts/ml_train.py --pipeline-config config/ml_pipeline_config.json --model-config config/time_series_regressor_config.json
-```
-
-Catch22 random forest:
-
-```bash
-python scripts/ml_train.py --pipeline-config config/ml_pipeline_config.json --model-config config/catch22_random_forest_config.json
-```
-
-The first random-forest run builds the Catch22 cache. Later runs with the same feature configuration reuse it.
-
-### 3. Final blind-test evaluation
-
-```bash
-python scripts/ml_evaluate.py --pipeline-config config/ml_pipeline_config.json --model-config config/catch22_random_forest_config.json
-```
-
-### One-command execution
-
-```bash
-python scripts/run_energy_ml_pipeline.py --pipeline-config config/ml_pipeline_config.json --model-config config/catch22_random_forest_config.json
-```
-
-### Resume or restart random-forest training
-
-```bash
-python scripts/ml_train.py --pipeline-config config/ml_pipeline_config.json --model-config config/catch22_random_forest_config.json --resume
-```
-
-```bash
-python scripts/ml_train.py --pipeline-config config/ml_pipeline_config.json --model-config config/catch22_random_forest_config.json --restart
-```
-
-Feature extraction resumes at the last completed chunk. Forest fitting checkpoints every configured number of trees and after every residual stage.
-
-## Model-separated outputs
-
-The waveform dataset and split caches remain shared. Alternative models are written to separate directories, for example:
-
-```text
-results/energy_ml_cnn/checkpoints/time_series_mlp/
-results/energy_ml_cnn/checkpoints/catch22_random_forest/
-results/energy_ml_cnn/plots/catch22_random_forest/
-results/energy_ml_cnn/catch22_random_forest/final_metrics.csv
-```
-
-The Catch22 model additionally writes:
-
-```text
-feature_importance.csv
-feature_importance.png
-training_history.csv
-best_validation.joblib
-last.joblib
-```
-
-## Swap test
-
-Mixed-channel training is not implemented. Final evaluation explicitly swaps the test channels and verifies correction antisymmetry, corrected-estimator sign consistency, CTR consistency, and bias consistency.
-
-## Faster Catch24 extraction on Windows
-
-The default Catch24 feature configuration now uses the compiled `pycatch22`
-implementation and process-based parallelism:
-
-```json
-"features": {
-  "implementation": "aeon",
-  "catch24": true,
-  "outlier_norm": true,
-  "use_pycatch22": true,
-  "replace_non_finite": true,
-  "chunk_events": 2048,
-  "checkpoint_every_chunks": 4,
-  "n_jobs": -1,
-  "parallel_backend": "loky"
-}
-```
-
-`threading` can under-use the CPU when feature calculations spend time in
-Python code because threads contend for the GIL. `loky` uses separate worker
-processes, while `pycatch22` routes feature calculations through the compiled C
-implementation. The transformer is now created and fitted once per extraction
-run rather than once per chunk. Feature-cache flushing is batched every four
-chunks to reduce disk synchronization overhead.
-
-Install the accelerated dependency with:
-
-```cmd
-python -m pip install -r requirements_ml.txt
-```
-
-The extraction log reports per-chunk throughput, average throughput, ETA, and
-whether a resumable checkpoint was written. On memory-constrained machines,
-replace `n_jobs: -1` with a fixed value such as `4` or `6`. Reducing
-`chunk_events` to `1024` also reduces the amount of data resident in each
-worker batch.
-
-Changing `use_pycatch22`, `catch24`, or `outlier_norm` creates a new feature
-cache because these options can alter the extracted values. Changing only
-`n_jobs`, `parallel_backend`, `chunk_events`, or `checkpoint_every_chunks`
-reuses the same feature-value fingerprint.
+`training_metrics.csv` includes `train_fit_performed` and `validation_fit_performed` flags.

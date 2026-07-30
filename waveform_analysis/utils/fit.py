@@ -133,11 +133,37 @@ def fit_delta_times_integer_fs(
             message=f"Only {n_valid} valid events; need {min_events}",
         )
 
-    range_ps = config["histogram_range_ps"]
-    low_fs = np.int64(np.rint(float(range_ps[0]) * FS_PER_PS))
-    high_fs = np.int64(np.rint(float(range_ps[1]) * FS_PER_PS))
+    range_ps = config.get("histogram_range_ps")
     bin_width_fs = int(np.rint(float(config["histogram_bin_ps"]) * FS_PER_PS))
-    if bin_width_fs <= 0 or high_fs <= low_fs:
+    if bin_width_fs <= 0:
+        raise ValueError("fit.histogram_bin_ps must produce a positive integer-fs width")
+
+    if range_ps is None:
+        # Automatic range for mixed operating regimes.  Use a robust symmetric
+        # interval whose bin grid remains anchored at zero, so changing tails does
+        # not shift histogram bin centers between methods or data splits.
+        finite_values = values[np.isfinite(values)]
+        if finite_values.size == 0:
+            return _failure(
+                method=method,
+                parameter=parameter,
+                n_total=n_total,
+                n_selected=n_selected,
+                n_valid=n_valid,
+                message="No finite events available for automatic histogram range",
+            )
+        robust_abs_fs = float(np.quantile(np.abs(finite_values.astype(np.float64)), 0.999))
+        minimum_half_fs = 2.0 * float(config["initial_half_width_ps"]) * FS_PER_PS
+        requested_half_fs = max(robust_abs_fs * 1.10, minimum_half_fs, float(bin_width_fs))
+        half_bins = max(1, int(np.ceil(requested_half_fs / bin_width_fs)))
+        half_range_fs = half_bins * bin_width_fs
+        low_fs = np.int64(-half_range_fs)
+        high_fs = np.int64(half_range_fs)
+    else:
+        low_fs = np.int64(np.rint(float(range_ps[0]) * FS_PER_PS))
+        high_fs = np.int64(np.rint(float(range_ps[1]) * FS_PER_PS))
+
+    if high_fs <= low_fs:
         raise ValueError("invalid integer histogram settings")
     edges_fs = np.arange(
         int(low_fs),

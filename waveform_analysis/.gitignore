@@ -1,6 +1,8 @@
-.venv/
 __pycache__/
-*.pyc
-results/*
+*.py[cod]
+.ipynb_checkpoints/
+.cache/
+datasets/
+results/
 processed_data/*
-datasets/*
+*.log

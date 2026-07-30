@@ -1,6 +1,8 @@
--r requirements.txt
-torch>=2.2
-scikit-learn>=1.3
-aeon>=1.0
-pycatch22==0.4.5
-joblib>=1.3
+numpy
+scipy
+matplotlib
+torch
+uproot
+awkward
+optuna
+scikit-learn

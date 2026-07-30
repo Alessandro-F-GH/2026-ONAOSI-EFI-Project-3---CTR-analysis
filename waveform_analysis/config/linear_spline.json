@@ -1,0 +1,15 @@
+{
+  "dataset": "datasets/central_source_47V/train_validation",
+  "output_dir": "results/47V/standard_methods/linear_spline",
+  "window": {
+    "before_ns": 4.0,
+    "after_ns": 36.0
+  },
+  "parameters": {
+    "n_basis": 16,
+    "spline_degree": 3,
+    "amplitude_normalization": "none",
+    "smoothness_penalty": 0.001,
+    "ridge_penalty": 1e-10
+  }
+}

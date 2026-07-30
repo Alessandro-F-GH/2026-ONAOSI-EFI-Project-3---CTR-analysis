@@ -28,14 +28,6 @@ def _positive(value: Any, path: str) -> float:
     return number
 
 
-def load_json(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as stream:
-        value = json.load(stream)
-    if not isinstance(value, dict):
-        raise MLConfigError(f"{path} must contain a JSON object")
-    return value
-
-
 def _resolve_path(project_root: Path, value: str) -> str:
     path = Path(value)
     if not path.is_absolute():
@@ -43,48 +35,72 @@ def _resolve_path(project_root: Path, value: str) -> str:
     return str(path.resolve())
 
 
-def load_pipeline_config(path: str | Path, project_root: str | Path) -> dict[str, Any]:
+def load_json(path: str | Path) -> dict[str, Any]:
     source = Path(path).resolve()
-    root = Path(project_root).resolve()
-    config = load_json(source)
-    validate_pipeline_config(config)
+    with source.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise MLConfigError(f"{source} must contain a JSON object")
+    return value
+
+
+def _finish(config: dict[str, Any], source: Path, root: Path) -> dict[str, Any]:
     result = copy.deepcopy(config)
     result["_config_path"] = str(source)
     result["_config_hash"] = canonical_hash(config)
     result["_project_root"] = str(root)
-    result["data"]["input_root"] = _resolve_path(root, result["data"]["input_root"])
-    for key in ("work_dir", "dataset_cache_dir", "split_dir", "checkpoint_dir", "plot_dir", "log_dir"):
-        result["paths"][key] = _resolve_path(root, result["paths"][key])
     return result
 
 
-def load_model_config(path: str | Path) -> dict[str, Any]:
-    source = Path(path).resolve()
-    config = load_json(source)
-    validate_model_config(config)
-    result = copy.deepcopy(config)
-    result["_config_path"] = str(source)
-    result["_config_hash"] = canonical_hash(config)
-    # Import lazily to avoid importing torch while merely validating JSON.
-    from .model import model_type
 
-    result["_model_type"] = model_type(result)
-    return result
+def resolve_fit_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    fit = copy.deepcopy(config or {})
+    fit.setdefault("histogram_bin_ps", 10.0)
+    fit.setdefault("initial_half_width_ps", 500.0)
+    fit.setdefault("iteration_sigma", 2.5)
+    fit.setdefault("max_iterations", 3)
+    fit.setdefault("min_events", 10)
+    fit.setdefault("minimum_fit_bins", 5)
+    fit.setdefault("convergence_tolerance_ps", 0.1)
+    fit.setdefault("minimum_sigma_bins", 1.0)
+    return fit
 
-
-def load_cnn_config(path: str | Path) -> dict[str, Any]:
-    """Backward-compatible alias for older terminal commands."""
-    result = load_model_config(path)
-    if result["_model_type"] != "cnn":
-        raise MLConfigError(
-            f"Expected a CNN config, found model_type={result['_model_type']!r}"
-        )
-    return result
+def _validate_fit(config: dict[str, Any]) -> None:
+    fit = _mapping(config, "fit")
+    for name in ("histogram_bin_ps", "initial_half_width_ps", "iteration_sigma"):
+        _positive(fit[name], f"fit.{name}")
+    for name in ("max_iterations", "min_events", "minimum_fit_bins"):
+        if int(fit[name]) <= 0:
+            raise MLConfigError(f"fit.{name} must be positive")
 
 
-def validate_pipeline_config(config: dict[str, Any]) -> None:
-    root = _mapping(config, "config")
-    required = (
+
+
+def _validate_denoising_config(value: Any, path: str) -> None:
+    if value is None:
+        return
+    denoising = _mapping(value, path)
+    enabled = denoising.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise MLConfigError(f"{path}.enabled must be boolean")
+    method = str(denoising.get("method", "butterworth_lowpass"))
+    if method != "butterworth_lowpass":
+        raise MLConfigError(f"{path}.method must be 'butterworth_lowpass'")
+    if enabled or "cutoff_GHz" in denoising:
+        _positive(denoising.get("cutoff_GHz"), f"{path}.cutoff_GHz")
+    if enabled or "order" in denoising:
+        order_value = denoising.get("order", 4)
+        try:
+            order = int(order_value)
+        except (TypeError, ValueError) as exc:
+            raise MLConfigError(f"{path}.order must be an integer") from exc
+        if float(order_value) != float(order) or not 1 <= order <= 12:
+            raise MLConfigError(f"{path}.order must be an integer from 1 to 12")
+
+
+def validate_preprocess_config(config: dict[str, Any]) -> None:
+    for section in (
+        "dataset",
         "data",
         "channels",
         "waveform",
@@ -92,36 +108,45 @@ def validate_pipeline_config(config: dict[str, Any]) -> None:
         "photopeak",
         "split",
         "parallelization",
-        "paths",
         "cache",
-        "fit",
-        "plotting",
         "logging",
-        "evaluation",
-    )
-    for section in required:
-        _mapping(root.get(section), section)
-
-    data = root["data"]
-    if not isinstance(data.get("input_root"), str) or not data["input_root"]:
-        raise MLConfigError("data.input_root must be a non-empty path string")
-    float(data["true_tof_ps"])
-
-    channels = root["channels"]
-    energy = channels.get("energy")
-    polarities = channels.get("polarities")
-    if not isinstance(energy, list) or len(energy) != 2:
-        raise MLConfigError("channels.energy must contain two one-based channel numbers")
-    if len(set(int(item) for item in energy)) != 2 or any(
-        int(item) not in (1, 2, 3, 4) for item in energy
     ):
-        raise MLConfigError("channels.energy must contain two distinct values in [1, 4]")
-    if not isinstance(polarities, list) or len(polarities) != 2:
-        raise MLConfigError("channels.polarities must contain two entries")
-    if any(int(item) not in (-1, 1) for item in polarities):
+        _mapping(config.get(section), section)
+
+    dataset = config["dataset"]
+    if not str(dataset.get("name", "")).strip():
+        raise MLConfigError("dataset.name must be non-empty")
+    if dataset.get("role", "training") not in ("training", "blind"):
+        raise MLConfigError("dataset.role must be 'training' or 'blind'")
+    if not str(dataset.get("output_dir", "")).strip():
+        raise MLConfigError("dataset.output_dir must be non-empty")
+    blind_test = dataset.get("blind_test")
+    if blind_test is not None:
+        blind_test = _mapping(blind_test, "dataset.blind_test")
+        if dataset.get("role", "training") != "training":
+            raise MLConfigError("dataset.blind_test is allowed only for training datasets")
+        if not str(blind_test.get("name", "")).strip():
+            raise MLConfigError("dataset.blind_test.name must be non-empty")
+        if not str(blind_test.get("output_dir", "")).strip():
+            raise MLConfigError("dataset.blind_test.output_dir must be non-empty")
+        if str(blind_test["output_dir"]) == str(dataset["output_dir"]):
+            raise MLConfigError("Training and blind-test output directories must differ")
+
+    if not str(config["data"].get("input_root", "")).strip():
+        raise MLConfigError("data.input_root must be non-empty")
+    float(config["data"]["true_tof_ps"])
+    channels = config["channels"]
+    if not isinstance(channels.get("energy"), list) or len(channels["energy"]) != 2:
+        raise MLConfigError("channels.energy must contain exactly two channels")
+    energy_channels = [int(value) for value in channels["energy"]]
+    if any(value <= 0 for value in energy_channels) or len(set(energy_channels)) != 2:
+        raise MLConfigError("channels.energy must contain two distinct positive channels")
+    if not isinstance(channels.get("polarities"), list) or len(channels["polarities"]) != 2:
+        raise MLConfigError("channels.polarities must contain exactly two values")
+    if any(int(value) not in (-1, 1) for value in channels["polarities"]):
         raise MLConfigError("channels.polarities values must be +1 or -1")
 
-    waveform = root["waveform"]
+    waveform = config["waveform"]
     for name in (
         "baseline_samples",
         "search_trigger_threshold_mV",
@@ -131,157 +156,188 @@ def validate_pipeline_config(config: dict[str, Any]) -> None:
         "subsample_factor",
     ):
         _positive(waveform[name], f"waveform.{name}")
-    if not 0 < float(waveform["cfd_fraction"]) < 1:
-        raise MLConfigError("waveform.cfd_fraction must lie strictly between 0 and 1")
-    if int(waveform["subsample_factor"]) < 1:
-        raise MLConfigError("waveform.subsample_factor must be at least 1")
-    for section in ("analysis_crop_ns", "ml_window_ns"):
-        window = _mapping(waveform.get(section), f"waveform.{section}")
-        _positive(window["before"], f"waveform.{section}.before")
-        _positive(window["after"], f"waveform.{section}.after")
+    for name in ("analysis_crop_ns", "ml_window_ns"):
+        window = _mapping(waveform[name], f"waveform.{name}")
+        _positive(window["before"], f"waveform.{name}.before")
+        _positive(window["after"], f"waveform.{name}.after")
 
-    split = root["split"]
+    _validate_denoising_config(waveform.get("denoising"), "waveform.denoising")
+
+    timing_led = waveform.get("timing_channel_led", {"enabled": False})
+    timing_led = _mapping(timing_led, "waveform.timing_channel_led")
+    timing_enabled = timing_led.get("enabled", False)
+    if not isinstance(timing_enabled, bool):
+        raise MLConfigError("waveform.timing_channel_led.enabled must be boolean")
+    if timing_enabled:
+        timing_channels = channels.get("timing")
+        if not isinstance(timing_channels, list) or len(timing_channels) != 2:
+            raise MLConfigError(
+                "channels.timing must contain exactly two channels when timing-channel LED is enabled"
+            )
+        timing_channels = [int(value) for value in timing_channels]
+        if any(value <= 0 for value in timing_channels) or len(set(timing_channels)) != 2:
+            raise MLConfigError("channels.timing must contain two distinct positive channels")
+        if set(timing_channels).intersection(energy_channels):
+            raise MLConfigError("channels.timing must be distinct from channels.energy")
+        timing_polarities = channels.get("timing_polarities")
+        if not isinstance(timing_polarities, list) or len(timing_polarities) != 2:
+            raise MLConfigError(
+                "channels.timing_polarities must contain exactly two values when timing-channel LED is enabled"
+            )
+        if any(int(value) not in (-1, 1) for value in timing_polarities):
+            raise MLConfigError("channels.timing_polarities values must be +1 or -1")
+
+    for name in (
+        "baseline_samples",
+        "search_trigger_threshold_mV",
+        "upsample_step_ps",
+        "led_threshold_mV",
+    ):
+        if name in timing_led:
+            _positive(timing_led[name], f"waveform.timing_channel_led.{name}")
+    if "analysis_crop_ns" in timing_led:
+        timing_crop = _mapping(
+            timing_led["analysis_crop_ns"],
+            "waveform.timing_channel_led.analysis_crop_ns",
+        )
+        _positive(
+            timing_crop["before"],
+            "waveform.timing_channel_led.analysis_crop_ns.before",
+        )
+        _positive(
+            timing_crop["after"],
+            "waveform.timing_channel_led.analysis_crop_ns.after",
+        )
+    _validate_denoising_config(
+        timing_led.get("denoising"),
+        "waveform.timing_channel_led.denoising",
+    )
+
+    split = config["split"]
     fractions = [float(split[name]) for name in ("train_fraction", "validation_fraction", "test_fraction")]
     if any(value <= 0 for value in fractions) or abs(sum(fractions) - 1.0) > 1e-9:
         raise MLConfigError("split fractions must be positive and sum to 1")
-    if split.get("strategy", "event") not in ("event", "source_file"):
-        raise MLConfigError("split.strategy must be 'event' or 'source_file'")
+    strategy = str(split.get("strategy", "event"))
+    allowed = {"event", "stratified_event", "source_file", "contiguous_blocks"}
+    if strategy not in allowed:
+        raise MLConfigError(f"split.strategy must be one of {sorted(allowed)}")
+    if strategy == "contiguous_blocks" and int(split.get("guard_gap_events", 0)) < 0:
+        raise MLConfigError("split.guard_gap_events must be non-negative")
 
-    augmentation = root.get("channel_swap_augmentation", {})
-    if augmentation is not None:
-        augmentation = _mapping(augmentation, "channel_swap_augmentation")
-        for name in ("enabled", "paired_batches"):
-            if name in augmentation and not isinstance(augmentation[name], bool):
-                raise MLConfigError(
-                    f"channel_swap_augmentation.{name} must be boolean"
-                )
-
-    parallel = root["parallelization"]
-    if parallel.get("preprocessing_backend", "process") not in ("process", "thread", "serial"):
-        raise MLConfigError("parallelization.preprocessing_backend is invalid")
-    for name in ("preprocessing_workers", "training_num_workers", "torch_num_threads"):
-        if int(parallel.get(name, 0)) < 0:
-            raise MLConfigError(f"parallelization.{name} cannot be negative")
-
-    fit = root["fit"]
-    if len(fit["histogram_range_ps"]) != 2:
-        raise MLConfigError("fit.histogram_range_ps must contain two values")
-    if float(fit["histogram_range_ps"][1]) <= float(fit["histogram_range_ps"][0]):
-        raise MLConfigError("fit.histogram_range_ps must be increasing")
-    for name in ("histogram_bin_ps", "initial_half_width_ps", "iteration_sigma"):
-        _positive(fit[name], f"fit.{name}")
+    cache = config["cache"]
+    for name in ("raw_cache_dir", "selection_cache_dir"):
+        if not str(cache.get(name, "")).strip():
+            raise MLConfigError(f"cache.{name} must be non-empty")
 
 
-def _validate_common_model_sections(root: dict[str, Any]) -> None:
-    for section in ("architecture", "optimizer", "scheduler", "training", "checkpointing"):
-        _mapping(root.get(section), section)
-    architecture = root["architecture"]
-    if architecture.get("activation", "relu") not in ("relu", "gelu", "silu"):
-        raise MLConfigError("architecture.activation must be relu, gelu, or silu")
-    dropout = float(architecture.get("dropout", 0.0))
-    if not 0.0 <= dropout < 1.0:
-        raise MLConfigError("architecture.dropout must lie in [0, 1)")
-    max_abs = architecture.get("max_abs_single_channel_output_ps")
-    if max_abs is not None:
-        _positive(max_abs, "architecture.max_abs_single_channel_output_ps")
-    training = root["training"]
-    for name in ("epochs", "batch_size"):
-        if int(training[name]) <= 0:
-            raise MLConfigError(f"training.{name} must be positive")
-    _positive(root["optimizer"]["learning_rate"], "optimizer.learning_rate")
+def load_preprocess_config(path: str | Path, project_root: str | Path) -> dict[str, Any]:
+    source = Path(path).resolve()
+    root = Path(project_root).resolve()
+    config = load_json(source)
+    validate_preprocess_config(config)
+    result = _finish(config, source, root)
+    result["data"]["input_root"] = _resolve_path(root, result["data"]["input_root"])
+    if not Path(result["data"]["input_root"]).is_file():
+        raise MLConfigError(f"Input ROOT file does not exist: {result['data']['input_root']}")
+    result["dataset"]["output_dir"] = _resolve_path(root, result["dataset"]["output_dir"])
+    if "blind_test" in result["dataset"]:
+        result["dataset"]["blind_test"]["output_dir"] = _resolve_path(
+            root, result["dataset"]["blind_test"]["output_dir"]
+        )
+    result["cache"]["raw_cache_dir"] = _resolve_path(root, result["cache"]["raw_cache_dir"])
+    result["cache"]["selection_cache_dir"] = _resolve_path(
+        root, result["cache"]["selection_cache_dir"]
+    )
+    return result
 
 
-def validate_model_config(config: dict[str, Any]) -> None:
-    root = _mapping(config, "model_config")
-    from .model import model_type
+def validate_train_config(config: dict[str, Any]) -> None:
+    for section in ("model", "training", "output", "fit", "plotting", "logging"):
+        _mapping(config.get(section), section)
+    datasets = config.get("datasets")
+    if not isinstance(datasets, list) or not datasets or not all(
+        isinstance(value, str) and value for value in datasets
+    ):
+        raise MLConfigError("datasets must be a non-empty list of dataset paths")
 
-    kind = model_type(root)
-    if kind == "catch22_random_forest":
-        for section in ("features", "random_forest", "training", "checkpointing"):
-            _mapping(root.get(section), section)
-        features = root["features"]
-        if str(features.get("implementation", "aeon")).lower() != "aeon":
-            raise MLConfigError("features.implementation currently supports only aeon")
-        if int(features.get("chunk_events", 512)) <= 0:
-            raise MLConfigError("features.chunk_events must be positive")
-        n_jobs = int(features.get("n_jobs", 1))
-        if n_jobs == 0 or n_jobs < -1:
-            raise MLConfigError("features.n_jobs must be -1 or a positive integer")
-        backend = features.get("parallel_backend", "threading")
-        if backend not in (None, "threading", "loky", "multiprocessing"):
-            raise MLConfigError("features.parallel_backend is invalid")
+    model = config["model"]
+    if not str(model.get("name", "")).strip():
+        raise MLConfigError("model.name must be non-empty")
+    model_type = str(model.get("type", "")).strip()
+    model_options = {key: value for key, value in model.items() if key not in ("type", "name")}
+    try:
+        from .models import validate_model, validate_model_training
 
-        forest = root["random_forest"]
-        if int(forest.get("n_estimators", 0)) <= 0:
-            raise MLConfigError("random_forest.n_estimators must be positive")
-        if forest.get("criterion", "squared_error") not in (
-            "squared_error",
-            "friedman_mse",
-            "absolute_error",
-        ):
-            raise MLConfigError("random_forest.criterion is invalid")
-        max_depth = forest.get("max_depth")
-        if max_depth is not None and int(max_depth) <= 0:
-            raise MLConfigError("random_forest.max_depth must be null or positive")
-        if int(forest.get("n_jobs", -1)) == 0 or int(forest.get("n_jobs", -1)) < -1:
-            raise MLConfigError("random_forest.n_jobs must be -1 or a positive integer")
-        if bool(forest.get("oob_score", False)) and not bool(
-            forest.get("bootstrap", True)
-        ):
-            raise MLConfigError("random_forest.oob_score requires bootstrap=true")
-        if forest.get("max_samples") is not None and not bool(
-            forest.get("bootstrap", True)
-        ):
-            raise MLConfigError("random_forest.max_samples requires bootstrap=true")
+        validate_model(model_type, model_options)
+        validate_model_training(model_type, config)
+    except ValueError as exc:
+        raise MLConfigError(f"Invalid {model_type or 'model'} configuration: {exc}") from exc
 
-        training = root["training"]
-        if int(training.get("stages", 0)) <= 0:
-            raise MLConfigError("training.stages must be positive")
-        rate = float(training.get("stage_learning_rate", 0.5))
-        if not 0 < rate <= 1:
-            raise MLConfigError("training.stage_learning_rate must lie in (0, 1]")
-        if training.get("monitor", "validation_loss") not in (
-            "validation_loss",
-            "validation_ctr_ps",
-            "validation_corrected_std_ps",
-        ):
-            raise MLConfigError("training.monitor is invalid")
-        max_abs = training.get("max_abs_single_channel_output_ps")
-        if max_abs is not None:
-            _positive(max_abs, "training.max_abs_single_channel_output_ps")
-        if int(root["checkpointing"].get("every_trees", 1)) <= 0:
-            raise MLConfigError("checkpointing.every_trees must be positive")
-        return
-
-    _validate_common_model_sections(root)
-    architecture = root["architecture"]
-    if kind == "cnn":
-        channels = architecture.get("conv_channels")
-        kernels = architecture.get("kernel_sizes")
-        pools = architecture.get("pool_sizes")
-        if not isinstance(channels, list) or not channels:
-            raise MLConfigError("architecture.conv_channels must be a non-empty list")
-        if not isinstance(kernels, list) or len(kernels) != len(channels):
-            raise MLConfigError("architecture.kernel_sizes must match conv_channels")
-        if not isinstance(pools, list) or len(pools) != len(channels):
-            raise MLConfigError("architecture.pool_sizes must match conv_channels")
-        if any(int(value) <= 0 for value in channels + kernels + pools):
-            raise MLConfigError("CNN channels, kernels, and pool sizes must be positive")
-        return
-    if kind == "time_series_mlp":
-        hidden = architecture.get("hidden_units", [])
-        if not isinstance(hidden, list):
-            raise MLConfigError("architecture.hidden_units must be a list")
-        if any(int(value) <= 0 for value in hidden):
-            raise MLConfigError("architecture.hidden_units values must be positive")
-        return
-    raise MLConfigError(f"Unsupported model type: {kind}")
+    if not str(config["output"].get("train_dir", "")).strip():
+        raise MLConfigError("output.train_dir must be non-empty")
+    _validate_fit(config["fit"])
 
 
-def validate_cnn_config(config: dict[str, Any]) -> None:
-    """Backward-compatible validator."""
-    validate_model_config(config)
-    from .model import model_type
+def load_train_config(path: str | Path, project_root: str | Path) -> dict[str, Any]:
+    source = Path(path).resolve()
+    root = Path(project_root).resolve()
+    config = load_json(source)
+    validate_train_config(config)
+    result = _finish(config, source, root)
+    result["fit"] = resolve_fit_config(result.get("fit"))
+    result["datasets"] = [_resolve_path(root, value) for value in result["datasets"]]
+    result["output"]["train_dir"] = _resolve_path(root, result["output"]["train_dir"])
+    return result
 
-    if model_type(config) != "cnn":
-        raise MLConfigError("validate_cnn_config received a non-CNN model config")
+
+def validate_evaluate_config(config: dict[str, Any]) -> None:
+    for section in ("output", "fit", "plotting", "logging"):
+        _mapping(config.get(section), section)
+    blind_tests = config.get("blind_tests")
+    if not isinstance(blind_tests, list) or not blind_tests:
+        raise MLConfigError("blind_tests must be a non-empty list")
+    for item in blind_tests:
+        if isinstance(item, str):
+            continue
+        if not isinstance(item, dict) or not str(item.get("dataset", "")).strip():
+            raise MLConfigError("Each blind test must be a path string or an object with dataset")
+    models = config.get("models", [])
+    if models is not None and (
+        not isinstance(models, list) or not all(isinstance(value, str) for value in models)
+    ):
+        raise MLConfigError("models must be a list of model run/checkpoint paths")
+    standard_methods = config.get("standard_methods", {})
+    has_standard = isinstance(standard_methods, dict) and bool(standard_methods)
+    if not models and not str(config.get("model_search_dir", "")).strip() and not has_standard:
+        raise MLConfigError("Provide models, model_search_dir, or standard_methods")
+    if not str(config["output"].get("evaluation_dir", "")).strip():
+        raise MLConfigError("output.evaluation_dir must be non-empty")
+    _validate_fit(config["fit"])
+
+
+def load_evaluate_config(path: str | Path, project_root: str | Path) -> dict[str, Any]:
+    source = Path(path).resolve()
+    root = Path(project_root).resolve()
+    config = load_json(source)
+    validate_evaluate_config(config)
+    result = _finish(config, source, root)
+    result["fit"] = resolve_fit_config(result.get("fit"))
+    resolved_tests = []
+    for item in result["blind_tests"]:
+        if isinstance(item, str):
+            resolved_tests.append({"name": Path(item).name, "dataset": _resolve_path(root, item)})
+        else:
+            value = dict(item)
+            value["dataset"] = _resolve_path(root, value["dataset"])
+            value.setdefault("name", Path(value["dataset"]).name)
+            resolved_tests.append(value)
+    result["blind_tests"] = resolved_tests
+    result["models"] = [_resolve_path(root, value) for value in (result.get("models") or [])]
+    if str(result.get("model_search_dir", "")).strip():
+        result["model_search_dir"] = _resolve_path(root, result["model_search_dir"])
+    if isinstance(result.get("standard_methods"), dict):
+        spline = result["standard_methods"].get("linear_spline")
+        if isinstance(spline, dict) and str(spline.get("artifact", "")).strip():
+            spline["artifact"] = _resolve_path(root, spline["artifact"])
+    result["output"]["evaluation_dir"] = _resolve_path(root, result["output"]["evaluation_dir"])
+    return result
