@@ -74,8 +74,10 @@ def validate_config(config: dict[str, Any]) -> None:
     crop = _require_mapping(waveform.get("timing_crop_ns"), "waveform.timing_crop_ns")
     if float(crop["before"]) <= 0 or float(crop["after"]) <= 0:
         raise ConfigError("timing crop widths must be positive")
-    if float(waveform["upsample_step_ps"]) <= 0:
-        raise ConfigError("waveform.upsample_step_ps must be positive")
+    # Deprecated compatibility key. Timing extraction now interpolates only the
+    # crossing timestamp between adjacent native samples.
+    if "upsample_step_ps" in waveform and float(waveform["upsample_step_ps"]) <= 0:
+        raise ConfigError("waveform.upsample_step_ps must be positive when provided")
 
     for grid_name in ("led_thresholds_mV", "cfd_fractions"):
         grid = _require_mapping(root["timing_scan"].get(grid_name), f"timing_scan.{grid_name}")
@@ -125,9 +127,11 @@ def grid_from_config(grid: dict[str, Any]) -> list[float]:
 
 
 def extraction_fingerprint(config: dict[str, Any]) -> str:
+    waveform = copy.deepcopy(config["waveform"])
+    waveform.pop("upsample_step_ps", None)
     relevant = {
         "channels": config["channels"],
-        "waveform": config["waveform"],
+        "waveform": waveform,
         "timing_scan": config["timing_scan"],
         "max_events": int(config["io"].get("max_events", 0)),
     }

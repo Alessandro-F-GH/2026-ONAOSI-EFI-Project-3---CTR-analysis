@@ -1,25 +1,80 @@
 # ML pipeline architecture
 
-## Optional timing-channel LED preprocessing
+## Canonical energy/timing preprocessing
 
-The preprocessing layer supports two explicitly recorded conventions:
-
-- `energy_channel_led`: channels 1 and 2 provide LED timestamps and window alignment;
-- `timing_channel_led`: channels 3 and 4 provide LED timestamps and window alignment,
-  while channels 1 and 2 remain the only ML inputs.
-
-In timing-channel mode the event flow is:
+A joint preprocessing run may store two native-grid waveform families in the
+same canonical prepared dataset:
 
 ```text
-channel 3/4 waveform -> timing LED timestamp only
-channel 1/2 waveform + timing LED timestamp -> aligned energy ML window
+energy channels 1/2 -> windows_mV + energy_led_time_fs
+timing channels 3/4 -> timing_windows_mV + timing_led_time_fs
 ```
 
-The timing waveform is never written to the prepared dataset. Energy-channel
-CFD, amplitude, noise and trigger metadata remain unchanged. The prepared
-dataset manifest records `led_timestamp_source`, `cfd_timestamp_source`,
-`ml_window_alignment_source`, and `timing_channel_waveforms_saved` so downstream
-runs cannot silently confuse the two preprocessing conventions.
+`led_time_fs` is retained as the legacy prepared target. In timing-reference
+mode it contains timing-channel LED timestamps, while energy LED timestamps are
+still saved separately. Energy CFD, amplitude, noise and trigger metadata remain
+energy-channel quantities.
+
+Training does not create separate canonical datasets. It resolves a prediction
+view through:
+
+```json
+"prediction": {
+  "input_waveforms": "energy | timing",
+  "target": "prepared_led | energy_led | timing_led"
+}
+```
+
+The selected view redirects the generic `windows_mV` and `led_time_fs` fields
+without copying events. Differentiation, when requested, is then applied to that
+selected waveform family and cached under the training directory. Checkpoint
+metadata records `input_waveform_source`, `prediction_target`, and
+`input_transform`, so evaluation reconstructs the same view automatically.
+
+## Enforced final MLP bias calibration
+
+For the MLP, a bias inside the shared function cancels:
+
+```text
+(g(s1) + b) - (g(s2) + b) = g(s1) - g(s2)
+```
+
+The MLP therefore exposes a separate scalar
+`pair_output_bias_ps`. After early stopping selects the best checkpoint, the
+pipeline measures the arithmetic residual bias on the training split,
+
+```text
+train_bias = mean(target - prediction)
+```
+
+and adds exactly that value to the predicted correction. The calibrated model is
+re-evaluated and overwrites `best.pt`; consequently its final arithmetic train
+bias is zero up to floating-point precision. This last calibration is mandatory
+and cannot be disabled. An optional epoch-end constraint may still be used while
+training, but it is not a substitute for the final checkpoint calibration.
+
+A nonzero global output offset necessarily relaxes exact detector-swap
+antisymmetry by a constant. The shared waveform branch remains antisymmetric; the scalar offset performs
+the requested absolute calibration.
+
+## Lightweight CNN for long waveforms
+
+The model type `cnn_regressor` applies one shared single-waveform network to both
+detectors and returns `g(s1) - g(s2) + pair_output_bias_ps`. The default model is
+intentionally small: strided 1-D convolutions exploit local time-series structure
+and reduce the sequence length before a single linear head. This avoids both a
+large full-waveform dense layer and a compute-heavy deep CNN.
+
+The supplied configs are:
+
+```bash
+python scripts/ml_train.py --config config/ml_train_cnn.json --restart
+python scripts/ml_train.py --config config/ml_train_cnn_raw.json --restart
+python scripts/ml_evaluate.py --config config/ml_evaluate_cnn.json
+```
+
+The differentiated and raw configs use identical architectures, seeds, losses,
+and training settings, allowing a controlled input-representation comparison.
 
 ## Trainable models
 
@@ -30,6 +85,37 @@ Every model is self-contained in `ml_pipeline/models/<model>.py` and exposes a
 A model module owns architecture construction, validation, training and
 checkpoint-compatible configuration. The shared training entry point prepares
 datasets, normalization, output paths and the `TrainingContext`.
+
+## Linear SVR
+
+The model type `linear_svr` uses the same ordered detector-pair convention as
+the MLP. A shared linear single-channel score gives
+
+```text
+g(s) = w^T s
+correction(s1, s2) = w^T (s1 - s2) + pair_output_bias_ps
+```
+
+Training uses scikit-learn `LinearSVR` with its epsilon-insensitive objective.
+Every run scans all values in `model.epsilon_values`; each candidate is
+train-bias calibrated and then compared on validation residuals. The configurable
+selection loss is:
+
+- `variance`: population variance of the validation residual;
+- `rmse`: validation residual RMSE;
+- `variance_bias`: `variance + bias_weight * bias^2`.
+
+The squared bias keeps the two terms in `ps^2` and prevents positive and negative
+bias from cancelling. The selected epsilon, full scan table, linear weight, and
+checkpoint-compatible model are saved in the run directory.
+
+Train the three standard prediction tasks with:
+
+```bash
+python scripts/ml_train.py --config config/ml_train_linear_svr.json --restart
+python scripts/ml_train.py --config config/ml_train_linear_svr_timing.json --restart
+python scripts/ml_train.py --config config/ml_train_linear_svr_energy_to_timing.json --restart
+```
 
 ## Shared position-aware shapelet regressor
 
@@ -103,8 +189,17 @@ The model is optimized directly with:
 MSE(g(s1) - g(s2), LED_delta - true_TOF)
 ```
 
-The optional bias-aware objective remains available through
-`model.loss.type = "mse_bias"`. A shapelet-diversity penalty can be enabled with
+The optional bias-aware objective is selected with
+`model.loss.type = "var_bias"`. For residuals
+`r = prediction - target`, it minimizes
+
+```text
+mean((r - mean(r))^2) + bias_weight * (mean(r) / target_scale)^2
+```
+
+so the base term is population residual variance rather than MSE. The bias
+normalization and penalty convention are unchanged from the former
+`mse_bias` option. A shapelet-diversity penalty can be enabled with
 `shapelets.diversity_weight_ps2` to discourage duplicate motifs.
 
 ### Initialization
@@ -284,3 +379,52 @@ The iterative Gaussian fit used to estimate CTR can be skipped on most epochs wh
 - If `selection_metric` is `validation_ctr`, validation fitting is forced every epoch because CTR is required for checkpoint selection. Train fitting remains configurable.
 
 `training_metrics.csv` includes `train_fit_performed` and `validation_fit_performed` flags.
+
+## Event-level top correction analysis
+
+When at least two compatible models are evaluated, `ml_evaluate` computes the
+Pearson correlation matrix of their per-event predicted corrections. The
+outputs are:
+
+```text
+<evaluation>/<blind_test>/model_output_correlation.csv
+<evaluation>/<blind_test>/plots/model_output_correlation.png
+```
+
+This intentionally correlates `predicted_correction_ps`, not corrected timing
+values, because all corrected values contain the same raw LED contribution.
+The plot is controlled by:
+
+```json
+"model_output_correlation": {
+  "enabled": true,
+  "annotate": true
+}
+```
+
+Evaluation can preserve the full per-event model output and rank events by the
+actual reduction in absolute timing error:
+
+```text
+improvement_ps = |raw_target_delta - true_TOF|
+               - |corrected_target_delta - true_TOF|
+```
+
+This avoids the misleading alternative of ranking by prediction magnitude: a
+large correction in the wrong direction is not considered useful. Positive
+`improvement_ps` values are "right corrections"; negative values worsened the
+event. The optional `correction_analysis` block in `ml_evaluate.json` controls the
+number of saved events and whether waveform PNG files are produced.
+
+Artifacts are written per blind test and model:
+
+- `top_right_corrections.csv`: ranked event identifiers, source metadata, raw and
+  corrected residuals, predicted correction, improvement, amplitudes and noise;
+- `correction_analysis.json`: aggregate useful/wrong counts and the top useful
+  correction number;
+- `waveforms/rank_*.png`: exact model-source waveform pair, transformed pair
+  difference, and the movement from raw timing to corrected timing relative to
+  the known TOF.
+
+Use `scripts/plot_top_corrections.py` for the same analysis without rerunning all
+standard-method fits and model comparisons.

@@ -64,5 +64,6 @@
   },
   "logging": {
     "level": "INFO"
-  }
+  },
+  "input_transform": "none"
 }

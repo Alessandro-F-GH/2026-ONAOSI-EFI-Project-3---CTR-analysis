@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from .common import canonical_hash
+from .input_transform import resolve_input_transform
+from .prediction import resolve_prediction_config
 
 
 class MLConfigError(ValueError):
@@ -150,12 +152,18 @@ def validate_preprocess_config(config: dict[str, Any]) -> None:
     for name in (
         "baseline_samples",
         "search_trigger_threshold_mV",
-        "upsample_step_ps",
         "led_threshold_mV",
         "cfd_fraction",
-        "subsample_factor",
     ):
         _positive(waveform[name], f"waveform.{name}")
+    if float(waveform["cfd_fraction"]) > 1.0:
+        raise MLConfigError("waveform.cfd_fraction must lie in (0, 1]")
+    # Deprecated preprocessing options are accepted for old configs but ignored.
+    # Canonical waveform windows are now kept on the native acquisition grid.
+    if "upsample_step_ps" in waveform:
+        _positive(waveform["upsample_step_ps"], "waveform.upsample_step_ps")
+    if "subsample_factor" in waveform:
+        _positive(waveform["subsample_factor"], "waveform.subsample_factor")
     for name in ("analysis_crop_ns", "ml_window_ns"):
         window = _mapping(waveform[name], f"waveform.{name}")
         _positive(window["before"], f"waveform.{name}.before")
@@ -190,8 +198,8 @@ def validate_preprocess_config(config: dict[str, Any]) -> None:
     for name in (
         "baseline_samples",
         "search_trigger_threshold_mV",
-        "upsample_step_ps",
         "led_threshold_mV",
+        "cfd_fraction",
     ):
         if name in timing_led:
             _positive(timing_led[name], f"waveform.timing_channel_led.{name}")
@@ -207,6 +215,23 @@ def validate_preprocess_config(config: dict[str, Any]) -> None:
         _positive(
             timing_crop["after"],
             "waveform.timing_channel_led.analysis_crop_ns.after",
+        )
+    if "cfd_fraction" in timing_led and float(timing_led["cfd_fraction"]) > 1.0:
+        raise MLConfigError(
+            "waveform.timing_channel_led.cfd_fraction must lie in (0, 1]"
+        )
+    if "ml_window_ns" in timing_led:
+        timing_window = _mapping(
+            timing_led["ml_window_ns"],
+            "waveform.timing_channel_led.ml_window_ns",
+        )
+        _positive(
+            timing_window["before"],
+            "waveform.timing_channel_led.ml_window_ns.before",
+        )
+        _positive(
+            timing_window["after"],
+            "waveform.timing_channel_led.ml_window_ns.after",
         )
     _validate_denoising_config(
         timing_led.get("denoising"),
@@ -255,16 +280,31 @@ def validate_train_config(config: dict[str, Any]) -> None:
     for section in ("model", "training", "output", "fit", "plotting", "logging"):
         _mapping(config.get(section), section)
     datasets = config.get("datasets")
-    if not isinstance(datasets, list) or not datasets or not all(
-        isinstance(value, str) and value for value in datasets
-    ):
-        raise MLConfigError("datasets must be a non-empty list of dataset paths")
+    if not isinstance(datasets, list) or not datasets:
+        raise MLConfigError("datasets must be a non-empty list")
+    for value in datasets:
+        if isinstance(value, str) and value:
+            continue
+        if isinstance(value, dict) and str(value.get("dataset", "")).strip():
+            continue
+        raise MLConfigError(
+            "Each dataset must be a path string or an object containing dataset"
+        )
 
     model = config["model"]
+    try:
+        resolve_input_transform(config)
+        resolve_prediction_config(config)
+    except ValueError as exc:
+        raise MLConfigError(str(exc)) from exc
     if not str(model.get("name", "")).strip():
         raise MLConfigError("model.name must be non-empty")
     model_type = str(model.get("type", "")).strip()
-    model_options = {key: value for key, value in model.items() if key not in ("type", "name")}
+    model_options = {
+        key: value
+        for key, value in model.items()
+        if key not in ("type", "name", "input_transform")
+    }
     try:
         from .models import validate_model, validate_model_training
 
@@ -285,7 +325,18 @@ def load_train_config(path: str | Path, project_root: str | Path) -> dict[str, A
     validate_train_config(config)
     result = _finish(config, source, root)
     result["fit"] = resolve_fit_config(result.get("fit"))
-    result["datasets"] = [_resolve_path(root, value) for value in result["datasets"]]
+    result["input_transform"] = resolve_input_transform(result)
+    result["prediction"] = resolve_prediction_config(result)
+    result["model"].pop("input_transform", None)
+    resolved_datasets = []
+    for value in result["datasets"]:
+        if isinstance(value, str):
+            resolved_datasets.append(_resolve_path(root, value))
+        else:
+            item = dict(value)
+            item["dataset"] = _resolve_path(root, item["dataset"])
+            resolved_datasets.append(item)
+    result["datasets"] = resolved_datasets
     result["output"]["train_dir"] = _resolve_path(root, result["output"]["train_dir"])
     return result
 
@@ -312,6 +363,41 @@ def validate_evaluate_config(config: dict[str, Any]) -> None:
         raise MLConfigError("Provide models, model_search_dir, or standard_methods")
     if not str(config["output"].get("evaluation_dir", "")).strip():
         raise MLConfigError("output.evaluation_dir must be non-empty")
+    correlation = config.get("model_output_correlation", {})
+    if correlation is not None:
+        _mapping(correlation, "model_output_correlation")
+        if not isinstance(correlation.get("enabled", True), bool):
+            raise MLConfigError("model_output_correlation.enabled must be boolean")
+        if not isinstance(correlation.get("annotate", True), bool):
+            raise MLConfigError("model_output_correlation.annotate must be boolean")
+
+    correction_analysis = config.get("correction_analysis", {})
+    if correction_analysis is not None:
+        _mapping(correction_analysis, "correction_analysis")
+        if not isinstance(correction_analysis.get("enabled", False), bool):
+            raise MLConfigError("correction_analysis.enabled must be boolean")
+        if not isinstance(correction_analysis.get("save_waveform_plots", True), bool):
+            raise MLConfigError(
+                "correction_analysis.save_waveform_plots must be boolean"
+            )
+        try:
+            top_n = int(correction_analysis.get("top_n", 10))
+        except (TypeError, ValueError) as exc:
+            raise MLConfigError("correction_analysis.top_n must be an integer") from exc
+        if top_n <= 0:
+            raise MLConfigError("correction_analysis.top_n must be positive")
+        try:
+            minimum = float(
+                correction_analysis.get("minimum_improvement_ps", 0.0)
+            )
+        except (TypeError, ValueError) as exc:
+            raise MLConfigError(
+                "correction_analysis.minimum_improvement_ps must be numeric"
+            ) from exc
+        if minimum < 0.0:
+            raise MLConfigError(
+                "correction_analysis.minimum_improvement_ps must be non-negative"
+            )
     _validate_fit(config["fit"])
 
 

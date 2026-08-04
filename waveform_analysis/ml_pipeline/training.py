@@ -7,8 +7,10 @@ from typing import Any
 
 from .common import atomic_json, set_global_seed
 from .config import resolve_fit_config
-from .dataset import PreparedDataset, load_prepared_dataset
+from .dataset import PreparedDataset, load_prepared_dataset_spec
+from .input_transform import materialize_training_input_cache, resolve_input_transform
 from .models import train_registered_model
+from .prediction import prediction_dataset_view, resolve_prediction_config
 from .torch_data import compute_normalization
 from .training_context import TrainingContext
 
@@ -24,6 +26,7 @@ def _validate_dataset_contract(
         "cfd_timestamp_source",
         "ml_window_alignment_source",
         "timing_channel_waveforms_saved",
+        "waveform_grid",
     )
     observed: dict[str, set[Any]] = {field: set() for field in fields}
     for dataset in datasets:
@@ -43,11 +46,12 @@ def _validate_dataset_contract(
     resolved = {field: next(iter(values)) for field, values in observed.items()}
     logger.info(
         "Prepared-data contract | LED %s | CFD %s | ML alignment %s | "
-        "timing waveforms saved=%s",
+        "timing waveforms saved=%s | waveform grid=%s",
         resolved["led_timestamp_source"],
         resolved["cfd_timestamp_source"],
         resolved["ml_window_alignment_source"],
         resolved["timing_channel_waveforms_saved"],
+        resolved["waveform_grid"],
     )
 
     if contract is None:
@@ -88,6 +92,12 @@ def train_model(
 
     config = copy.deepcopy(config)
     config["fit"] = resolve_fit_config(config.get("fit"))
+    input_transform = resolve_input_transform(config)
+    config["input_transform"] = input_transform
+    prediction = resolve_prediction_config(config)
+    config["prediction"] = prediction
+    if isinstance(config.get("model"), dict):
+        config["model"].pop("input_transform", None)
     output_dir = Path(config["output"]["train_dir"])
     if restart and output_dir.exists():
         shutil.rmtree(output_dir)
@@ -99,7 +109,7 @@ def train_model(
     datasets = (
         list(prepared_datasets)
         if prepared_datasets is not None
-        else [load_prepared_dataset(path) for path in config["datasets"]]
+        else [load_prepared_dataset_spec(spec) for spec in config["datasets"]]
     )
     _validate_dataset_contract(datasets, config.get("data_contract"), logger)
     for dataset in datasets:
@@ -107,6 +117,45 @@ def train_model(
             raise RuntimeError(
                 f"Dataset has no training/validation split: {dataset.directory}"
             )
+
+    datasets = [
+        prediction_dataset_view(
+            dataset,
+            input_waveforms=prediction["input_waveforms"],
+            target=prediction["target"],
+        )
+        for dataset in datasets
+    ]
+    logger.info(
+        "Prediction task | input waveforms=%s | target=%s",
+        prediction["input_waveforms"],
+        prediction["target"],
+    )
+
+    transformed_datasets: list[PreparedDataset] = []
+    input_cache_dirs: list[Path] = []
+    cache_root = output_dir / "input_cache"
+    cache_chunk_size = int(
+        config["training"].get(
+            "input_transform_chunk_size",
+            config["training"].get("normalization_chunk_size", 2048),
+        )
+    )
+    for dataset in datasets:
+        transformed, cache_dir = materialize_training_input_cache(
+            dataset,
+            input_transform,
+            cache_root,
+            chunk_size=cache_chunk_size,
+            rebuild=False,
+            logger=logger,
+        )
+        transformed_datasets.append(transformed)
+        if cache_dir is not None:
+            input_cache_dirs.append(cache_dir)
+    datasets = transformed_datasets
+    logger.info("Model input transform: %s", input_transform)
+
     input_lengths = {dataset.input_length for dataset in datasets}
     if len(input_lengths) != 1:
         raise ValueError(
@@ -138,6 +187,10 @@ def train_model(
         datasets=datasets,
         input_length=input_length,
         normalization=normalization,
+        input_transform=input_transform,
+        input_waveform_source=prediction["input_waveforms"],
+        prediction_target=prediction["target"],
+        input_cache_dirs=tuple(input_cache_dirs),
         output_dir=output_dir,
         plot_dir=plot_dir,
         checkpoint_dir=checkpoint_dir,

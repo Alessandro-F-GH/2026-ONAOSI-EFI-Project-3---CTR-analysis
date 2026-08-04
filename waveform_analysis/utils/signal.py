@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.interpolate import CubicSpline
-
 FEMTOSECONDS_PER_SECOND = 1_000_000_000_000_000
 FEMTOSECONDS_PER_NANOSECOND = 1_000_000
 INVALID_TIME_FS = np.iinfo(np.int64).min
@@ -86,7 +84,7 @@ def _sequential_crossings_fs(
 
     Thresholds are processed in ascending order and the search index is retained,
     as in ``TWaveForm::LED``. Crossing timestamps are rounded to int64 fs only
-    after linear interpolation between adjacent upsampled points.
+    after linear interpolation between adjacent native acquisition samples.
     """
     x = np.asarray(time_ns, dtype=np.float64)
     y = np.asarray(signal_mV, dtype=np.float64)
@@ -116,6 +114,50 @@ def _sequential_crossings_fs(
     return result
 
 
+def _last_rising_crossing_before_peak_fs(
+    time_ns: np.ndarray,
+    signal_mV: np.ndarray,
+    thresholds_mV: np.ndarray,
+) -> np.ndarray:
+    """Return the final rising crossing before the crop maximum for each threshold."""
+
+    x = np.asarray(time_ns, dtype=np.float64)
+    y = np.asarray(signal_mV, dtype=np.float64)
+    thresholds = np.asarray(thresholds_mV, dtype=np.float64)
+    result = np.full(thresholds.shape, INVALID_TIME_FS, dtype=np.int64)
+    if x.size < 2 or x.size != y.size:
+        return result
+    peak_index = int(np.argmax(y))
+    if peak_index <= 0 or not np.isfinite(y[peak_index]):
+        return result
+
+    x0 = x[:peak_index]
+    x1 = x[1 : peak_index + 1]
+    y0 = y[:peak_index]
+    y1 = y[1 : peak_index + 1]
+    finite = np.isfinite(x0) & np.isfinite(x1) & np.isfinite(y0) & np.isfinite(y1)
+
+    for out_index, threshold in enumerate(thresholds):
+        if not np.isfinite(threshold) or threshold <= 0.0:
+            continue
+        crossing = finite & (y0 < threshold) & (y1 >= threshold)
+        indices = np.flatnonzero(crossing)
+        if indices.size == 0:
+            crossing = finite & (y0 == threshold) & (y1 > threshold)
+            indices = np.flatnonzero(crossing)
+        if indices.size == 0:
+            continue
+        lower = int(indices[-1])
+        if x1[lower] <= x0[lower] or y1[lower] == y0[lower]:
+            continue
+        fraction = (threshold - y0[lower]) / (y1[lower] - y0[lower])
+        if not 0.0 <= fraction <= 1.0:
+            continue
+        crossing_ns = x0[lower] + fraction * (x1[lower] - x0[lower])
+        result[out_index] = np.int64(np.rint(crossing_ns * FEMTOSECONDS_PER_NANOSECOND))
+    return result
+
+
 def prepare_timing_features(
     corrected_signal_mV: np.ndarray,
     *,
@@ -124,10 +166,18 @@ def prepare_timing_features(
     horizontal_offset_s: float,
     crop_before_ns: float,
     crop_after_ns: float,
-    upsample_step_ps: float,
+    upsample_step_ps: float | None = None,
     led_thresholds_mV: np.ndarray,
     cfd_fractions: np.ndarray,
 ) -> TimingFeatures:
+    """Extract LED/CFD times from the native samples.
+
+    ``upsample_step_ps`` is retained as a deprecated compatibility argument and
+    is ignored. Only the final threshold crossing time is interpolated, using the
+    two original samples that bracket the crossing.
+    """
+
+    del upsample_step_ps
     invalid_led = np.full(np.asarray(led_thresholds_mV).shape, INVALID_TIME_FS, dtype=np.int64)
     invalid_cfd = np.full(np.asarray(cfd_fractions).shape, INVALID_TIME_FS, dtype=np.int64)
     if trigger_index < 0:
@@ -148,11 +198,11 @@ def prepare_timing_features(
     requested_start = trigger_ns - float(crop_before_ns)
     requested_stop = trigger_ns + float(crop_after_ns)
 
-    # Include one original sample outside each requested boundary, mirroring the
-    # original Resize() behavior closely enough for spline boundary stability.
+    # Keep one original sample outside each boundary so crossings at the crop
+    # edge still have a valid bracketing pair.
     start_index = max(0, int(np.searchsorted(time_ns, requested_start, side="left")) - 1)
     stop_index = min(signal.size, int(np.searchsorted(time_ns, requested_stop, side="right")) + 1)
-    if stop_index - start_index < 4:
+    if stop_index - start_index < 2:
         return TimingFeatures(
             invalid_led,
             invalid_cfd,
@@ -172,31 +222,21 @@ def prepare_timing_features(
             np.int64(INVALID_TIME_FS),
         )
 
-    step_ns = float(upsample_step_ps) / 1000.0
-    span_ns = float(crop_time_ns[-1] - crop_time_ns[0])
-    n_new = int(span_ns / step_ns)
-    if n_new < 2:
-        return TimingFeatures(
-            invalid_led,
-            invalid_cfd,
-            np.nan,
-            np.int64(INVALID_TIME_FS),
-            np.int64(INVALID_TIME_FS),
-        )
-
-    spline = CubicSpline(crop_time_ns, crop_signal, bc_type="not-a-knot", extrapolate=False)
-    up_time_ns = crop_time_ns[0] + np.arange(n_new, dtype=np.float64) * step_ns
-    up_signal = np.asarray(spline(up_time_ns), dtype=np.float64)
-    cropped_peak = float(np.max(up_signal))
-
-    led_times = _sequential_crossings_fs(up_time_ns, up_signal, led_thresholds_mV)
+    cropped_peak = float(np.max(crop_signal))
+    led_times = _sequential_crossings_fs(crop_time_ns, crop_signal, led_thresholds_mV)
     cfd_thresholds = cropped_peak * np.asarray(cfd_fractions, dtype=np.float64)
-    cfd_times = _sequential_crossings_fs(up_time_ns, up_signal, cfd_thresholds)
+    cfd_times = _last_rising_crossing_before_peak_fs(
+        crop_time_ns, crop_signal, cfd_thresholds
+    )
 
     return TimingFeatures(
         led_times_fs=led_times,
         cfd_times_fs=cfd_times,
         cropped_peak_mV=cropped_peak,
-        crop_start_fs=np.int64(np.rint(up_time_ns[0] * FEMTOSECONDS_PER_NANOSECOND)),
-        crop_stop_fs=np.int64(np.rint(up_time_ns[-1] * FEMTOSECONDS_PER_NANOSECOND)),
+        crop_start_fs=np.int64(
+            np.rint(crop_time_ns[0] * FEMTOSECONDS_PER_NANOSECOND)
+        ),
+        crop_stop_fs=np.int64(
+            np.rint(crop_time_ns[-1] * FEMTOSECONDS_PER_NANOSECOND)
+        ),
     )

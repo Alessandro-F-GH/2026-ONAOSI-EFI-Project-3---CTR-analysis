@@ -35,6 +35,41 @@ def energy_event_count(path: Path) -> int:
         return int(root_file["events"].num_entries)
 
 
+def energy_sampling_interval_s(
+    path: Path, energy_channels_one_based: tuple[int, int]
+) -> float:
+    """Read and validate the native sampling interval used by the ML channels.
+
+    Prepared waveform tensors have one shared time axis, so both selected energy
+    channels must use the same finite interval. Every processed event is checked
+    again during extraction to catch files that mix acquisition grids.
+    """
+
+    indices = np.asarray(energy_channels_one_based, dtype=np.int64) - 1
+    with uproot.open(path) as root_file:
+        if "events" not in root_file:
+            raise KeyError("ROOT file does not contain the 'events' TTree")
+        tree = root_file["events"]
+        if "horizontal_interval_s" not in tree.keys():
+            raise KeyError("ROOT events tree is missing branch: horizontal_interval_s")
+        values = tree["horizontal_interval_s"].array(
+            entry_start=0, entry_stop=1, library="ak"
+        )
+    if len(values) == 0:
+        raise RuntimeError("Input ROOT file contains no events")
+    first = np.asarray(ak.to_numpy(values[0]), dtype=np.float64)
+    selected = first[indices]
+    if np.any(~np.isfinite(selected)) or np.any(selected <= 0.0):
+        raise ValueError("Energy-channel sampling intervals must be finite and positive")
+    reference = float(selected[0])
+    if not np.allclose(selected, reference, rtol=1e-9, atol=0.0):
+        raise ValueError(
+            "Selected energy channels use different sampling intervals; a shared "
+            "canonical waveform grid cannot be constructed"
+        )
+    return reference
+
+
 def iterate_energy_chunks(
     path: Path,
     *,

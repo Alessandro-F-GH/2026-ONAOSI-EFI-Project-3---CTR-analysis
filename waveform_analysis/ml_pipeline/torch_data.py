@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .dataset import PreparedDataset
+from .input_transform import apply_input_transform, normalize_input_transform
 
 
 @dataclass(frozen=True)
@@ -58,17 +59,22 @@ class CorrectionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
         dataset: PreparedDataset,
         indices: np.ndarray,
         normalization: Normalization,
+        input_transform: str = "none",
     ) -> None:
         self.dataset = dataset
         self.indices = np.asarray(indices, dtype=np.int64)
         self.normalization = normalization
+        self.input_transform = normalize_input_transform(input_transform)
 
     def __len__(self) -> int:
         return int(self.indices.size)
 
     def __getitem__(self, position: int):
         index = int(self.indices[position])
-        pair = np.asarray(self.dataset.windows_mV[index], dtype=np.float32).copy()
+        pair = np.asarray(self.dataset.windows_mV[index], dtype=np.float32)
+        pair = np.asarray(
+            apply_input_transform(pair, self.input_transform), dtype=np.float32
+        ).copy()
         pair = (pair - np.float32(self.normalization.mean_mV)) / np.float32(self.normalization.std_mV)
         led_delta_ps = (
             int(self.dataset.led_time_fs[index, 0]) - int(self.dataset.led_time_fs[index, 1])
@@ -85,3 +91,4 @@ class CorrectionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
             torch.tensor(cfd_delta_ps, dtype=torch.float32),
             torch.tensor(true_tof_ps, dtype=torch.float32),
         )
+

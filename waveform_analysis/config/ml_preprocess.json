@@ -8,6 +8,8 @@
       "output_dir": "datasets/central_source_all/blind_test"
     }
   },
+  "cfd_timestamp_source": "energy_channels",
+
   "data": {
     "input_root": "processed_data/combined/all.root",
     "true_tof_ps": 0.0
@@ -25,23 +27,21 @@
     "baseline_samples": 500,
     "search_trigger_threshold_mV": 50.0,
     "denoising": {
-      "enabled": false,
+      "enabled": true,
       "method": "butterworth_lowpass",
-      "cutoff_GHz": 1.0,
+      "cutoff_GHz": 0.5,
       "order": 4
     },
     "analysis_crop_ns": {
       "before": 7.0,
       "after": 60.0
     },
-    "upsample_step_ps": 2.5,
     "led_threshold_mV": 7.0,
-    "cfd_fraction": 0.045,
+    "cfd_fraction": 0.03,
     "ml_window_ns": {
       "before": 4,
       "after": 60.0
-    },
-    "subsample_factor": 1
+    }
   },
   "selection": {
     "energy_noise_max_mV": null,

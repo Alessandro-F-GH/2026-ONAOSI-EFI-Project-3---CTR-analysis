@@ -1,18 +1,18 @@
 {
   "blind_tests": [
     {
-      "name": "central_source_49V_timing_led_blind_test_validation",
-      "dataset": "datasets/central_source_49V_timing_led/blind_test"
+      "name": "central_source_47V_blind_test",
+      "dataset": "datasets/central_source_47V/blind_test"
     }
   ],
   "models": [],
-  "model_search_dir": "results/49V/train/mlp_timing_led",
+  "model_search_dir": "results/47V/train",
   "device": "auto",
   "batch_size": 512,
   "num_workers": 0,
   "pin_memory": false,
   "output": {
-    "evaluation_dir": "results/49V/evaluation"
+    "evaluation_dir": "results/47V/evaluation/central_source"
   },
   "fit": {
     "histogram_range_ps": [
@@ -41,5 +41,11 @@
       "enabled": false,
       "artifact": "results/47V-timing/standard_methods/linear_spline"
     }
+  },
+  "correction_analysis": {
+    "enabled": true,
+    "top_n": 10,
+    "minimum_improvement_ps": 0.0,
+    "save_waveform_plots": true
   }
 }

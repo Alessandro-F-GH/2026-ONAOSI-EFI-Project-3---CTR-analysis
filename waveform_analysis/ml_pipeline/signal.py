@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from scipy.interpolate import CubicSpline
 
 from utils.signal import (
     FEMTOSECONDS_PER_NANOSECOND,
@@ -45,23 +44,38 @@ class ChannelExtraction:
     valid: bool
 
 
-def relative_window_grid_ps(waveform_config: dict[str, Any]) -> np.ndarray:
-    base_step = float(waveform_config["upsample_step_ps"])
-    factor = int(waveform_config["subsample_factor"])
-    before = float(waveform_config["ml_window_ns"]["before"]) * 1000.0
-    after = float(waveform_config["ml_window_ns"]["after"]) * 1000.0
-    full = np.arange(-before, after + 0.5 * base_step, base_step, dtype=np.float64)
-    sampled = full[::factor]
-    if sampled.size < 4:
-        raise ValueError("ML window contains fewer than four points after subsampling")
-    return sampled
+def relative_window_grid_ps(
+    waveform_config: dict[str, Any],
+    native_interval_s: float,
+) -> np.ndarray:
+    """Return sample offsets for a canonical window on the native time grid.
+
+    The old pipeline generated a dense cubic-spline grid using
+    ``upsample_step_ps`` and then optionally subsampled it. Those options are now
+    deprecated: every saved point is an acquired sample and adjacent points are
+    separated by the hardware sampling interval.
+    """
+
+    interval_s = float(native_interval_s)
+    if not np.isfinite(interval_s) or interval_s <= 0.0:
+        raise ValueError("native_interval_s must be finite and positive")
+    interval_ps = interval_s * 1.0e12
+    before_ps = float(waveform_config["ml_window_ns"]["before"]) * 1000.0
+    after_ps = float(waveform_config["ml_window_ns"]["after"]) * 1000.0
+    before_samples = int(np.floor(before_ps / interval_ps + 1e-9))
+    after_samples = int(np.floor(after_ps / interval_ps + 1e-9))
+    offsets = np.arange(-before_samples, after_samples + 1, dtype=np.int64)
+    if offsets.size < 4:
+        raise ValueError("ML window contains fewer than four native samples")
+    return offsets.astype(np.float64) * interval_ps
 
 
 def timing_channel_waveform_config(waveform_config: dict[str, Any]) -> dict[str, Any]:
     """Resolve timing-channel LED settings, inheriting energy defaults.
 
     Only timing extraction options are copied. ML-window settings intentionally
-    remain energy-channel-only.
+    remain energy-channel-only. ``upsample_step_ps`` is deliberately excluded:
+    LED extraction uses local interpolation on the native samples.
     """
 
     override = waveform_config.get("timing_channel_led", {})
@@ -71,8 +85,9 @@ def timing_channel_waveform_config(waveform_config: dict[str, Any]) -> dict[str,
         "baseline_samples",
         "search_trigger_threshold_mV",
         "analysis_crop_ns",
-        "upsample_step_ps",
         "led_threshold_mV",
+        "cfd_fraction",
+        "ml_window_ns",
         "denoising",
     )
     resolved: dict[str, Any] = {}
@@ -83,20 +98,83 @@ def timing_channel_waveform_config(waveform_config: dict[str, Any]) -> dict[str,
 
 
 def _first_rising_crossing_ns(
-    time_ns: np.ndarray, signal_mV: np.ndarray, threshold_mV: float
+    time_ns: np.ndarray,
+    signal_mV: np.ndarray,
+    threshold_mV: float,
 ) -> float:
+    """Interpolate the first rising threshold crossing from two native samples."""
+
+    x = np.asarray(time_ns, dtype=np.float64)
+    y = np.asarray(signal_mV, dtype=np.float64)
     threshold = float(threshold_mV)
-    if not np.isfinite(threshold) or threshold <= 0:
+    if x.ndim != 1 or y.ndim != 1 or x.size != y.size or x.size < 2:
         return np.nan
-    above = np.flatnonzero(signal_mV >= threshold)
-    if above.size == 0:
+    if not np.isfinite(threshold) or threshold <= 0.0:
         return np.nan
-    index = int(above[0])
-    if index <= 0:
+    finite = np.isfinite(x[:-1]) & np.isfinite(x[1:]) & np.isfinite(y[:-1]) & np.isfinite(y[1:])
+    crossing = finite & (y[:-1] < threshold) & (y[1:] >= threshold)
+    indices = np.flatnonzero(crossing)
+    if indices.size == 0:
+        # Preserve exact hits on the lower sample of a rising segment.
+        crossing = finite & (y[:-1] == threshold) & (y[1:] > threshold)
+        indices = np.flatnonzero(crossing)
+    if indices.size == 0:
         return np.nan
-    x0, x1 = float(time_ns[index - 1]), float(time_ns[index])
-    y0, y1 = float(signal_mV[index - 1]), float(signal_mV[index])
-    if not np.all(np.isfinite([x0, x1, y0, y1])) or y1 == y0:
+    lower = int(indices[0])
+    x0, x1 = float(x[lower]), float(x[lower + 1])
+    y0, y1 = float(y[lower]), float(y[lower + 1])
+    if x1 <= x0 or y1 == y0:
+        return np.nan
+    fraction = (threshold - y0) / (y1 - y0)
+    if not 0.0 <= fraction <= 1.0:
+        return np.nan
+    return x0 + fraction * (x1 - x0)
+
+
+def _last_rising_crossing_before_peak_ns(
+    time_ns: np.ndarray,
+    signal_mV: np.ndarray,
+    threshold_mV: float,
+) -> float:
+    """Interpolate the physical rising-edge crossing immediately before the peak.
+
+    A CFD threshold can be low enough that baseline noise or a pre-pulse crosses it
+    inside the analysis crop. Selecting the first crossing then gives a timestamp
+    unrelated to the main pulse. Restricting the search to samples up to the crop
+    maximum and taking the last rising crossing identifies the crossing connected
+    to the pulse that defines the CFD amplitude.
+    """
+
+    x = np.asarray(time_ns, dtype=np.float64)
+    y = np.asarray(signal_mV, dtype=np.float64)
+    threshold = float(threshold_mV)
+    if x.ndim != 1 or y.ndim != 1 or x.size != y.size or x.size < 2:
+        return np.nan
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        return np.nan
+
+    peak_index = int(np.argmax(y))
+    if peak_index <= 0 or not np.isfinite(y[peak_index]):
+        return np.nan
+
+    finite = (
+        np.isfinite(x[:peak_index])
+        & np.isfinite(x[1 : peak_index + 1])
+        & np.isfinite(y[:peak_index])
+        & np.isfinite(y[1 : peak_index + 1])
+    )
+    crossing = finite & (y[:peak_index] < threshold) & (y[1 : peak_index + 1] >= threshold)
+    indices = np.flatnonzero(crossing)
+    if indices.size == 0:
+        crossing = finite & (y[:peak_index] == threshold) & (y[1 : peak_index + 1] > threshold)
+        indices = np.flatnonzero(crossing)
+    if indices.size == 0:
+        return np.nan
+
+    lower = int(indices[-1])
+    x0, x1 = float(x[lower]), float(x[lower + 1])
+    y0, y1 = float(y[lower]), float(y[lower + 1])
+    if x1 <= x0 or y1 == y0:
         return np.nan
     fraction = (threshold - y0) / (y1 - y0)
     if not 0.0 <= fraction <= 1.0:
@@ -178,41 +256,34 @@ def _timing_from_basic(
     stop_index = min(
         signal.size, int(np.searchsorted(time_ns, crop_stop, side="right")) + 1
     )
-    if stop_index - start_index < 4:
+    if stop_index - start_index < 2:
         return invalid
     crop_time = time_ns[start_index:stop_index]
     crop_signal = signal[start_index:stop_index]
     if np.any(~np.isfinite(crop_time)) or np.any(~np.isfinite(crop_signal)):
         return invalid
 
-    try:
-        spline = CubicSpline(
-            crop_time, crop_signal, bc_type="not-a-knot", extrapolate=False
-        )
-    except Exception:
+    amplitude_mV = float(np.max(crop_signal))
+    if not np.isfinite(amplitude_mV) or amplitude_mV <= 0.0:
         return invalid
-    step_ns = float(extraction_config["upsample_step_ps"]) / 1000.0
-    up_time = np.arange(
-        crop_time[0], crop_time[-1] + 0.25 * step_ns, step_ns, dtype=np.float64
+    led_ns = (
+        _first_rising_crossing_ns(
+            crop_time,
+            crop_signal,
+            float(extraction_config["led_threshold_mV"]),
+        )
+        if compute_led
+        else np.nan
     )
-    if up_time.size < 4:
-        return invalid
-    up_signal = np.asarray(spline(up_time), dtype=np.float64)
-    if np.any(~np.isfinite(up_signal)):
-        return invalid
-    peak = float(np.max(up_signal))
-    if compute_led:
-        led_ns = _first_rising_crossing_ns(
-            up_time, up_signal, float(extraction_config["led_threshold_mV"])
+    cfd_ns = (
+        _last_rising_crossing_before_peak_ns(
+            crop_time,
+            crop_signal,
+            amplitude_mV * float(extraction_config["cfd_fraction"]),
         )
-    else:
-        led_ns = np.nan
-    if compute_cfd:
-        cfd_ns = _first_rising_crossing_ns(
-            up_time, up_signal, peak * float(extraction_config["cfd_fraction"])
-        )
-    else:
-        cfd_ns = np.nan
+        if compute_cfd
+        else np.nan
+    )
     if (compute_led and not np.isfinite(led_ns)) or (
         compute_cfd and not np.isfinite(cfd_ns)
     ):
@@ -243,9 +314,11 @@ def extract_timing_reference(
     polarity: int,
     waveform_config: dict[str, Any],
 ) -> TimingReference:
-    """Extract an LED timestamp from a timing channel only.
+    """Extract an interpolated LED timestamp from a timing channel.
 
-    No timing waveform samples are returned or persisted for ML use.
+    This compatibility helper returns timing metadata only. Canonical
+    preprocessing uses :func:`extract_timing_channel` when timing waveforms are
+    configured as an available ML input.
     """
 
     extraction_config = timing_channel_waveform_config(waveform_config)
@@ -268,6 +341,35 @@ def extract_timing_reference(
     )
 
 
+def _native_window(
+    signal_mV: np.ndarray,
+    *,
+    horizontal_interval_s: float,
+    horizontal_offset_s: float,
+    alignment_ns: float,
+    relative_grid_ps: np.ndarray,
+) -> np.ndarray | None:
+    interval_s = float(horizontal_interval_s)
+    interval_ps = interval_s * 1.0e12
+    relative = np.asarray(relative_grid_ps, dtype=np.float64)
+    sample_offsets = np.rint(relative / interval_ps).astype(np.int64)
+    if not np.allclose(
+        relative,
+        sample_offsets.astype(np.float64) * interval_ps,
+        rtol=0.0,
+        atol=max(1e-6, abs(interval_ps) * 1e-9),
+    ):
+        raise ValueError("Requested ML window is not on the waveform's native sample grid")
+
+    first_time_ns = float(horizontal_offset_s) * 1.0e9
+    interval_ns = interval_s * 1.0e9
+    anchor = int(np.rint((float(alignment_ns) - first_time_ns) / interval_ns))
+    indices = anchor + sample_offsets
+    if indices.size == 0 or int(indices[0]) < 0 or int(indices[-1]) >= signal_mV.size:
+        return None
+    return np.asarray(signal_mV[indices], dtype=np.float32).copy()
+
+
 def extract_channel(
     raw_samples: np.ndarray,
     *,
@@ -279,12 +381,14 @@ def extract_channel(
     waveform_config: dict[str, Any],
     relative_grid_ps: np.ndarray,
     timing_reference: TimingReference | None = None,
+    compute_cfd: bool = True,
 ) -> ChannelExtraction:
-    """Extract one energy-channel ML window and its timing labels.
+    """Extract one native-grid energy waveform window and its timing labels.
 
-    When ``timing_reference`` is supplied, its LED timestamp controls both the
-    reported LED value and the absolute alignment of the energy-channel ML
-    window. The timing waveform itself is never included in ``window_mV``.
+    LED and CFD timestamps use linear interpolation only between the two native
+    samples bracketing the crossing. The saved ML window itself is never
+    interpolated: it is a direct slice of acquired samples, aligned to the native
+    sample nearest the selected LED timestamp.
     """
 
     invalid_window = np.full(relative_grid_ps.shape, np.nan, dtype=np.float32)
@@ -309,68 +413,71 @@ def extract_channel(
     if basic.trigger_index < 0:
         return invalid
 
-    energy_timing = _timing_from_basic(
+    channel_timing = _timing_from_basic(
         basic,
         horizontal_interval_s=horizontal_interval_s,
         horizontal_offset_s=horizontal_offset_s,
         extraction_config=waveform_config,
-        compute_led=timing_reference is None,
-        compute_cfd=True,
+        compute_led=True,
+        compute_cfd=bool(compute_cfd),
     )
-    if not energy_timing.valid:
+    if not channel_timing.valid:
         return invalid
-    reference = energy_timing if timing_reference is None else timing_reference
-    if not reference.valid:
+    alignment_reference = channel_timing if timing_reference is None else timing_reference
+    if not alignment_reference.valid:
         return invalid
 
-    signal = np.asarray(basic.corrected_signal_mV, dtype=np.float64)
-    time_ns = (
-        float(horizontal_offset_s)
-        + np.arange(signal.size, dtype=np.float64) * float(horizontal_interval_s)
-    ) * 1.0e9
-    alignment_ns = float(reference.led_time_fs) / FEMTOSECONDS_PER_NANOSECOND
-    relative_ns = np.asarray(relative_grid_ps, dtype=np.float64) / 1000.0
-    window_time = alignment_ns + relative_ns
-
-    # Retain the established energy-trigger crop, but expand it when necessary
-    # so the externally aligned energy window is fully covered.
-    trigger_ns = float(time_ns[basic.trigger_index])
-    crop_start = min(
-        trigger_ns - float(waveform_config["analysis_crop_ns"]["before"]),
-        float(window_time[0]),
+    alignment_ns = (
+        float(alignment_reference.led_time_fs) / FEMTOSECONDS_PER_NANOSECOND
     )
-    crop_stop = max(
-        trigger_ns + float(waveform_config["analysis_crop_ns"]["after"]),
-        float(window_time[-1]),
+    window = _native_window(
+        np.asarray(basic.corrected_signal_mV, dtype=np.float64),
+        horizontal_interval_s=horizontal_interval_s,
+        horizontal_offset_s=horizontal_offset_s,
+        alignment_ns=alignment_ns,
+        relative_grid_ps=relative_grid_ps,
     )
-    start_index = max(0, int(np.searchsorted(time_ns, crop_start, side="left")) - 1)
-    stop_index = min(
-        signal.size, int(np.searchsorted(time_ns, crop_stop, side="right")) + 1
-    )
-    if stop_index - start_index < 4:
-        return invalid
-    crop_time = time_ns[start_index:stop_index]
-    crop_signal = signal[start_index:stop_index]
-    if np.any(~np.isfinite(crop_time)) or np.any(~np.isfinite(crop_signal)):
-        return invalid
-    if window_time[0] < crop_time[0] or window_time[-1] > crop_time[-1]:
-        return invalid
-
-    try:
-        spline = CubicSpline(
-            crop_time, crop_signal, bc_type="not-a-knot", extrapolate=False
-        )
-    except Exception:
-        return invalid
-    window = np.asarray(spline(window_time), dtype=np.float32)
-    if np.any(~np.isfinite(window)):
+    if window is None or np.any(~np.isfinite(window)):
         return invalid
     return ChannelExtraction(
         amplitude_mV=basic.amplitude_mV,
         noise_rms_mV=basic.noise_rms_mV,
         trigger_index=basic.trigger_index,
-        led_time_fs=reference.led_time_fs,
-        cfd_time_fs=energy_timing.cfd_time_fs,
+        led_time_fs=channel_timing.led_time_fs,
+        cfd_time_fs=channel_timing.cfd_time_fs,
         window_mV=window,
         valid=True,
+    )
+
+
+def extract_timing_channel(
+    raw_samples: np.ndarray,
+    *,
+    vertical_gain_v_per_count: float,
+    vertical_offset_v: float,
+    horizontal_interval_s: float,
+    horizontal_offset_s: float,
+    polarity: int,
+    waveform_config: dict[str, Any],
+    relative_grid_ps: np.ndarray,
+) -> ChannelExtraction:
+    """Extract a timing-channel waveform plus precomputed LED and CFD timestamps.
+
+    Both standard-method timestamps are materialized during preprocessing.  The
+    evaluator later reads them from the prepared dataset and does not recompute
+    either crossing from the saved ML window.
+    """
+
+    resolved = timing_channel_waveform_config(waveform_config)
+    return extract_channel(
+        raw_samples,
+        vertical_gain_v_per_count=vertical_gain_v_per_count,
+        vertical_offset_v=vertical_offset_v,
+        horizontal_interval_s=horizontal_interval_s,
+        horizontal_offset_s=horizontal_offset_s,
+        polarity=polarity,
+        waveform_config=resolved,
+        relative_grid_ps=relative_grid_ps,
+        timing_reference=None,
+        compute_cfd=True,
     )

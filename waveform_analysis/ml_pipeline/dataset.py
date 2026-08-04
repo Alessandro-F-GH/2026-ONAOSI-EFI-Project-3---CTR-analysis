@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -14,11 +14,17 @@ from .common import atomic_json, canonical_hash, read_json, write_csv_rows
 if TYPE_CHECKING:
     from .data import EnergyCache, SplitData
 
-DATASET_FORMAT_VERSION = 1
+DATASET_FORMAT_VERSION = 2
+_SUPPORTED_DATASET_FORMAT_VERSIONS = {1, 2}
 _ARRAY_NAMES = (
     "event_id", "event_index", "source_file_id", "source_run_index",
     "bias_voltage_V", "amplitude_mV", "noise_rms_mV", "trigger_index",
     "led_time_fs", "cfd_time_fs", "windows_mV",
+)
+_OPTIONAL_ARRAY_NAMES = (
+    "energy_led_time_fs",
+    "timing_led_time_fs",
+    "timing_windows_mV",
 )
 
 
@@ -38,10 +44,14 @@ class PreparedDataset:
     cfd_time_fs: np.ndarray
     windows_mV: np.ndarray
     relative_time_ps: np.ndarray
-    train: np.ndarray
-    validation: np.ndarray
-    test: np.ndarray
-    evaluation: np.ndarray
+    energy_led_time_fs: np.ndarray | None = None
+    timing_led_time_fs: np.ndarray | None = None
+    timing_windows_mV: np.ndarray | None = None
+    timing_relative_time_ps: np.ndarray | None = None
+    train: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    validation: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    test: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    evaluation: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
 
     @property
     def input_length(self) -> int:
@@ -59,6 +69,11 @@ def _load_array(directory: Path, name: str) -> np.ndarray:
     return np.load(path, mmap_mode="r")
 
 
+def _load_optional_array(directory: Path, name: str) -> np.ndarray | None:
+    path = directory / f"{name}.npy"
+    return np.load(path, mmap_mode="r") if path.is_file() else None
+
+
 def load_prepared_dataset(directory: str | Path) -> PreparedDataset:
     directory = Path(directory).resolve()
     manifest_path = directory / "manifest.json"
@@ -66,7 +81,7 @@ def load_prepared_dataset(directory: str | Path) -> PreparedDataset:
     if not manifest_path.is_file() or not split_path.is_file():
         raise FileNotFoundError(f"Not a prepared ML dataset: {directory}")
     manifest = read_json(manifest_path)
-    if int(manifest.get("format_version", -1)) != DATASET_FORMAT_VERSION:
+    if int(manifest.get("format_version", -1)) not in _SUPPORTED_DATASET_FORMAT_VERSIONS:
         raise ValueError(f"Unsupported prepared dataset version in {directory}")
     with np.load(split_path, allow_pickle=False) as splits:
         split_values = {
@@ -88,12 +103,27 @@ def load_prepared_dataset(directory: str | Path) -> PreparedDataset:
         cfd_time_fs=_load_array(directory, "cfd_time_fs"),
         windows_mV=_load_array(directory, "windows_mV"),
         relative_time_ps=_load_array(directory, "relative_time_ps"),
+        energy_led_time_fs=_load_optional_array(directory, "energy_led_time_fs"),
+        timing_led_time_fs=_load_optional_array(directory, "timing_led_time_fs"),
+        timing_windows_mV=_load_optional_array(directory, "timing_windows_mV"),
+        timing_relative_time_ps=_load_optional_array(directory, "timing_relative_time_ps"),
         train=split_values["train"],
         validation=split_values["validation"],
         test=split_values["test"],
         evaluation=split_values["evaluation"],
     )
 
+
+def load_prepared_dataset_spec(spec: str | Path | dict[str, Any]) -> PreparedDataset:
+    """Load a canonical prepared dataset from a path or dataset object."""
+
+    if isinstance(spec, (str, Path)):
+        return load_prepared_dataset(spec)
+    if not isinstance(spec, dict) or not str(spec.get("dataset", "")).strip():
+        raise ValueError(
+            "Dataset specification must be a path or an object containing 'dataset'"
+        )
+    return load_prepared_dataset(spec["dataset"])
 
 def _copy_selected(source: np.ndarray, selected: np.ndarray, path: Path, chunk_size: int) -> None:
     shape = (selected.size,) + tuple(source.shape[1:])
@@ -189,7 +219,18 @@ def _materialize_subset(
             temporary / f"{array_name}.npy",
             chunk_size,
         )
+    for array_name in _OPTIONAL_ARRAY_NAMES:
+        source = getattr(cache, array_name, None)
+        if source is not None:
+            _copy_selected(
+                source, selected_old, temporary / f"{array_name}.npy", chunk_size
+            )
     np.save(temporary / "relative_time_ps.npy", np.asarray(cache.relative_time_ps))
+    if getattr(cache, "timing_relative_time_ps", None) is not None:
+        np.save(
+            temporary / "timing_relative_time_ps.npy",
+            np.asarray(cache.timing_relative_time_ps),
+        )
     with (temporary / "splits.npz.tmp").open("wb") as stream:
         np.savez_compressed(
             stream,
@@ -244,8 +285,46 @@ def _materialize_subset(
         "ml_window_alignment_source": cache.manifest.get(
             "ml_window_alignment_source", "energy_channel_led"
         ),
-        "timing_channel_waveforms_saved": False,
+        "timing_channel_waveforms_saved": bool(
+            getattr(cache, "timing_windows_mV", None) is not None
+        ),
+        "available_waveform_sources": [
+            "energy",
+            *(
+                ["timing"]
+                if getattr(cache, "timing_windows_mV", None) is not None
+                else []
+            ),
+        ],
+        "available_prediction_targets": [
+            "prepared_led",
+            *(
+                ["energy_led"]
+                if getattr(cache, "energy_led_time_fs", None) is not None
+                else []
+            ),
+            *(
+                ["timing_led"]
+                if getattr(cache, "timing_led_time_fs", None) is not None
+                else []
+            ),
+        ],
         "same_event_set_for_led_cfd_and_ml": True,
+        "waveform_grid": cache.manifest.get(
+            "waveform_grid", "legacy_materialized_interpolation"
+        ),
+        "native_sample_interval_ps": cache.manifest.get(
+            "native_sample_interval_ps"
+        ),
+        "ml_window_alignment_quantization": cache.manifest.get(
+            "ml_window_alignment_quantization"
+        ),
+        "timing_crossing_interpolation": cache.manifest.get(
+            "timing_crossing_interpolation"
+        ),
+        "waveform_representation": "standard",
+        "is_canonical_prepared_dataset": True,
+        "model_input_transform_applied": False,
         "arrays_are_post_selection": True,
         "split_frozen_before_selection_fitting": True,
         "photopeak_and_led_outlier_parameters_fit_on_training_candidate_only": True,
@@ -432,6 +511,7 @@ def prepared_dataset_view(
             "source": dataset.manifest["fingerprint"],
             "window_start_index": start,
             "window_stop_index": stop,
+            "prediction_view": dataset.manifest.get("prediction_view", {}),
         }
     )
     return replace(

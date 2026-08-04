@@ -24,8 +24,14 @@ if str(PROJECT) not in sys.path:
 from ml_pipeline.common import setup_logging
 from ml_pipeline.config import load_train_config
 from ml_pipeline.dataset import load_prepared_dataset
+from ml_pipeline.input_transform import (
+    normalize_input_transform,
+    transform_relative_time_ps,
+    transformed_input_length,
+)
 from ml_pipeline.training import train_model
 from ml_pipeline.models.mlp_regressor import build as build_mlp, model_state_hash
+from ml_pipeline.prediction import prediction_dataset_view, resolve_prediction_config
 
 
 
@@ -386,8 +392,17 @@ def _make_plots(
     plt.close(figure)
 
 
-def _validate_dataset_grids(dataset_paths: list[str]) -> tuple[int, np.ndarray]:
-    datasets = [load_prepared_dataset(path) for path in dataset_paths]
+def _validate_dataset_grids(
+    dataset_paths: list[str], input_transform: str, prediction: dict[str, str]
+) -> tuple[int, np.ndarray]:
+    datasets = [
+        prediction_dataset_view(
+            load_prepared_dataset(path),
+            input_waveforms=prediction["input_waveforms"],
+            target=prediction["target"],
+        )
+        for path in dataset_paths
+    ]
     lengths = {dataset.input_length for dataset in datasets}
     if len(lengths) != 1:
         raise ValueError(f"Datasets have incompatible input lengths: {sorted(lengths)}")
@@ -396,7 +411,8 @@ def _validate_dataset_grids(dataset_paths: list[str]) -> tuple[int, np.ndarray]:
         values = np.asarray(dataset.relative_time_ps, dtype=np.float64)
         if values.shape != reference.shape or not np.allclose(values, reference):
             raise ValueError("All datasets must use the same relative_time_ps grid")
-    return int(reference.size), reference
+    transformed_time = transform_relative_time_ps(reference, input_transform)
+    return transformed_input_length(reference.size, input_transform), transformed_time
 
 
 def main() -> None:
@@ -469,7 +485,11 @@ def main() -> None:
         config.get("logging", {}).get("level", "INFO"),
     )
     logger.info("Running %s version %s", Path(__file__).name, SCRIPT_VERSION)
-    input_length, relative_time_ps = _validate_dataset_grids(config["datasets"])
+    input_transform = normalize_input_transform(config.get("input_transform", "none"))
+    prediction = resolve_prediction_config(config)
+    input_length, relative_time_ps = _validate_dataset_grids(
+        config["datasets"], input_transform, prediction
+    )
     if args.block_size > input_length:
         raise ValueError("--block-size cannot exceed the waveform input length")
 
@@ -660,6 +680,9 @@ def main() -> None:
             normalization_std_mV=np.asarray(normalization_std_runs, dtype=np.float64),
             initialization_seeds=np.asarray(seeds, dtype=np.int64),
             relative_time_ps=relative_time_ps,
+            input_transform=np.asarray([input_transform]),
+            input_waveform_source=np.asarray([prediction["input_waveforms"]]),
+            prediction_target=np.asarray([prediction["target"]]),
         )
         if not args.keep_run_checkpoints:
             shutil.rmtree(run_dir)
@@ -703,6 +726,9 @@ def main() -> None:
         normalization_std_mV=normalization_std,
         initialization_seeds=np.asarray(seeds, dtype=np.int64),
         relative_time_ps=relative_time_ps,
+        input_transform=np.asarray([input_transform]),
+        input_waveform_source=np.asarray([prediction["input_waveforms"]]),
+        prediction_target=np.asarray([prediction["target"]]),
     )
 
     sample_rows = _sample_rows(
@@ -737,6 +763,9 @@ def main() -> None:
             "output_bound_ps": "" if output_bound is None else float(output_bound),
             "signed_path_is_exact_effective_weight": int(exact_linear),
             "input_length": input_length,
+            "input_transform": input_transform,
+            "input_waveform_source": prediction["input_waveforms"],
+            "prediction_target": prediction["target"],
             "block_size": args.block_size,
             "top_fraction": args.top_fraction,
             "dataset_count": len(config["datasets"]),

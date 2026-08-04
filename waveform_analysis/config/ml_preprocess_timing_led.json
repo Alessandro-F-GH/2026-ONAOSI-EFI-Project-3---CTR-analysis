@@ -1,15 +1,15 @@
 {
   "dataset": {
-    "name": "central_source_49V_timing_led_train_validation",
+    "name": "central_source_all_train_validation_timing_led",
     "role": "training",
-    "output_dir": "datasets/central_source_49V_timing_led/train_validation",
+    "output_dir": "datasets/central_source_all/train_validation_timing_led",
     "blind_test": {
-      "name": "central_source_49V_timing_led_blind_test",
-      "output_dir": "datasets/central_source_49V_timing_led/blind_test"
+      "name": "central_source_all_blind_test_timing_led",
+      "output_dir": "datasets/central_source_all/blind_test_timing_led"
     }
   },
   "data": {
-    "input_root": "processed_data/converted_runs_07-13/49V-490mV.root",
+    "input_root": "processed_data/combined/all.root",
     "true_tof_ps": 0.0
   },
   "channels": {
@@ -48,14 +48,12 @@
       "before": 5.0,
       "after": 60.0
     },
-    "upsample_step_ps": 2.5,
     "led_threshold_mV": 7.0,
     "cfd_fraction": 0.045,
     "ml_window_ns": {
       "before": 4,
       "after": 60.0
     },
-    "subsample_factor": 1,
     "timing_channel_led": {
       "enabled": true,
       "baseline_samples": 500,
@@ -64,13 +62,17 @@
         "before": 5.0,
         "after": 60.0
       },
-      "upsample_step_ps": 2.5,
       "led_threshold_mV": 7.0,
       "denoising": {
-        "enabled": false,
+        "enabled": true,
         "method": "butterworth_lowpass",
-        "cutoff_GHz": 1.0,
+        "cutoff_GHz": 0.5,
         "order": 4
+      },
+      "cfd_fraction": 0.045,
+      "ml_window_ns": {
+        "before": 4,
+        "after": 60.0
       }
     }
   },
@@ -84,7 +86,7 @@
     }
   },
   "photopeak": {
-    "enabled": true,
+    "enabled": false,
     "histogram_bin_mV": 1.0,
     "search_quantile_min": 0.55,
     "smoothing_sigma_bins": 2.0,
@@ -110,8 +112,8 @@
   },
   "cache": {
     "reuse": false,
-    "raw_cache_dir": "datasets/.cache/central_source_49V_timing_led/raw",
-    "selection_cache_dir": "datasets/.cache/central_source_49V_timing_led/blocked_split_selection",
+    "raw_cache_dir": "datasets/.cache/central_source_all/raw",
+    "selection_cache_dir": "datasets/.cache/central_source_all/blocked_split_selection",
     "materialization_chunk_size": 2048
   },
   "logging": {

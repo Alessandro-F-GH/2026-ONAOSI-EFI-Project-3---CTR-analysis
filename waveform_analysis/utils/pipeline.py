@@ -16,7 +16,7 @@ from .signal import (
     prepare_timing_features,
 )
 
-CACHE_FORMAT_VERSION = 4
+CACHE_FORMAT_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -107,7 +107,6 @@ def extract_features(
                         horizontal_offset_s=float(chunk.horizontal_offset_s[row, channel]),
                         crop_before_ns=float(waveform_config["timing_crop_ns"]["before"]),
                         crop_after_ns=float(waveform_config["timing_crop_ns"]["after"]),
-                        upsample_step_ps=float(waveform_config["upsample_step_ps"]),
                         led_thresholds_mV=led_thresholds,
                         cfd_fractions=cfd_fractions,
                     )

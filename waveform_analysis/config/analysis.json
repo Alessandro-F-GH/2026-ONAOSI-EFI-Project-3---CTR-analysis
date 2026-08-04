@@ -15,8 +15,7 @@
     "timing_crop_ns": {
       "before": 2.5,
       "after": 2.5
-    },
-    "upsample_step_ps": 2.5
+    }
   },
   "timing_scan": {
     "led_thresholds_mV": {

@@ -2,64 +2,177 @@
 
 ## Main commands
 
-```bash
-python scripts/ml_preprocess.py --config config/ml_preprocess.json
-python scripts/ml_train.py --config config/ml_train_mlp.json --restart
-python scripts/ml_train.py --config config/ml_train_shapelet.json --restart
-python scripts/ml_experiment.py --config config/experiments/model_experiment.json --restart
-python scripts/ml_experiment.py --config config/experiments/shapelet_experiment.json --restart
-python scripts/fit_linear_spline.py --config config/linear_spline.json --restart
-python scripts/ml_evaluate.py --config config/ml_evaluate.json
-```
-
-Optional high-frequency denoising is configured in
-`config/ml_preprocess.json` under `waveform.denoising`. It is disabled by
-default.
-
-## Optional timing-channel LED reference
-
-Preprocessing can read channels 3 and 4 only to estimate LED timestamps and
-align the energy-channel ML windows. The ML arrays still contain channels 1 and
-2 exclusively.
-
-Enable the supplied example with:
+Build a joint canonical dataset containing both energy and timing waveforms:
 
 ```bash
 python scripts/ml_preprocess.py --config config/ml_preprocess_timing_led.json --rebuild
 ```
 
-Equivalent settings in a custom preprocessing configuration are:
+Train separate MLP corrections from the same prepared dataset:
+
+```bash
+# Energy waveforms -> energy-channel LED correction
+python scripts/ml_train.py --config config/ml_train_mlp.json --restart
+
+# Timing waveforms -> timing-channel LED correction
+python scripts/ml_train.py --config config/ml_train_mlp_timing.json --restart
+
+# Optional cross-channel task: energy waveforms -> timing-channel LED correction
+python scripts/ml_train.py --config config/ml_train_mlp_energy_to_timing.json --restart
+
+# Linear SVR with an epsilon scan (energy waveforms -> energy LED)
+python scripts/ml_train.py --config config/ml_train_linear_svr.json --restart
+
+# Lightweight shared-branch 1-D CNN on differentiated waveforms
+python scripts/ml_train.py --config config/ml_train_cnn.json --restart
+
+# Matching raw-waveform CNN for a controlled raw-vs-difference comparison
+python scripts/ml_train.py --config config/ml_train_cnn_raw.json --restart
+
+python scripts/ml_evaluate.py --config config/ml_evaluate_cnn.json
+```
+
+`ml_evaluate` can also rank the events for which the ML model makes the largest
+useful correction. A correction is useful when it reduces the absolute distance
+from the known TOF:
+
+```text
+improvement_ps = |raw - true_TOF| - |corrected - true_TOF|
+```
+
+Enable it in `config/ml_evaluate.json`:
 
 ```json
-"channels": {
-  "energy": [1, 2],
-  "polarities": [1, 1],
-  "timing": [3, 4],
-  "timing_polarities": [1, 1]
-},
-"waveform": {
-  "timing_channel_led": {
-    "enabled": true,
-    "baseline_samples": 500,
-    "search_trigger_threshold_mV": 50.0,
-    "analysis_crop_ns": {"before": 5.0, "after": 80.0},
-    "upsample_step_ps": 2.5,
-    "led_threshold_mV": 7.0,
-    "denoising": {"enabled": false}
-  }
+"correction_analysis": {
+  "enabled": true,
+  "top_n": 10,
+  "minimum_improvement_ps": 0.0,
+  "save_waveform_plots": true
 }
 ```
 
-With this mode:
+For each model and blind test, evaluation writes `top_right_corrections.csv`, a
+JSON summary, and one waveform diagnostic per ranked event under
+`top_corrections/`. The evaluation log and metrics CSV also report
+`top_right_correction_ps`.
 
-- `led_time_fs.npy` comes from timing channels 3 and 4;
-- each energy waveform window is centered on that timing-channel LED crossing;
-- `cfd_time_fs.npy`, amplitudes, noise and trigger indices remain energy-channel quantities;
-- `windows_mV.npy` contains only energy-channel samples;
-- timing-channel waveforms are discarded after LED extraction.
+The same analysis can be run independently:
 
-The raw-cache fingerprint includes this choice, so switching LED source requires
-and automatically identifies a distinct preprocessing cache.
+```bash
+python scripts/plot_top_corrections.py \
+  --dataset datasets/central_source_all/blind_test_timing_led \
+  --model results/all/train/<model-run> \
+  --output results/top_corrections \
+  --top-n 10
+```
+
+## Energy and timing waveform inputs
+
+When `channels.timing` is configured and
+`waveform.timing_channel_led.enabled` is true, preprocessing writes one canonical
+prepared dataset with:
+
+- `windows_mV.npy`: standard energy-channel windows;
+- `timing_windows_mV.npy`: standard timing-channel windows;
+- `energy_led_time_fs.npy`: locally interpolated energy LED timestamps;
+- `timing_led_time_fs.npy`: locally interpolated timing LED timestamps;
+- `led_time_fs.npy`: the legacy/default LED target, retained for compatibility.
+
+Both waveform families remain on their original acquisition grids. No waveform
+upsampling is materialized. Energy windows keep the existing alignment behavior:
+in timing-reference mode they are aligned to the timing LED. Timing windows are
+aligned to their own timing LED.
+
+Training selects a view from that single dataset:
+
+```json
+"prediction": {
+  "input_waveforms": "energy",
+  "target": "energy_led"
+}
+```
+
+or:
+
+```json
+"prediction": {
+  "input_waveforms": "timing",
+  "target": "timing_led"
+}
+```
+
+The original cross-channel experiment remains available with
+`input_waveforms = "energy"` and `target = "timing_led"`. Old configs without a
+`prediction` section remain compatible and resolve to energy waveforms with the
+legacy `prepared_led` target.
+
+## Optional differentiated model input
+
+Set `input_transform` to `none`, `differentiate`, or `concatenate_diff`.
+`concatenate_diff` stores the raw waveform samples first and then appends the
+first differences, producing `2L-1` input values from a waveform of length `L`.
+Differentiation is applied
+after selecting the energy/timing waveform family and is cached inside the model
+run directory. Evaluation reads both the waveform source and transform from the
+checkpoint.
+
+## Enforced final train-bias calibration
+
+Every MLP, lightweight CNN, and linear SVR checkpoint is calibrated after model selection.
+The arithmetic mean of the corrected residual on the training split is measured
+and removed through `pair_output_bias_ps`. The calibrated state overwrites the
+best checkpoint and is the state used during evaluation.
+
+The final calibration always uses residual semantics:
+
+```text
+mean(target - calibrated_prediction) = 0
+```
+
+For the MLP, an optional `training.zero_bias_constraint` can still perform
+additional per-epoch calibration. Final train-bias removal remains mandatory for
+both model families.
+
+
+## Lightweight shared-branch 1-D CNN
+
+`cnn_regressor` preserves the same detector-pair structure used by the MLP:
+
+```text
+correction(s1, s2) = g_cnn(s1) - g_cnn(s2) + pair_output_bias
+```
+
+The two detector waveforms always pass through the same CNN weights. The default
+configuration is designed for long, strongly autocorrelated signals and limited
+compute: three small strided convolutions reduce the temporal length by a factor
+of 64 before a single linear output layer. No dense layer is applied directly to
+the original waveform, so the parameter count remains small even for 20k-sample
+inputs.
+
+The first configuration uses differentiated input and a linear head:
+
+```json
+"channels": [8, 16, 24],
+"kernel_sizes": [17, 9, 5],
+"strides": [8, 4, 2],
+"adaptive_pool_length": null,
+"dense_units": []
+```
+
+`adaptive_pool_length = null` preserves every downsampled temporal position.
+`dense_units = []` means the head is one simple `Linear` layer. Use
+`config/ml_train_cnn_raw.json` as the otherwise matched raw-waveform control.
+
+## Linear SVR epsilon scan
+
+`linear_svr` trains on the normalized pair difference `s1 - s2`, preserving the
+same shared-branch logic as the MLP. A true SVR is fitted with an
+epsilon-insensitive objective for every value in `model.epsilon_values`. The best
+epsilon is selected with `model.loss.type`: `variance` (default), `rmse`, or
+`variance_bias`, where the latter is `variance + bias_weight * bias^2`.
+
+The scan is written to `epsilon_scan.csv`; the selected checkpoint remains fully
+compatible with `ml_evaluate.py`.
 
 ## Position-aware shapelet regressor
 

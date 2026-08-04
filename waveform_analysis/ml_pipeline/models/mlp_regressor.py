@@ -10,7 +10,7 @@ from torch import nn
 from utils.plots import plot_best_fit
 
 from ..common import atomic_json, write_csv_rows
-from ..losses import mse_bias_loss, mse_residual_loss
+from ..losses import mse_residual_loss, var_bias_loss, var_bias_value_from_metrics
 from ..plots import plot_training_history
 from ..training_context import TrainingContext
 from .spec import ModelSpec
@@ -20,6 +20,7 @@ from ..training_utils import (
     evaluate_model_with_optional_fit,
     fit_schedule_for_epoch,
     make_split_loader,
+    predict_loader,
     randomly_swap_paired_batch,
     resolve_device,
     validate_fit_schedule,
@@ -84,6 +85,24 @@ def validate_training_config(config: dict[str, Any]) -> None:
     random_pair_swap = training.get("random_pair_swap", False)
     if not isinstance(random_pair_swap, bool):
         raise ValueError("training.random_pair_swap must be a boolean")
+    zero_bias = training.get("zero_bias_constraint", {"enabled": False})
+    if isinstance(zero_bias, bool):
+        zero_bias = {"enabled": zero_bias}
+    if not isinstance(zero_bias, dict):
+        raise ValueError("training.zero_bias_constraint must be boolean or an object")
+    if not isinstance(zero_bias.get("enabled", False), bool):
+        raise ValueError("training.zero_bias_constraint.enabled must be boolean")
+    mode = str(zero_bias.get("mode", "prediction_mean"))
+    if mode not in ("prediction_mean", "residual_mean"):
+        raise ValueError(
+            "training.zero_bias_constraint.mode must be "
+            "'prediction_mean' or 'residual_mean'"
+        )
+    if bool(zero_bias.get("enabled", False)) and bool(random_pair_swap):
+        raise ValueError(
+            "training.zero_bias_constraint cannot be combined with random_pair_swap: "
+            "a constant pair-output offset is not antisymmetric under detector swapping"
+        )
     baseline_guard_metric = training.get("baseline_guard_metric")
     if baseline_guard_metric not in (None, "validation_rmse", "validation_ctr"):
         raise ValueError(
@@ -94,8 +113,8 @@ def validate_training_config(config: dict[str, Any]) -> None:
     if not isinstance(loss, dict):
         raise ValueError("model.loss must be an object when provided")
     loss_type = str(loss.get("type", "mse"))
-    if loss_type not in ("mse", "mse_bias"):
-        raise ValueError("model.loss.type must be one of ['mse', 'mse_bias']")
+    if loss_type not in ("mse", "var_bias"):
+        raise ValueError("model.loss.type must be one of ['mse', 'var_bias']")
     if float(loss.get("bias_weight", 0.0)) < 0.0:
         raise ValueError("model.loss.bias_weight must be non-negative")
 
@@ -141,6 +160,26 @@ class AntisymmetricMLPRegressor(nn.Module):
         super().__init__()
         self.shared = SingleChannelMLP(config, input_length)
         self.input_length = int(input_length)
+        # A shared final-layer bias inside g cancels in g(s1)-g(s2). This explicit
+        # pair-level offset is therefore the only bias that can calibrate the
+        # mean pair prediction. It is not optimized by gradient descent; the
+        # mandatory final calibration (and optional epoch-end constraint) sets it analytically.
+        self.pair_output_bias_ps = nn.Parameter(
+            torch.zeros((), dtype=torch.float32), requires_grad=False
+        )
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys,
+        unexpected_keys, error_msgs
+    ):
+        # Checkpoints created before pair-output calibration have no such key.
+        key = prefix + "pair_output_bias_ps"
+        if key not in state_dict:
+            state_dict[key] = torch.zeros_like(self.pair_output_bias_ps)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys,
+            unexpected_keys, error_msgs
+        )
 
     def forward(self, waveform_pair: torch.Tensor) -> torch.Tensor:
         if waveform_pair.ndim != 3 or waveform_pair.shape[1] != 2:
@@ -151,7 +190,7 @@ class AntisymmetricMLPRegressor(nn.Module):
         output = self.shared(
             waveform_pair.reshape(batch * 2, self.input_length)
         ).reshape(batch, 2)
-        return output[:, 0] - output[:, 1]
+        return output[:, 0] - output[:, 1] + self.pair_output_bias_ps
 
 
 def build(config: dict[str, Any], input_length: int) -> nn.Module:
@@ -175,6 +214,52 @@ def _set_zero_correction(model: AntisymmetricMLPRegressor) -> None:
         final_linear.weight.zero_()
         if final_linear.bias is not None:
             final_linear.bias.zero_()
+        model.pair_output_bias_ps.zero_()
+
+
+def _resolve_zero_bias_constraint(training: dict[str, Any]) -> dict[str, Any]:
+    value = training.get("zero_bias_constraint", {"enabled": False})
+    if isinstance(value, bool):
+        value = {"enabled": value}
+    resolved = dict(value)
+    resolved.setdefault("enabled", False)
+    resolved.setdefault("mode", "prediction_mean")
+    return resolved
+
+
+def _apply_zero_bias_constraint(
+    model: AntisymmetricMLPRegressor,
+    loader,
+    device: torch.device,
+    *,
+    mode: str,
+) -> tuple[float, float]:
+    """Analytically update the pair-output offset from the training split.
+
+    ``prediction_mean`` enforces E[prediction]=0 exactly, matching the literal
+    requested constraint. ``residual_mean`` enforces E[prediction-target]=0,
+    which is the usual statistical definition of an unbiased predictor.
+    """
+
+    result = predict_loader(model, loader, device)
+    prediction = torch.as_tensor(result["prediction_ps"], dtype=torch.float64)
+    target = torch.as_tensor(result["target_ps"], dtype=torch.float64)
+    if mode == "prediction_mean":
+        measured = float(torch.mean(prediction).item())
+    elif mode == "residual_mean":
+        measured = float(torch.mean(prediction - target).item())
+    else:
+        raise ValueError(f"Unsupported zero-bias constraint mode: {mode}")
+    adjustment = -measured
+    with torch.no_grad():
+        model.pair_output_bias_ps.add_(
+            torch.tensor(
+                adjustment,
+                dtype=model.pair_output_bias_ps.dtype,
+                device=model.pair_output_bias_ps.device,
+            )
+        )
+    return adjustment, float(model.pair_output_bias_ps.detach().cpu().item())
 
 
 def _target_scale_from_datasets(context: TrainingContext, minimum_scale: float) -> float:
@@ -271,7 +356,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
 
     loss_config = dict(config.get("model", {}).get("loss", {}))
     loss_type = str(loss_config.get("type", "mse"))
-    bias_weight = float(loss_config.get("bias_weight", 0.0)) if loss_type == "mse_bias" else 0.0
+    bias_weight = float(loss_config.get("bias_weight", 0.0)) if loss_type == "var_bias" else 0.0
     bias_norm = str(loss_config.get("bias_normalization", "target_std"))
     minimum_scale = float(loss_config.get("minimum_scale", 1e-8))
     target_scale = (
@@ -301,6 +386,14 @@ def train(context: TrainingContext) -> dict[str, Any]:
         context.logger.info(
             "Random ordered-pair swapping enabled for training batches (probability 0.5)"
         )
+    zero_bias_constraint = _resolve_zero_bias_constraint(config["training"])
+    zero_bias_enabled = bool(zero_bias_constraint["enabled"])
+    zero_bias_mode = str(zero_bias_constraint["mode"])
+    if zero_bias_enabled:
+        context.logger.info(
+            "Epoch-end zero-bias constraint enabled | mode=%s | reference split=train",
+            zero_bias_mode,
+        )
 
     context.logger.info("Training %s with Adam on %s", context.model_name, device)
     for epoch in range(1, epochs + 1):
@@ -321,8 +414,8 @@ def train(context: TrainingContext) -> dict[str, Any]:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
                 prediction = model(waveforms)
-                if loss_type == "mse_bias":
-                    loss, _penalty = mse_bias_loss(
+                if loss_type == "var_bias":
+                    loss, _penalty = var_bias_loss(
                         prediction,
                         target,
                         bias_weight=bias_weight,
@@ -337,10 +430,17 @@ def train(context: TrainingContext) -> dict[str, Any]:
             scaler.step(optimizer)
             scaler.update()
 
+        zero_bias_adjustment = 0.0
+        pair_output_bias = float(model.pair_output_bias_ps.detach().cpu().item())
+        if zero_bias_enabled:
+            zero_bias_adjustment, pair_output_bias = _apply_zero_bias_constraint(
+                model, train_eval_loader, device, mode=zero_bias_mode
+            )
+
         fit_train, fit_validation = fit_schedule_for_epoch(
             config["training"], epoch, selection_metric=selection_metric
         )
-        train_metrics, _train_fit, _ = evaluate_model_with_optional_fit(
+        train_metrics, _train_fit, train_prediction = evaluate_model_with_optional_fit(
             model,
             train_eval_loader,
             device,
@@ -348,7 +448,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
             "Train residual",
             perform_fit=fit_train,
         )
-        validation_metrics, _validation_fit, _ = evaluate_model_with_optional_fit(
+        validation_metrics, _validation_fit, validation_prediction = evaluate_model_with_optional_fit(
             model,
             validation_loader,
             device,
@@ -356,10 +456,29 @@ def train(context: TrainingContext) -> dict[str, Any]:
             "Validation residual",
             perform_fit=fit_validation,
         )
+        train_bias = float(train_metrics["bias_ps"])
         validation_bias = float(validation_metrics["bias_ps"])
-        validation_loss = float(validation_metrics["rmse_ps"] ** 2)
-        if loss_type == "mse_bias":
-            validation_loss += bias_weight * (validation_bias / target_scale) ** 2
+        if loss_type == "var_bias":
+            train_loss, train_variance, _train_bias_penalty = var_bias_value_from_metrics(
+                rmse_ps=float(train_metrics["rmse_ps"]),
+                bias_ps=train_bias,
+                bias_weight=bias_weight,
+                target_scale=target_scale,
+            )
+            validation_loss, validation_variance, validation_bias_penalty = (
+                var_bias_value_from_metrics(
+                    rmse_ps=float(validation_metrics["rmse_ps"]),
+                    bias_ps=validation_bias,
+                    bias_weight=bias_weight,
+                    target_scale=target_scale,
+                )
+            )
+        else:
+            train_loss = float(train_metrics["rmse_ps"] ** 2)
+            validation_loss = float(validation_metrics["rmse_ps"] ** 2)
+            train_variance = max(train_loss - train_bias**2, 0.0)
+            validation_variance = max(validation_loss - validation_bias**2, 0.0)
+            validation_bias_penalty = 0.0
         row = {
             "epoch": epoch,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
@@ -367,15 +486,29 @@ def train(context: TrainingContext) -> dict[str, Any]:
             "validation_rmse_ps": float(validation_metrics["rmse_ps"]),
             "train_ctr_ps": float(train_metrics["ctr_ps"]),
             "validation_ctr_ps": float(validation_metrics["ctr_ps"]),
-            "train_bias_ps": float(train_metrics["bias_ps"]),
+            "train_bias_ps": train_bias,
             "validation_bias_ps": validation_bias,
-            "train_loss": float(train_metrics["rmse_ps"] ** 2),
-            "validation_loss": validation_loss,
-            "bias_penalty": float(
-                bias_weight * (validation_bias / target_scale) ** 2
-                if loss_type == "mse_bias"
-                else 0.0
+            "train_variance_ps2": float(train_variance),
+            "validation_variance_ps2": float(validation_variance),
+            "train_loss": float(train_loss),
+            "validation_loss": float(validation_loss),
+            "train_prediction_mean_ps": float(
+                torch.as_tensor(train_prediction["prediction_ps"], dtype=torch.float64).mean().item()
             ),
+            "train_prediction_residual_mean_ps": float(
+                (
+                    torch.as_tensor(train_prediction["prediction_ps"], dtype=torch.float64)
+                    - torch.as_tensor(train_prediction["target_ps"], dtype=torch.float64)
+                ).mean().item()
+            ),
+            "validation_prediction_mean_ps": float(
+                torch.as_tensor(validation_prediction["prediction_ps"], dtype=torch.float64).mean().item()
+            ),
+            "zero_bias_constraint_enabled": zero_bias_enabled,
+            "zero_bias_constraint_mode": zero_bias_mode if zero_bias_enabled else "",
+            "zero_bias_adjustment_ps": float(zero_bias_adjustment),
+            "pair_output_bias_ps": float(pair_output_bias),
+            "bias_penalty": float(validation_bias_penalty),
             "train_fit_performed": bool(train_metrics["fit_performed"]),
             "validation_fit_performed": bool(validation_metrics["fit_performed"]),
             "selected_best": False,
@@ -405,13 +538,14 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 last_path,
             )
         context.logger.info(
-            "Epoch %d/%d | train RMSE %.3f ps | val RMSE %.3f ps | val CTR %s | val bias %.3f ps",
+            "Epoch %d/%d | train RMSE %.3f ps | val RMSE %.3f ps | val CTR %s | val bias %.3f ps | output bias %.3f ps",
             epoch,
             epochs,
             row["train_rmse_ps"],
             row["validation_rmse_ps"],
             (f"{row['validation_ctr_ps']:.3f} ps" if math.isfinite(row["validation_ctr_ps"]) else "not fitted"),
             row["validation_bias_ps"],
+            row["pair_output_bias_ps"],
         )
         if bad_epochs >= patience:
             context.logger.info("Early stopping after %d epochs without improvement", bad_epochs)
@@ -467,6 +601,65 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 model, validation_loader, device, config["fit"], "Selected uncorrected validation LED"
             )
 
+    # Mandatory final calibration: remove the arithmetic training residual bias
+    # from the selected model through its scalar prediction offset.  This is
+    # applied after early stopping and any baseline guard, and the calibrated
+    # state is the checkpoint used for every later evaluation.
+    final_bias_calibration_adjustment_ps, final_pair_output_bias_ps = (
+        _apply_zero_bias_constraint(
+            model,
+            train_eval_loader,
+            device,
+            mode="residual_mean",
+        )
+    )
+    train_metrics, train_fit, _ = evaluate_model(
+        model, train_eval_loader, device, config["fit"], "Final calibrated train residual"
+    )
+    validation_metrics, validation_fit, _ = evaluate_model(
+        model, validation_loader, device, config["fit"], "Final calibrated validation residual"
+    )
+    final_train_bias_ps = float(train_metrics["bias_ps"])
+    if loss_type == "var_bias":
+        final_validation_loss, _final_validation_variance, _final_bias_penalty = (
+            var_bias_value_from_metrics(
+                rmse_ps=float(validation_metrics["rmse_ps"]),
+                bias_ps=float(validation_metrics["bias_ps"]),
+                bias_weight=bias_weight,
+                target_scale=target_scale,
+            )
+        )
+    else:
+        final_validation_loss = float(validation_metrics["rmse_ps"] ** 2)
+    final_selection_values = {
+        "validation_rmse": float(validation_metrics["rmse_ps"]),
+        "validation_loss": final_validation_loss,
+        "absolute_validation_bias": abs(float(validation_metrics["bias_ps"])),
+        "validation_ctr": float(validation_metrics["ctr_ps"]),
+    }
+    best_value = float(final_selection_values[selection_metric])
+    checkpoint_metadata["final_bias_calibration"] = {
+        "enforced": True,
+        "reference_split": "train",
+        "quantity_zeroed": "arithmetic mean of corrected residual",
+        "mode": "residual_mean",
+        "adjustment_ps": float(final_bias_calibration_adjustment_ps),
+        "final_train_bias_ps": final_train_bias_ps,
+    }
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "epoch": int(best_epoch),
+            "context": checkpoint_metadata,
+        },
+        best_path,
+    )
+    context.logger.info(
+        "Final train-bias calibration | adjustment %.6f ps | final train bias %.9f ps",
+        final_bias_calibration_adjustment_ps,
+        final_train_bias_ps,
+    )
+
     if save_history:
         write_csv_rows(context.output_dir / "training_metrics.csv", history)
     if save_plots:
@@ -498,6 +691,25 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "last_checkpoint": str(last_path.resolve()) if last_path.is_file() else "",
         "train_dir": str(context.output_dir.resolve()),
         "input_length": int(context.input_length),
+        "input_transform": context.input_transform,
+        "input_waveform_source": context.input_waveform_source,
+        "prediction_target": context.prediction_target,
+        "input_cache_paths": [str(path) for path in context.input_cache_dirs],
+        "zero_bias_constraint": {
+            "enabled": zero_bias_enabled,
+            "mode": zero_bias_mode,
+            "reference_split": "train",
+        },
+        "pair_output_bias_ps": float(
+            model.pair_output_bias_ps.detach().cpu().item()
+        ),
+        "final_bias_calibration": {
+            "enforced": True,
+            "reference_split": "train",
+            "mode": "residual_mean",
+            "adjustment_ps": float(final_bias_calibration_adjustment_ps),
+            "final_train_bias_ps": float(final_train_bias_ps),
+        },
         "normalization": context.normalization.as_dict(),
         "training_datasets": [str(dataset.directory) for dataset in context.datasets],
         "optimizer": "Adam",

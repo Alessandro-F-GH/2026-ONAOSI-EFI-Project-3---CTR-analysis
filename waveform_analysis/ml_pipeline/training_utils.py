@@ -77,6 +77,7 @@ def randomly_swap_paired_batch(
     return waveforms, target, led_delta, cfd_delta, true_tof
 
 
+
 def make_split_loader(
     datasets: list[PreparedDataset],
     split_name: str,
@@ -125,7 +126,10 @@ def predict_loader(
     cfd: list[np.ndarray] = []
     true_tof: list[np.ndarray] = []
     with torch.no_grad():
-        for waveforms, target, led_delta, cfd_delta, tof in loader:
+        for batch in loader:
+            if len(batch) != 5:
+                raise ValueError(f"Unsupported correction batch with {len(batch)} fields")
+            waveforms, target, led_delta, cfd_delta, tof = batch
             prediction = model(waveforms.to(device, non_blocking=True))
             predictions.append(prediction.detach().cpu().numpy().astype(np.float64))
             targets.append(target.numpy().astype(np.float64))
@@ -237,6 +241,7 @@ def checkpoint_context(
         "cfd_timestamp_source",
         "ml_window_alignment_source",
         "timing_channel_waveforms_saved",
+        "waveform_grid",
     )
     dataset_contract = {
         field: context.datasets[0].manifest.get(field) for field in contract_fields
@@ -246,12 +251,32 @@ def checkpoint_context(
         "model_name": context.model_name,
         "model_config": dict(context.model_config if model_config is None else model_config),
         "input_length": int(context.input_length),
+        "input_transform": context.input_transform,
+        "input_waveform_source": context.input_waveform_source,
+        "prediction_target": context.prediction_target,
+        "input_representation": (
+            "first_difference"
+            if context.input_transform == "differentiate"
+            else (
+                "raw_waveform_then_first_difference"
+                if context.input_transform == "concatenate_diff"
+                else "standard_waveform"
+            )
+        ),
+        "source_input_length": int(
+            context.datasets[0].manifest.get("model_input", {}).get(
+                "input_length_before_transform", context.input_length
+            )
+        ),
         "normalization": context.normalization.as_dict(),
         "training_dataset_fingerprints": [
             dataset.manifest["fingerprint"] for dataset in context.datasets
         ],
         "training_dataset_paths": [str(dataset.directory) for dataset in context.datasets],
-        "target_definition": "LED time difference minus known true TOF",
+        "input_cache_paths": [str(path) for path in context.input_cache_dirs],
+        "target_definition": (
+            f"{context.prediction_target} time difference minus known true TOF"
+        ),
         "training_strategy": training_strategy,
         "data_view": dict(context.data_view),
         "relative_time_ps_start": float(context.datasets[0].relative_time_ps[0]),

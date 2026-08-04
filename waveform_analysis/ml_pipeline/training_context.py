@@ -19,6 +19,10 @@ class TrainingContext:
     datasets: list[PreparedDataset]
     input_length: int
     normalization: Normalization
+    input_transform: str
+    input_waveform_source: str
+    prediction_target: str
+    input_cache_dirs: tuple[Path, ...]
     output_dir: Path
     plot_dir: Path
     checkpoint_dir: Path

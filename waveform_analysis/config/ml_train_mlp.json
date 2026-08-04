@@ -1,22 +1,25 @@
 {
   "datasets": [
-    "datasets/central_source_49V_timing_led/train_validation"
+    "datasets/central_source_47V/train_validation"
   ],
   "model": {
     "type": "mlp_regressor",
-    "name": "mlp_baseline",
-    "hidden_units": [128,32],
+    "name": "mlp_energy",
+    "hidden_units": [
+      1
+    ],
     "activation": "silu",
     "loss": {
-    "type": "mse"
+      "type": "mse_bias",
+      "bias_weight": 0.01
     },
     "dropout": 0.0,
     "batch_norm": false,
     "max_abs_single_channel_output_ps": 1000.0
   },
   "optimizer": {
-    "learning_rate": 0.0001,
-    "weight_decay": 0.000001
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001
   },
   "training": {
     "device": "auto",
@@ -25,16 +28,20 @@
     "fit_train_during_training": false,
     "fit_validation_during_training": true,
     "epochs": 300,
-    "random_pair_swap": true,
-    "batch_size": 8,
+    "random_pair_swap": false,
+    "batch_size": 64,
     "mixed_precision": true,
-    "gradient_clip_norm": 100.0,
+    "gradient_clip_norm": 10.0,
     "early_stopping_patience": 20,
     "early_stopping_min_delta_ps": 0.01,
-    "normalization_chunk_size": 2048, 
+    "normalization_chunk_size": 2048,
     "num_workers": 0,
     "pin_memory": false,
-    "selection_metric": "validation_rmse"
+    "selection_metric": "validation_rmse",
+    "zero_bias_constraint": {
+      "enabled": false,
+      "mode": "prediction_mean"
+    }
   },
   "fit": {
     "histogram_range_ps": [
@@ -51,13 +58,17 @@
     "minimum_sigma_bins": 0.5
   },
   "output": {
-    "train_dir": "results/49V/train/mlp_timing_led"
+    "train_dir": "results/47V/train/mlp_energy"
   },
-  
   "plotting": {
     "dpi": 180
   },
   "logging": {
     "level": "INFO"
+  },
+  "input_transform": "differentiate",
+  "prediction": {
+    "input_waveforms": "energy",
+    "target": "energy_led"
   }
 }

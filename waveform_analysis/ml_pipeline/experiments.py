@@ -20,7 +20,9 @@ from .dataset import (
     prepared_dataset_view,
     window_slice_indices,
 )
+from .input_transform import resolve_input_transform, transformed_input_length
 from .models import count_model_parameters
+from .prediction import prediction_dataset_view, resolve_prediction_config
 from .training import train_model
 import logging
 from pathlib import Path
@@ -361,9 +363,15 @@ def _summary_rows(
         biases = np.asarray([float(row["validation_bias_ps"]) for row in group])
         ctrs = np.asarray([float(row["validation_ctr_ps"]) for row in group])
         complete = len(group) == required_runs
-        model_cfg = dict(configurations[config_id]["effective_config"]["model"])
+        effective_config = configurations[config_id]["effective_config"]
+        model_cfg = dict(effective_config["model"])
         model_type = str(model_cfg.pop("type"))
         model_cfg.pop("name", None)
+        model_cfg.pop("input_transform", None)
+        model_input_length = transformed_input_length(
+            int(windows[window_id]["input_length"]),
+            resolve_input_transform(effective_config),
+        )
         observed_parameter_counts = [
             int(float(row.get("parameter_count", 0)))
             for row in group
@@ -373,7 +381,7 @@ def _summary_rows(
             max(observed_parameter_counts)
             if observed_parameter_counts
             else count_model_parameters(
-                model_type, model_cfg, int(windows[window_id]["input_length"])
+                model_type, model_cfg, model_input_length
             )
         )
         output.append(
@@ -459,6 +467,12 @@ def run_experiment(
     output.mkdir(parents=True, exist_ok=True)
 
     dataset = load_prepared_dataset(config["dataset"])
+    prediction = resolve_prediction_config(config["base_train_config"])
+    dataset = prediction_dataset_view(
+        dataset,
+        input_waveforms=prediction["input_waveforms"],
+        target=prediction["target"],
+    )
     if resume and existing_settings:
         previous_dataset = existing_settings.get("dataset_fingerprint")
         if previous_dataset and previous_dataset != str(dataset.manifest["fingerprint"]):
@@ -482,6 +496,8 @@ def run_experiment(
         "dataset": config["dataset"],
         "dataset_fingerprint": dataset.manifest["fingerprint"],
         "model_type": config["base_train_config"]["model"]["type"],
+        "input_waveform_source": prediction["input_waveforms"],
+        "prediction_target": prediction["target"],
         "search_method": search_method,
         "fold_count": len(folds),
         "seed_count": len(seeds),

@@ -14,7 +14,7 @@ from torch import nn
 from utils.plots import plot_best_fit
 
 from ..common import atomic_json, write_csv_rows
-from ..losses import mse_bias_loss, mse_residual_loss
+from ..losses import mse_residual_loss, var_bias_loss, var_bias_value_from_metrics
 from ..plots import plot_training_history
 from ..training_context import TrainingContext
 from ..training_utils import (
@@ -103,8 +103,8 @@ def validate_training_config(config: dict[str, Any]) -> None:
     if not isinstance(loss, dict):
         raise ValueError("model.loss must be an object when provided")
     loss_type = str(loss.get("type", "mse"))
-    if loss_type not in {"mse", "mse_bias"}:
-        raise ValueError("model.loss.type must be 'mse' or 'mse_bias'")
+    if loss_type not in {"mse", "var_bias"}:
+        raise ValueError("model.loss.type must be 'mse' or 'var_bias'")
     if float(loss.get("bias_weight", 0.0)) < 0.0:
         raise ValueError("model.loss.bias_weight must be non-negative")
 
@@ -507,7 +507,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
     loss_type = str(loss_config.get("type", "mse"))
     bias_weight = (
         float(loss_config.get("bias_weight", 0.0))
-        if loss_type == "mse_bias"
+        if loss_type == "var_bias"
         else 0.0
     )
     bias_norm = str(loss_config.get("bias_normalization", "target_std"))
@@ -611,8 +611,8 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=amp_enabled):
                     prediction = model(waveforms)
-                    if loss_type == "mse_bias":
-                        loss, _penalty = mse_bias_loss(
+                    if loss_type == "var_bias":
+                        loss, _penalty = var_bias_loss(
                             prediction,
                             target,
                             bias_weight=bias_weight,
@@ -648,9 +648,21 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 perform_fit=fit_validation,
             )
             validation_bias = float(validation_metrics["bias_ps"])
-            validation_loss = float(validation_metrics["rmse_ps"] ** 2)
-            if loss_type == "mse_bias":
-                validation_loss += bias_weight * (validation_bias / target_scale) ** 2
+            if loss_type == "var_bias":
+                validation_loss, validation_variance, validation_bias_penalty = (
+                    var_bias_value_from_metrics(
+                        rmse_ps=float(validation_metrics["rmse_ps"]),
+                        bias_ps=validation_bias,
+                        bias_weight=bias_weight,
+                        target_scale=target_scale,
+                    )
+                )
+            else:
+                validation_loss = float(validation_metrics["rmse_ps"] ** 2)
+                validation_variance = max(
+                    validation_loss - validation_bias**2, 0.0
+                )
+                validation_bias_penalty = 0.0
             current = _selection_value(
                 validation_metrics, validation_loss, selection_metric
             )
@@ -675,10 +687,12 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 "validation_ctr_ps": float(validation_metrics["ctr_ps"]),
                 "train_bias_ps": float(train_metrics["bias_ps"]),
                 "validation_bias_ps": validation_bias,
+                "validation_variance_ps2": float(validation_variance),
                 "train_loss": (
                     float(np.mean(batch_losses)) if batch_losses else math.nan
                 ),
-                "validation_loss": validation_loss,
+                "validation_loss": float(validation_loss),
+                "bias_penalty": float(validation_bias_penalty),
                 "train_fit_performed": bool(train_metrics["fit_performed"]),
                 "validation_fit_performed": bool(validation_metrics["fit_performed"]),
                 "selected_best": selected,
@@ -858,6 +872,8 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "last_checkpoint": str(last_path.resolve()) if last_path.is_file() else "",
         "train_dir": str(context.output_dir.resolve()),
         "input_length": int(context.input_length),
+        "input_transform": context.input_transform,
+        "input_cache_paths": [str(path) for path in context.input_cache_dirs],
         "encoded_dimension": int(accepted_units),
         "accepted_units": int(accepted_units),
         "attempted_units": int(len(growth_rows)),
@@ -884,7 +900,11 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "model_parameter_count": int(
             sum(parameter.numel() for parameter in model.parameters())
         ),
-        "objective": "Direct MSE of g(s1)-g(s2) against LED_delta-true_TOF",
+        "objective": (
+            "Residual variance plus normalized squared-bias penalty"
+            if loss_type == "var_bias"
+            else "Direct MSE of g(s1)-g(s2) against LED_delta-true_TOF"
+        ),
         "linearity_note": (
             "Because every hidden activation is identity, the complete encoder and "
             "predictor are affine/linear functions of the normalized waveform."

@@ -23,7 +23,13 @@ from ml_pipeline.dataset import (
     prepared_dataset_view,
     window_slice_indices,
 )
+from ml_pipeline.input_transform import (
+    apply_input_transform,
+    normalize_input_transform,
+    transformed_input_length,
+)
 from ml_pipeline.models import build_model
+from ml_pipeline.prediction import prediction_dataset_view
 from ml_pipeline.models.constructive_mlp_encoder import (
     AntisymmetricConstructiveMLPEncoder,
 )
@@ -57,12 +63,6 @@ def _resolve_dataset_view(
             window_start=start,
             window_stop=stop,
         )
-    expected = int(checkpoint_context["input_length"])
-    if dataset.input_length != expected:
-        raise ValueError(
-            f"Checkpoint expects {expected} waveform samples, but dataset view has "
-            f"{dataset.input_length}"
-        )
     return dataset
 
 
@@ -94,11 +94,26 @@ def encode_dataset(
         raise ValueError(
             "ml_encode_constructive.py requires a constructive_mlp_encoder checkpoint"
         )
-    dataset = _resolve_dataset_view(load_prepared_dataset(dataset_path), context)
+    dataset = load_prepared_dataset(dataset_path)
+    dataset = prediction_dataset_view(
+        dataset,
+        input_waveforms=context.get("input_waveform_source", "energy"),
+        target=context.get("prediction_target", "prepared_led"),
+    )
+    dataset = _resolve_dataset_view(dataset, context)
+    input_transform = normalize_input_transform(context.get("input_transform", "none"))
+    expected_input_length = int(context["input_length"])
+    actual_input_length = transformed_input_length(dataset.input_length, input_transform)
+    if actual_input_length != expected_input_length:
+        raise ValueError(
+            f"Checkpoint expects {expected_input_length} samples after "
+            f"input_transform={input_transform!r}, but the selected canonical dataset "
+            f"view produces {actual_input_length}"
+        )
     model = build_model(
         model_type,
         dict(context["model_config"]),
-        int(context["input_length"]),
+        expected_input_length,
     ).to(device)
     if not isinstance(model, AntisymmetricConstructiveMLPEncoder):
         raise TypeError("Loaded checkpoint did not build a constructive encoder")
@@ -157,6 +172,9 @@ def encode_dataset(
             waveforms = np.asarray(
                 dataset.windows_mV[start:stop], dtype=np.float32
             ).copy()
+            waveforms = np.asarray(
+                apply_input_transform(waveforms, input_transform), dtype=np.float32
+            )
             waveforms = (waveforms - mean) / std
             tensor = torch.from_numpy(waveforms).to(device)
             hidden = model.encode_pair(tensor)
@@ -210,6 +228,10 @@ def encode_dataset(
         "source_dataset_fingerprint": dataset.manifest.get("fingerprint", ""),
         "source_event_count": event_count,
         "source_input_length": int(dataset.input_length),
+        "model_input_length": expected_input_length,
+        "input_transform": input_transform,
+        "input_waveform_source": context.get("input_waveform_source", "energy"),
+        "prediction_target": context.get("prediction_target", "prepared_led"),
         "encoded_dimension": unit_count,
         "encoded_channels_shape": [event_count, 2, unit_count],
         "encoded_pair_difference_shape": [event_count, unit_count],
