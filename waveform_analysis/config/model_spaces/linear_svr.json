@@ -1,0 +1,77 @@
+{
+  "id": "linear_svr",
+  "model_type": "linear_svr",
+  "supported_losses": [
+    "mse",
+    "var_bias"
+  ],
+  "study_loss_mapping": {
+    "mse": {
+      "type": "rmse"
+    },
+    "var_bias": {
+      "type": "variance_bias",
+      "bias_weight": 0.01
+    }
+  },
+  "base_train_config": {
+    "model": {
+      "type": "linear_svr",
+      "name": "resolved_by_study",
+      "C": 1.0,
+      "epsilon_values": [
+        50.0
+      ],
+      "svm_loss": "epsilon_insensitive",
+      "loss": {
+        "type": "rmse"
+      },
+      "tolerance": 1,
+      "max_iterations": 1000,
+      "dual": "auto"
+    },
+    "training": {
+      "device": "cpu",
+      "seed": 20260804,
+      "batch_size": 512,
+      "normalization_chunk_size": 2048,
+      "svr_materialization_chunk_size": 2048,
+      "num_workers": 0,
+      "pin_memory": false,
+      "random_pair_swap": false,
+      "baseline_guard_metric": null
+    },
+    "fit": {
+      "histogram_range_ps": [
+        -300.0,
+        300.0
+      ],
+      "histogram_bin_ps": 5.0,
+      "initial_half_width_ps": 500.0,
+      "iteration_sigma": 2.5,
+      "max_iterations": 6,
+      "convergence_tolerance_ps": 0.01,
+      "min_events": 100,
+      "minimum_fit_bins": 9,
+      "minimum_sigma_bins": 0.5
+    },
+    "output": {
+      "train_dir": "resolved_by_study"
+    },
+    "plotting": {
+      "dpi": 180
+    },
+    "logging": {
+      "level": "INFO"
+    }
+  },
+  "search": {
+  "method": "grid",
+  "parameters": {
+    "model.epsilon": {
+      "type": "categorical",
+      "values": [0.0, 20.0, 50.0, 100]
+    }
+  }
+  }
+}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import os
 import shutil
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -23,10 +24,10 @@ from .signal import (
     extract_timing_channel,
     relative_window_grid_ps,
 )
-from .splitting import contiguous_block_split
+from .splitting import contiguous_block_split, contiguous_development_blind_split
 from .standard_methods.cfd import select_precomputed_cfd_times
 
-CACHE_FORMAT_VERSION = 6
+CACHE_FORMAT_VERSION = 9
 SPLIT_FORMAT_VERSION = 4
 
 
@@ -49,6 +50,12 @@ class EnergyCache:
     relative_time_ps: np.ndarray
     energy_led_time_fs: np.ndarray | None = None
     timing_led_time_fs: np.ndarray | None = None
+    energy_cfd_time_fs: np.ndarray | None = None
+    timing_cfd_time_fs: np.ndarray | None = None
+    energy_window_anchor_time_fs: np.ndarray | None = None
+    timing_aligned_energy_window_anchor_time_fs: np.ndarray | None = None
+    timing_window_anchor_time_fs: np.ndarray | None = None
+    timing_aligned_energy_windows_mV: np.ndarray | None = None
     timing_windows_mV: np.ndarray | None = None
     timing_relative_time_ps: np.ndarray | None = None
 
@@ -106,6 +113,12 @@ def _array_paths(directory: Path) -> dict[str, Path]:
         "relative_time_ps",
         "energy_led_time_fs",
         "timing_led_time_fs",
+        "energy_cfd_time_fs",
+        "timing_cfd_time_fs",
+        "energy_window_anchor_time_fs",
+        "timing_aligned_energy_window_anchor_time_fs",
+        "timing_window_anchor_time_fs",
+        "timing_aligned_energy_windows_mV",
         "timing_windows_mV",
         "timing_relative_time_ps",
     )
@@ -128,10 +141,19 @@ def load_energy_cache(directory: Path, input_path: Path, config: dict[str, Any])
         "event_id", "event_index", "source_file_id", "source_run_index",
         "bias_voltage_V", "amplitude_mV", "noise_rms_mV", "trigger_index",
         "led_time_fs", "cfd_time_fs", "windows_mV", "valid",
-        "relative_time_ps", "energy_led_time_fs",
+        "relative_time_ps", "energy_led_time_fs", "energy_cfd_time_fs",
+        "energy_window_anchor_time_fs",
     )
     if bool(manifest.get("timing_channel_waveforms_saved", False)):
-        required += ("timing_led_time_fs", "timing_windows_mV", "timing_relative_time_ps")
+        required += (
+            "timing_led_time_fs",
+            "timing_cfd_time_fs",
+            "timing_aligned_energy_window_anchor_time_fs",
+            "timing_window_anchor_time_fs",
+            "timing_aligned_energy_windows_mV",
+            "timing_windows_mV",
+            "timing_relative_time_ps",
+        )
     missing = [str(paths[name]) for name in required if not paths[name].is_file()]
     if missing:
         raise ValueError("Energy cache is incomplete: " + ", ".join(missing))
@@ -155,6 +177,26 @@ def load_energy_cache(directory: Path, input_path: Path, config: dict[str, Any])
         timing_led_time_fs=(
             np.load(paths["timing_led_time_fs"], mmap_mode="r")
             if paths["timing_led_time_fs"].is_file() else None
+        ),
+        energy_cfd_time_fs=np.load(paths["energy_cfd_time_fs"], mmap_mode="r"),
+        timing_cfd_time_fs=(
+            np.load(paths["timing_cfd_time_fs"], mmap_mode="r")
+            if paths["timing_cfd_time_fs"].is_file() else None
+        ),
+        energy_window_anchor_time_fs=np.load(
+            paths["energy_window_anchor_time_fs"], mmap_mode="r"
+        ),
+        timing_aligned_energy_window_anchor_time_fs=(
+            np.load(paths["timing_aligned_energy_window_anchor_time_fs"], mmap_mode="r")
+            if paths["timing_aligned_energy_window_anchor_time_fs"].is_file() else None
+        ),
+        timing_window_anchor_time_fs=(
+            np.load(paths["timing_window_anchor_time_fs"], mmap_mode="r")
+            if paths["timing_window_anchor_time_fs"].is_file() else None
+        ),
+        timing_aligned_energy_windows_mV=(
+            np.load(paths["timing_aligned_energy_windows_mV"], mmap_mode="r")
+            if paths["timing_aligned_energy_windows_mV"].is_file() else None
         ),
         timing_windows_mV=(
             np.load(paths["timing_windows_mV"], mmap_mode="r")
@@ -267,6 +309,22 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
         if use_timing_channel_led
         else None
     )
+    energy_window_anchor = np.asarray(
+        [item.window_anchor_time_fs for item in outputs], dtype=np.int64
+    )
+    timing_window_anchor = (
+        np.asarray([item.window_anchor_time_fs for item in timing_outputs], dtype=np.int64)
+        if use_timing_channel_led
+        else None
+    )
+    timing_aligned_energy_anchor = (
+        np.asarray(
+            [item.reference_aligned_window_anchor_time_fs for item in outputs],
+            dtype=np.int64,
+        )
+        if use_timing_channel_led
+        else None
+    )
     # ``led_time_fs`` and ``cfd_time_fs`` are the prepared standard-method
     # timestamps consumed by ml_evaluate.  Select both from the same waveform
     # family here, during preprocessing; the manifest only documents this choice.
@@ -276,6 +334,24 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
         np.stack([item.window_mV for item in timing_outputs]).astype(np.float32)
         if use_timing_channel_led
         else None
+    )
+    timing_aligned_available = bool(
+        use_timing_channel_led
+        and all(item.reference_aligned_window_mV is not None for item in outputs)
+    )
+    timing_aligned_energy_windows = (
+        np.stack(
+            [
+                np.asarray(item.reference_aligned_window_mV, dtype=np.float32)
+                for item in outputs
+            ]
+        ).astype(np.float32)
+        if timing_aligned_available
+        else (
+            np.full((2, relative_grid_ps.size), np.nan, dtype=np.float32)
+            if use_timing_channel_led
+            else None
+        )
     )
     return (
         int(event_index),
@@ -290,11 +366,21 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
         prepared_cfd,
         energy_led,
         timing_led,
+        energy_cfd,
+        timing_cfd,
+        energy_window_anchor,
+        timing_aligned_energy_anchor,
+        timing_window_anchor,
         np.stack([item.window_mV for item in outputs]).astype(np.float32),
+        timing_aligned_energy_windows,
         timing_windows,
         bool(
             all(item.valid for item in outputs)
             and (not use_timing_channel_led or all(item.valid for item in timing_outputs))
+            and (
+                not use_timing_channel_led
+                or timing_aligned_available
+            )
         ),
     )
 
@@ -373,6 +459,58 @@ def prepare_energy_cache(
     if temporary.exists():
         shutil.rmtree(temporary)
     temporary.mkdir(parents=True, exist_ok=True)
+
+    # Fail before partially allocating large memmaps. In study mode the cache may
+    # contain energy-aligned energy, timing-aligned energy, and timing waveforms.
+    # Their combined size is substantial, especially for long windows.
+    array_specs: list[tuple[tuple[int, ...], np.dtype]] = [
+        ((n_events,), np.dtype(np.int64)),
+        ((n_events,), np.dtype(np.int64)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events,), np.dtype(np.int32)),
+        ((n_events,), np.dtype(np.float64)),
+        ((n_events, 2), np.dtype(np.float32)),
+        ((n_events, 2), np.dtype(np.float32)),
+        ((n_events, 2), np.dtype(np.int32)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events, 2, int(relative_grid.size)), np.dtype(np.float32)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events,), np.dtype(np.bool_)),
+    ]
+    if use_timing_channel_led:
+        assert timing_relative_grid is not None
+        array_specs.extend([
+            ((n_events, 2), np.dtype(np.int64)),
+            ((n_events, 2), np.dtype(np.int64)),
+            ((n_events, 2), np.dtype(np.int64)),
+            ((n_events, 2), np.dtype(np.int64)),
+            ((n_events, 2, int(relative_grid.size)), np.dtype(np.float32)),
+            ((n_events, 2, int(timing_relative_grid.size)), np.dtype(np.float32)),
+        ])
+    required_bytes = sum(
+        int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+        for shape, dtype in array_specs
+    )
+    free_bytes = int(shutil.disk_usage(temporary.parent).free)
+    safety_bytes = max(int(required_bytes * 1.05), required_bytes + 256 * 1024**2)
+    logger.info(
+        "Preprocessing storage | required about %.2f GiB | free %.2f GiB",
+        required_bytes / 1024**3,
+        free_bytes / 1024**3,
+    )
+    if free_bytes < safety_bytes:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise OSError(
+            errno.ENOSPC,
+            "Insufficient disk space for preprocessing cache: "
+            f"need about {safety_bytes / 1024**3:.2f} GiB including safety margin, "
+            f"but only {free_bytes / 1024**3:.2f} GiB is free",
+            str(directory),
+        )
+
     paths = _array_paths(temporary)
     arrays = {
         "event_id": open_memmap(paths["event_id"], mode="w+", dtype=np.int64, shape=(n_events,)),
@@ -387,6 +525,11 @@ def prepare_energy_cache(
         "cfd_time_fs": open_memmap(paths["cfd_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
         "windows_mV": open_memmap(paths["windows_mV"], mode="w+", dtype=np.float32, shape=(n_events, 2, relative_grid.size)),
         "energy_led_time_fs": open_memmap(paths["energy_led_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
+        "energy_cfd_time_fs": open_memmap(paths["energy_cfd_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
+        "energy_window_anchor_time_fs": open_memmap(
+            paths["energy_window_anchor_time_fs"], mode="w+", dtype=np.int64,
+            shape=(n_events, 2),
+        ),
         "valid": open_memmap(paths["valid"], mode="w+", dtype=np.bool_, shape=(n_events,)),
     }
     np.save(paths["relative_time_ps"], relative_grid.astype(np.float32))
@@ -394,6 +537,23 @@ def prepare_energy_cache(
         assert timing_relative_grid is not None
         arrays["timing_led_time_fs"] = open_memmap(
             paths["timing_led_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)
+        )
+        arrays["timing_cfd_time_fs"] = open_memmap(
+            paths["timing_cfd_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)
+        )
+        arrays["timing_aligned_energy_window_anchor_time_fs"] = open_memmap(
+            paths["timing_aligned_energy_window_anchor_time_fs"],
+            mode="w+", dtype=np.int64, shape=(n_events, 2),
+        )
+        arrays["timing_window_anchor_time_fs"] = open_memmap(
+            paths["timing_window_anchor_time_fs"],
+            mode="w+", dtype=np.int64, shape=(n_events, 2),
+        )
+        arrays["timing_aligned_energy_windows_mV"] = open_memmap(
+            paths["timing_aligned_energy_windows_mV"],
+            mode="w+",
+            dtype=np.float32,
+            shape=(n_events, 2, relative_grid.size),
         )
         arrays["timing_windows_mV"] = open_memmap(
             paths["timing_windows_mV"], mode="w+", dtype=np.float32,
@@ -439,8 +599,9 @@ def prepare_energy_cache(
     if use_timing_channel_led:
         assert timing_channels is not None
         logger.info(
-            "Timing-channel LED mode enabled | LED and ML-window alignment from "
-            "samples_ch%d/samples_ch%d | timing waveforms are saved as optional ML inputs",
+            "Timing-channel mode enabled | energy windows are saved with both energy-LED "
+            "and timing-LED alignment | timing waveforms are saved with timing-LED alignment "
+            "from samples_ch%d/samples_ch%d",
             timing_channels[0],
             timing_channels[1],
         )
@@ -538,7 +699,13 @@ def prepare_energy_cache(
                     cfd,
                     energy_led,
                     timing_led,
+                    energy_cfd,
+                    timing_cfd,
+                    energy_window_anchor,
+                    timing_aligned_energy_anchor,
+                    timing_window_anchor,
                     windows,
+                    timing_aligned_energy_windows,
                     timing_windows,
                     valid,
                 ) = result
@@ -553,9 +720,19 @@ def prepare_energy_cache(
                 arrays["led_time_fs"][written] = led
                 arrays["cfd_time_fs"][written] = cfd
                 arrays["energy_led_time_fs"][written] = energy_led
+                arrays["energy_cfd_time_fs"][written] = energy_cfd
+                arrays["energy_window_anchor_time_fs"][written] = energy_window_anchor
                 arrays["windows_mV"][written] = windows
                 if use_timing_channel_led:
                     arrays["timing_led_time_fs"][written] = timing_led
+                    arrays["timing_cfd_time_fs"][written] = timing_cfd
+                    arrays["timing_aligned_energy_window_anchor_time_fs"][written] = (
+                        timing_aligned_energy_anchor
+                    )
+                    arrays["timing_window_anchor_time_fs"][written] = timing_window_anchor
+                    arrays["timing_aligned_energy_windows_mV"][written] = (
+                        timing_aligned_energy_windows
+                    )
                     arrays["timing_windows_mV"][written] = timing_windows
                 arrays["valid"][written] = valid
                 written += 1
@@ -592,6 +769,7 @@ def prepare_energy_cache(
                 else []
             ),
             "timing_channel_waveforms_saved": bool(use_timing_channel_led),
+            "timing_aligned_energy_waveforms_saved": bool(use_timing_channel_led),
             "available_waveform_sources": [
                 "energy", *( ["timing"] if use_timing_channel_led else [] )
             ],
@@ -605,8 +783,14 @@ def prepare_energy_cache(
             "cfd_timestamp_source": (
                 "timing_channels" if use_timing_channel_led else "energy_channels"
             ),
-            "ml_window_alignment_source": (
-                "timing_channel_led" if use_timing_channel_led else "energy_channel_led"
+            "target_specific_cfd_timestamps_saved": True,
+            "ml_window_alignment_source": "target_specific_led",
+            "energy_window_alignment_sources": [
+                "energy_channel_led",
+                *(["timing_channel_led"] if use_timing_channel_led else []),
+            ],
+            "timing_window_alignment_source": (
+                "timing_channel_led" if use_timing_channel_led else None
             ),
             "optional_metadata_cached": ["source_run_index", "bias_voltage_V"],
             "relative_window_points": int(relative_grid.size),
@@ -623,6 +807,9 @@ def prepare_energy_cache(
                 if timing_relative_grid is not None else 0
             ),
             "ml_window_alignment_quantization": "nearest_native_sample",
+            "window_anchor_timestamps_saved": True,
+            "correction_target_reference": "interpolated_led",
+            "window_anchor_shift_factorization_supported": True,
             "timing_crossing_interpolation": "linear_between_bracketing_native_samples",
             "deprecated_preprocessing_options_ignored": deprecated,
             "valid_events": valid_events,
@@ -650,19 +837,24 @@ def _source_group_split(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     keys = np.asarray([f"{int(a)}:{int(b)}" for a, b in groups], dtype=object)
     unique = np.unique(keys)
-    if unique.size < 3:
+    required_groups = int(np.count_nonzero(np.asarray(fractions) > 0.0))
+    if unique.size < required_groups:
         raise ValueError(
-            "source_file split requires at least three distinct energy-channel source-file pairs"
+            "source_file split requires at least "
+            f"{required_groups} distinct energy-channel source-file pairs"
         )
     rng = np.random.default_rng(seed)
     rng.shuffle(unique)
     target = np.asarray(fractions) * keys.size
+    active_destinations = np.flatnonzero(np.asarray(fractions) > 0.0)
     split_lists: list[list[str]] = [[], [], []]
     counts = np.zeros(3, dtype=np.int64)
     for key in unique:
         size = int(np.count_nonzero(keys == key))
         deficits = target - counts
-        destination = int(np.argmax(deficits))
+        destination = int(
+            active_destinations[np.argmax(deficits[active_destinations])]
+        )
         split_lists[destination].append(str(key))
         counts[destination] += size
     masks = [np.isin(keys, split_keys) for split_keys in split_lists]
@@ -765,6 +957,7 @@ def prepare_splits(
 
     n_events = int(cache.event_id.shape[0])
     split_config = config["split"]
+    development_blind = bool(split_config.get("development_blind", False))
     fractions = (
         float(split_config["train_fraction"]),
         float(split_config["validation_fraction"]),
@@ -778,9 +971,21 @@ def prepare_splits(
     elif strategy == "stratified_event":
         candidates = _stratified_event_split(cache.bias_voltage_V, fractions, seed)
     elif strategy == "contiguous_blocks":
-        candidates = contiguous_block_split(
-            n_events, fractions, guard_gap_events
-        )
+        if development_blind:
+            development_candidate, blind_candidate = contiguous_development_blind_split(
+                n_events,
+                fractions[2],
+                guard_gap_events,
+            )
+            candidates = (
+                development_candidate,
+                np.empty(0, dtype=np.int64),
+                blind_candidate,
+            )
+        else:
+            candidates = contiguous_block_split(
+                n_events, fractions, guard_gap_events
+            )
     else:
         candidates = _event_split(n_events, fractions, seed)
     train_candidate, validation_candidate, test_candidate = candidates
@@ -886,7 +1091,12 @@ def prepare_splits(
     validation = validation_candidate[base_valid[validation_candidate]]
     test = test_candidate[base_valid[test_candidate]]
     minimum = int(selection_config.get("minimum_events_per_split", 1))
-    for name, values in (("train", train), ("validation", validation), ("test", test)):
+    required_selected_splits = (
+        (("train", train), ("test", test))
+        if development_blind
+        else (("train", train), ("validation", validation), ("test", test))
+    )
+    for name, values in required_selected_splits:
         if values.size < minimum:
             raise RuntimeError(
                 f"Only {values.size} selected events in {name}; need at least {minimum}"
@@ -902,10 +1112,13 @@ def prepare_splits(
         "fingerprint": fingerprint,
         "dataset_fingerprint": cache.manifest["fingerprint"],
         "strategy": strategy,
+        "split_mode": "development_blind" if development_blind else "train_validation_test",
         "seed": seed,
         "guard_gap_events": guard_gap_events if strategy == "contiguous_blocks" else 0,
         "guard_events_excluded_total": (
-            2 * guard_gap_events if strategy == "contiguous_blocks" else 0
+            (guard_gap_events if development_blind else 2 * guard_gap_events)
+            if strategy == "contiguous_blocks"
+            else 0
         ),
         "fractions": {
             "train": fractions[0],

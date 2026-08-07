@@ -76,7 +76,13 @@ prepared dataset with:
 - `timing_windows_mV.npy`: standard timing-channel windows;
 - `energy_led_time_fs.npy`: locally interpolated energy LED timestamps;
 - `timing_led_time_fs.npy`: locally interpolated timing LED timestamps;
-- `led_time_fs.npy`: the legacy/default LED target, retained for compatibility.
+- `energy_cfd_time_fs.npy`: energy-channel CFD timestamps;
+- `timing_cfd_time_fs.npy`: timing-channel CFD timestamps;
+- `energy_window_anchor_time_fs.npy`: native energy-sample anchors used by energy windows;
+- `timing_aligned_energy_window_anchor_time_fs.npy`: native energy-sample anchors used by timing-LED-aligned energy windows;
+- `timing_window_anchor_time_fs.npy`: native timing-sample anchors used by timing windows;
+- `led_time_fs.npy` and `cfd_time_fs.npy`: legacy/default timestamp families,
+  retained for compatibility.
 
 Both waveform families remain on their original acquisition grids. No waveform
 upsampling is materialized. Energy windows keep the existing alignment behavior:
@@ -106,15 +112,52 @@ The original cross-channel experiment remains available with
 `prediction` section remain compatible and resolve to energy waveforms with the
 legacy `prepared_led` target.
 
-## Optional differentiated model input
 
-Set `input_transform` to `none`, `differentiate`, or `concatenate_diff`.
-`concatenate_diff` stores the raw waveform samples first and then appends the
-first differences, producing `2L-1` input values from a waveform of length `L`.
-Differentiation is applied
-after selecting the energy/timing waveform family and is cached inside the model
-run directory. Evaluation reads both the waveform source and transform from the
-checkpoint.
+### Interpolated-LED target with native-window shift factorization
+
+LED remains a locally interpolated timestamp, while the waveform input remains a
+direct slice of acquired samples. For detector `j`, preprocessing stores the
+nearest native sample time `t_anchor,j` used to center the selected waveform and
+computes the exact fractional offset
+
+```text
+delta_j = t_LED,j - t_anchor,j.
+```
+
+For an ordered detector pair, the model does not learn this deterministic grid
+quantization term. Its target is
+
+```text
+c_model = [(t_LED,1 - t_LED,2) - TOF_true] - (delta_1 - delta_2)
+        = (t_anchor,1 - t_anchor,2) - TOF_true.
+```
+
+At inference, the full correction to the interpolated LED is reconstructed as
+
+```text
+c_LED = c_model_prediction + (delta_1 - delta_2),
+TOF_corrected = Delta t_LED - c_LED.
+```
+
+Thus no waveform samples are interpolated, but the label no longer contains the
+nearest-sample rounding discontinuity. For combined energy+timing input targeting
+timing LED, the timing-window native anchor is the canonical factorization anchor;
+the independently sampled energy component remains an auxiliary input.
+
+## Optional model-input transformations
+
+Set `input_transform` to `none`, `differentiate`, `concatenate_diff`, or
+`normalize`. `concatenate_diff` stores the raw waveform samples first and then
+appends the first differences, producing `2L-1` input values from a waveform of
+length `L`. Differentiated representations are cached after selecting the
+energy/timing waveform family.
+
+`normalize` performs a featurewise z-score. For every time position, the mean and
+standard deviation are estimated from the current fold's training events only,
+pooling the two detector channels. The same statistics are then applied to that
+fold's validation and blind events. Constant features use a scale of one. This
+transform is intentionally not materialized globally, preventing CV leakage.
+Evaluation replays the transformation from statistics stored in the checkpoint.
 
 ## Enforced final train-bias calibration
 
@@ -260,7 +303,8 @@ Main artifacts include:
 
 - `ml_pipeline/models/`: trainable ML models only.
 - `ml_pipeline/standard_methods/`: LED, CFD and linear-spline estimators.
-- `ml_pipeline/experiments.py`: model-independent search/CV orchestration.
+- `ml_pipeline/study.py`: folder-driven multi-file CV and blind-audit orchestration,
+  with target-specific LED-relative windows and unfiltered timing inputs.
 - `ml_pipeline/evaluation.py`: blind comparison of models and standard methods.
 
 ## Adding a trainable model
@@ -294,3 +338,55 @@ python scripts/ml_train.py --config config/ml_train_constructive_encoder.json --
 Because the activation is identity, the encoder is a learned affine projection;
 it is intended as supervised dimensionality reduction rather than a nonlinear
 network.
+
+## Compact folder-study reporting
+
+The folder experiment writes two human-readable final tables:
+
+```text
+results/studies/<study>/summary_results.csv
+results/studies/<study>/model_loss_results.csv
+```
+
+`summary_results.csv` contains one overall CV-selected winner per ROOT file and
+channel mode. LED and CFD participate in this CV comparison as non-trainable
+`standard_method` entries and may therefore be the reported winner.
+`model_loss_results.csv` contains one row per ROOT file, channel mode, trainable
+model/loss pair, plus one row each for LED and CFD. For trainable models, the best
+input transform and window are selected using mean CV CTR only. Standard-method
+rows use `loss_id=evaluation_mse`, `input_transform=not_applicable`, and have no
+window. Fold-level persistence remains under the private `_state/` directory for
+restartability.
+
+
+Standard methods are enabled by default in the study configuration:
+
+```json
+"standard_methods": ["led", "cfd"]
+```
+
+Use an empty list to exclude both. CFD always follows the target timestamp family:
+energy-channel CFD for `energy_to_energy`, and timing-channel CFD for every
+timing-LED target mode. Both timestamp families are materialized during
+preprocessing so the comparison uses the same selected events as ML.
+
+Final plots include:
+
+- one validation/blind Gaussian-fit figure per ROOT file;
+- one best mean-CV-CTR versus window-size figure per ROOT file, with one line per
+  model and one panel per channel mode;
+- one optional `CTR vs voltage` figure for all files.
+
+Voltage extraction is optional and configured by a filename regular expression, e.g.
+`45V_*.root`:
+
+```json
+"reporting": {
+  "voltage_from_filename": {
+    "enabled": true,
+    "pattern": "^(?P<voltage>\\d+(?:\\.\\d+)?)V",
+    "group": "voltage",
+    "plot_ctr_vs_voltage": true
+  }
+}
+```

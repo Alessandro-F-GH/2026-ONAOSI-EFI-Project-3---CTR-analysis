@@ -30,10 +30,11 @@ def randomly_swap_paired_batch(
     led_delta: torch.Tensor,
     cfd_delta: torch.Tensor,
     true_tof: torch.Tensor,
+    anchor_shift: torch.Tensor,
     *,
     generator: torch.Generator,
     probability: float = 0.5,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Randomly reverse ordered detector pairs while preserving supervision.
 
     Swapping ``(s1, s2)`` to ``(s2, s1)`` reverses every ordered time
@@ -49,6 +50,7 @@ def randomly_swap_paired_batch(
         ("led_delta", led_delta),
         ("cfd_delta", cfd_delta),
         ("true_tof", true_tof),
+        ("anchor_shift", anchor_shift),
     ):
         if values.ndim != 1 or int(values.shape[0]) != batch_size:
             raise ValueError(f"{name} must have shape [batch]")
@@ -57,24 +59,26 @@ def randomly_swap_paired_batch(
     if not 0.0 <= probability <= 1.0:
         raise ValueError("Pair-swap probability must lie in [0, 1]")
     if batch_size == 0 or probability == 0.0:
-        return waveforms, target, led_delta, cfd_delta, true_tof
+        return waveforms, target, led_delta, cfd_delta, true_tof, anchor_shift
 
     swap_mask = torch.rand(batch_size, generator=generator) < probability
     if not bool(torch.any(swap_mask)):
-        return waveforms, target, led_delta, cfd_delta, true_tof
+        return waveforms, target, led_delta, cfd_delta, true_tof, anchor_shift
 
     waveforms = waveforms.clone()
     target = target.clone()
     led_delta = led_delta.clone()
     cfd_delta = cfd_delta.clone()
     true_tof = true_tof.clone()
+    anchor_shift = anchor_shift.clone()
 
     waveforms[swap_mask] = waveforms[swap_mask][:, [1, 0], :]
     target[swap_mask] = -target[swap_mask]
     led_delta[swap_mask] = -led_delta[swap_mask]
     cfd_delta[swap_mask] = -cfd_delta[swap_mask]
     true_tof[swap_mask] = -true_tof[swap_mask]
-    return waveforms, target, led_delta, cfd_delta, true_tof
+    anchor_shift[swap_mask] = -anchor_shift[swap_mask]
+    return waveforms, target, led_delta, cfd_delta, true_tof, anchor_shift
 
 
 
@@ -86,11 +90,19 @@ def make_split_loader(
     device: torch.device,
     *,
     shuffle: bool,
+    subsampling_factor: int = 1,
 ) -> DataLoader:
     views = []
     for dataset in datasets:
         indices = np.asarray(getattr(dataset, split_name), dtype=np.int64)
-        views.append(CorrectionDataset(dataset, indices, normalization))
+        views.append(
+            CorrectionDataset(
+                dataset,
+                indices,
+                normalization,
+                subsampling_factor=subsampling_factor,
+            )
+        )
     combined = ConcatDataset(views)
 
     training = config["training"]
@@ -125,17 +137,23 @@ def predict_loader(
     led: list[np.ndarray] = []
     cfd: list[np.ndarray] = []
     true_tof: list[np.ndarray] = []
+    anchor_shifts: list[np.ndarray] = []
     with torch.no_grad():
         for batch in loader:
-            if len(batch) != 5:
+            if len(batch) == 6:
+                waveforms, target, led_delta, cfd_delta, tof, anchor_shift = batch
+            elif len(batch) == 5:
+                waveforms, target, led_delta, cfd_delta, tof = batch
+                anchor_shift = torch.zeros_like(target)
+            else:
                 raise ValueError(f"Unsupported correction batch with {len(batch)} fields")
-            waveforms, target, led_delta, cfd_delta, tof = batch
             prediction = model(waveforms.to(device, non_blocking=True))
             predictions.append(prediction.detach().cpu().numpy().astype(np.float64))
             targets.append(target.numpy().astype(np.float64))
             led.append(led_delta.numpy().astype(np.float64))
             cfd.append(cfd_delta.numpy().astype(np.float64))
             true_tof.append(tof.numpy().astype(np.float64))
+            anchor_shifts.append(anchor_shift.numpy().astype(np.float64))
     if not predictions:
         raise RuntimeError("Cannot evaluate an empty data loader")
 
@@ -144,10 +162,16 @@ def predict_loader(
     led_delta = np.concatenate(led)
     cfd_delta = np.concatenate(cfd)
     true = np.concatenate(true_tof)
-    corrected = led_delta - prediction
+    anchor_shift = np.concatenate(anchor_shifts)
+    apply_anchor_shift = bool(getattr(model, "apply_window_anchor_shift", True))
+    effective_anchor_shift = anchor_shift if apply_anchor_shift else np.zeros_like(anchor_shift)
+    total_led_correction = prediction + effective_anchor_shift
+    corrected = led_delta - total_led_correction
     residual = corrected - true
     return {
         "prediction_ps": prediction,
+        "total_led_correction_ps": total_led_correction,
+        "window_anchor_shift_ps": effective_anchor_shift,
         "target_ps": target,
         "led_ps": led_delta,
         "cfd_ps": cfd_delta,
@@ -242,6 +266,11 @@ def checkpoint_context(
         "ml_window_alignment_source",
         "timing_channel_waveforms_saved",
         "waveform_grid",
+        "window_anchor_timestamps_saved",
+        "correction_target_reference",
+        "window_anchor_shift_factored",
+        "factorization_anchor_source",
+        "factorization_anchor_component",
     )
     dataset_contract = {
         field: context.datasets[0].manifest.get(field) for field in contract_fields
@@ -252,8 +281,13 @@ def checkpoint_context(
         "model_config": dict(context.model_config if model_config is None else model_config),
         "input_length": int(context.input_length),
         "input_transform": context.input_transform,
+        "subsampling_factor": int(context.subsampling_factor),
         "input_waveform_source": context.input_waveform_source,
         "prediction_target": context.prediction_target,
+        "preprocessing": {
+            "subsampling_factor": int(context.subsampling_factor),
+            "subsampling_mode": "componentwise_stride",
+        },
         "input_representation": (
             "first_difference"
             if context.input_transform == "differentiate"
@@ -275,7 +309,14 @@ def checkpoint_context(
         "training_dataset_paths": [str(dataset.directory) for dataset in context.datasets],
         "input_cache_paths": [str(path) for path in context.input_cache_dirs],
         "target_definition": (
-            f"{context.prediction_target} time difference minus known true TOF"
+            "learned native-anchor correction = "
+            f"({context.prediction_target} interpolated LED difference - true TOF) "
+            "- [(LED1-anchor1) - (LED2-anchor2)]; the known anchor shift is "
+            "added back analytically before correcting interpolated LED"
+        ),
+        "correction_output_reference": "interpolated_led",
+        "window_anchor_shift_factored": bool(
+            context.datasets[0].manifest.get("window_anchor_shift_factored", False)
         ),
         "training_strategy": training_strategy,
         "data_view": dict(context.data_view),

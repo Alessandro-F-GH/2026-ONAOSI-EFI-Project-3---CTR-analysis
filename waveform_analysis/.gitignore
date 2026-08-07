@@ -3,6 +3,7 @@ __pycache__/
 .ipynb_checkpoints/
 .cache/
 datasets/
+old/
 results/
 processed_data/*
 *.log

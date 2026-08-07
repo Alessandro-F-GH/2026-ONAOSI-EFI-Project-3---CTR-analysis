@@ -8,21 +8,21 @@
     "n_basis": 16,
     "spline_degree": 3,
     "amplitude_normalization": "none",
-    "amplitude_epsilon": 1e-6
+    "amplitude_epsilon": 1e-06
   },
   "regularization": {
     "smoothness_penalties": [
-      1e-6,
-      1e-5,
-      1e-4,
-      1e-3,
-      1e-2,
-      1e-1,
+      1e-06,
+      1e-05,
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
       1.0,
       10.0,
       100.0
     ],
-    "ridge_penalty": 1e-8
+    "ridge_penalty": 1e-08
   },
   "training": {
     "device": "auto",
@@ -37,7 +37,10 @@
     "train_dir": "results/train/functional_spline_linear"
   },
   "fit": {
-    "histogram_range_ps": [-5000.0, 5000.0],
+    "histogram_range_ps": [
+      -5000.0,
+      5000.0
+    ],
     "histogram_bin_ps": 10.0,
     "initial_half_width_ps": 500.0,
     "iteration_sigma": 2.5,

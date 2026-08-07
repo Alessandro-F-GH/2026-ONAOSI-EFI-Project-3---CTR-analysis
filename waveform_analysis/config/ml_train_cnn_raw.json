@@ -5,10 +5,26 @@
   "model": {
     "type": "cnn_regressor",
     "name": "cnn_energy_raw_light",
-    "channels": [8, 16, 24],
-    "kernel_sizes": [17, 9, 5],
-    "strides": [8, 4, 2],
-    "dilations": [1, 1, 1],
+    "channels": [
+      8,
+      16,
+      24
+    ],
+    "kernel_sizes": [
+      17,
+      9,
+      5
+    ],
+    "strides": [
+      8,
+      4,
+      2
+    ],
+    "dilations": [
+      1,
+      1,
+      1
+    ],
     "activation": "silu",
     "normalization": "batch",
     "conv_dropout": 0.0,
@@ -16,7 +32,7 @@
     "dense_units": [],
     "dense_dropout": 0.0,
     "loss": {
-      "type": "mse_bias",
+      "type": "var_bias",
       "bias_weight": 0.01,
       "bias_normalization": "target_std"
     },
@@ -51,7 +67,10 @@
     }
   },
   "fit": {
-    "histogram_range_ps": [-500.0, 500.0],
+    "histogram_range_ps": [
+      -500.0,
+      500.0
+    ],
     "histogram_bin_ps": 10.0,
     "initial_half_width_ps": 500.0,
     "iteration_sigma": 2.5,

@@ -8,7 +8,13 @@ from typing import Any
 from .common import atomic_json, set_global_seed
 from .config import resolve_fit_config
 from .dataset import PreparedDataset, load_prepared_dataset_spec
-from .input_transform import materialize_training_input_cache, resolve_input_transform
+from .input_transform import (
+    INPUT_TRANSFORM_NORMALIZE,
+    materialize_training_input_cache,
+    normalize_subsampling_factor,
+    resolve_input_transform,
+    subsampled_dataset_input_length,
+)
 from .models import train_registered_model
 from .prediction import prediction_dataset_view, resolve_prediction_config
 from .torch_data import compute_normalization
@@ -94,6 +100,22 @@ def train_model(
     config["fit"] = resolve_fit_config(config.get("fit"))
     input_transform = resolve_input_transform(config)
     config["input_transform"] = input_transform
+    preprocessing_config = config.setdefault("preprocessing", {})
+    model_section = config.get("model") if isinstance(config.get("model"), dict) else {}
+    legacy_model_factor = model_section.pop("subsampling_factor", None)
+    configured_factor = preprocessing_config.get("subsampling_factor")
+    if configured_factor is not None and legacy_model_factor is not None:
+        if normalize_subsampling_factor(configured_factor) != normalize_subsampling_factor(
+            legacy_model_factor
+        ):
+            raise ValueError(
+                "Conflicting subsampling factors: preprocessing.subsampling_factor "
+                "and legacy model.subsampling_factor"
+            )
+    subsampling_factor = normalize_subsampling_factor(
+        configured_factor if configured_factor is not None else legacy_model_factor
+    )
+    preprocessing_config["subsampling_factor"] = subsampling_factor
     prediction = resolve_prediction_config(config)
     config["prediction"] = prediction
     if isinstance(config.get("model"), dict):
@@ -134,7 +156,12 @@ def train_model(
 
     transformed_datasets: list[PreparedDataset] = []
     input_cache_dirs: list[Path] = []
-    cache_root = output_dir / "input_cache"
+    configured_cache_root = config.get("training", {}).get("input_transform_cache_dir")
+    cache_root = (
+        Path(configured_cache_root).resolve()
+        if configured_cache_root
+        else output_dir / "input_cache"
+    )
     cache_chunk_size = int(
         config["training"].get(
             "input_transform_chunk_size",
@@ -154,9 +181,16 @@ def train_model(
         if cache_dir is not None:
             input_cache_dirs.append(cache_dir)
     datasets = transformed_datasets
-    logger.info("Model input transform: %s", input_transform)
+    logger.info(
+        "Model input preprocessing | transform=%s | subsampling_factor=%d",
+        input_transform,
+        subsampling_factor,
+    )
 
-    input_lengths = {dataset.input_length for dataset in datasets}
+    input_lengths = {
+        subsampled_dataset_input_length(dataset, subsampling_factor)
+        for dataset in datasets
+    }
     if len(input_lengths) != 1:
         raise ValueError(
             "Training datasets have incompatible waveform lengths: "
@@ -170,6 +204,8 @@ def train_model(
     normalization = compute_normalization(
         [(dataset, dataset.train) for dataset in datasets],
         chunk_size=int(config["training"].get("normalization_chunk_size", 2048)),
+        featurewise=input_transform == INPUT_TRANSFORM_NORMALIZE,
+        subsampling_factor=subsampling_factor,
     )
 
     model_config = dict(config["model"])
@@ -188,6 +224,7 @@ def train_model(
         input_length=input_length,
         normalization=normalization,
         input_transform=input_transform,
+        subsampling_factor=subsampling_factor,
         input_waveform_source=prediction["input_waveforms"],
         prediction_target=prediction["target"],
         input_cache_dirs=tuple(input_cache_dirs),

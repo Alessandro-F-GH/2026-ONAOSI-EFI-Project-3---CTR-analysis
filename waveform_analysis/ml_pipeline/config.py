@@ -240,7 +240,19 @@ def validate_preprocess_config(config: dict[str, Any]) -> None:
 
     split = config["split"]
     fractions = [float(split[name]) for name in ("train_fraction", "validation_fraction", "test_fraction")]
-    if any(value <= 0 for value in fractions) or abs(sum(fractions) - 1.0) > 1e-9:
+    development_blind = bool(split.get("development_blind", False))
+    if development_blind:
+        if (
+            fractions[0] <= 0.0
+            or fractions[1] != 0.0
+            or fractions[2] <= 0.0
+            or abs(sum(fractions) - 1.0) > 1e-9
+        ):
+            raise MLConfigError(
+                "development/blind split requires positive train/test fractions, "
+                "zero validation_fraction, and a total of 1"
+            )
+    elif any(value <= 0 for value in fractions) or abs(sum(fractions) - 1.0) > 1e-9:
         raise MLConfigError("split fractions must be positive and sum to 1")
     strategy = str(split.get("strategy", "event"))
     allowed = {"event", "stratified_event", "source_file", "contiguous_blocks"}

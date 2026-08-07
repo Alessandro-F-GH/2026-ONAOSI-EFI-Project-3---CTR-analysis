@@ -24,7 +24,8 @@ from .dataset import (
 from .input_transform import (
     materialize_training_input_cache,
     normalize_input_transform,
-    transformed_input_length,
+    normalize_subsampling_factor,
+    transformed_subsampled_dataset_input_length,
 )
 from .metrics import distribution_metrics, fit_times_ps
 from .models import build_model
@@ -32,6 +33,7 @@ from .prediction import (
     normalize_input_waveforms,
     normalize_prediction_target,
     prediction_dataset_view,
+    prediction_window_dataset_view,
 )
 from .standard_methods import cfd_delta_ps, led_delta_ps, load_linear_spline_artifact, predict_linear_spline
 from .plots import plot_metric_bars, plot_model_output_correlation
@@ -224,12 +226,14 @@ def _make_loader(
     config: dict[str, Any],
     device: torch.device,
     input_transform: str,
+    subsampling_factor: int = 1,
 ) -> DataLoader:
     evaluation_dataset = CorrectionDataset(
         dataset,
         dataset.evaluation,
         normalization,
         input_transform=input_transform,
+        subsampling_factor=subsampling_factor,
     )
     workers = int(config.get("num_workers", 0))
     kwargs: dict[str, Any] = {
@@ -259,16 +263,31 @@ def evaluate_trained_model(
     prediction_target = normalize_prediction_target(
         context.get("prediction_target", trained.prediction_target)
     )
-    dataset = prediction_dataset_view(
-        dataset,
-        input_waveforms=input_waveform_source,
-        target=prediction_target,
-    )
+    data_view = dict(context.get("data_view", {}))
+    if "window_before_ns" in data_view and "window_after_ns" in data_view:
+        dataset = prediction_window_dataset_view(
+            dataset,
+            input_waveforms=input_waveform_source,
+            target=prediction_target,
+            before_ns=float(data_view["window_before_ns"]),
+            after_ns=float(data_view["window_after_ns"]),
+        )
+    else:
+        dataset = prediction_dataset_view(
+            dataset,
+            input_waveforms=input_waveform_source,
+            target=prediction_target,
+        )
     checkpoint_contract = context.get("dataset_contract")
     if isinstance(checkpoint_contract, dict):
         for field in (
             "timing_channel_waveforms_saved",
             "waveform_grid",
+            "window_anchor_timestamps_saved",
+            "correction_target_reference",
+            "window_anchor_shift_factored",
+            "factorization_anchor_source",
+            "factorization_anchor_component",
         ):
             if field not in checkpoint_contract:
                 continue
@@ -281,23 +300,17 @@ def evaluate_trained_model(
                     "Rebuild or select a compatible canonical prepared dataset."
                 )
     input_length = int(context["input_length"])
-    data_view = dict(context.get("data_view", {}))
-    if "window_before_ns" in data_view and "window_after_ns" in data_view:
-        start, stop = window_slice_indices(
-            dataset,
-            float(data_view["window_before_ns"]),
-            float(data_view["window_after_ns"]),
-        )
-        dataset = prepared_dataset_view(
-            dataset,
-            window_start=start,
-            window_stop=stop,
-        )
     input_transform = normalize_input_transform(
         context.get("input_transform", trained.input_transform)
     )
-    resolved_input_length = transformed_input_length(
-        dataset.input_length, input_transform
+    subsampling_factor = normalize_subsampling_factor(
+        context.get(
+            "subsampling_factor",
+            context.get("preprocessing", {}).get("subsampling_factor", 1),
+        )
+    )
+    resolved_input_length = transformed_subsampled_dataset_input_length(
+        dataset, input_transform, subsampling_factor
     )
     if input_length != resolved_input_length:
         raise ValueError(
@@ -305,10 +318,7 @@ def evaluate_trained_model(
             f"input_transform={input_transform!r}, but the resolved blind-data "
             f"window produces {resolved_input_length}"
         )
-    normalization = Normalization(
-        mean_mV=float(context["normalization"]["mean_mV"]),
-        std_mV=float(context["normalization"]["std_mV"]),
-    )
+    normalization = Normalization.from_dict(context["normalization"])
     model_type = str(context["model_type"])
     model = build_model(
         model_type,
@@ -341,19 +351,29 @@ def evaluate_trained_model(
         chunk_size=int(config.get("input_transform_chunk_size", 2048)),
         rebuild=bool(config.get("rebuild_input_transform_cache", False)),
     )
-    if model_dataset.input_length != input_length:
+    resolved_materialized_length = transformed_subsampled_dataset_input_length(
+        model_dataset, "none", subsampling_factor
+    )
+    if resolved_materialized_length != input_length:
         raise ValueError(
             f"Model {trained.model_name} expects {input_length} samples, but the "
-            f"materialized evaluation representation has {model_dataset.input_length}"
+            "materialized and subsampled evaluation representation has "
+            f"{resolved_materialized_length}"
         )
     loader = _make_loader(
-        model_dataset, normalization, config, device, "none"
+        model_dataset,
+        normalization,
+        config,
+        device,
+        "none",
+        subsampling_factor=subsampling_factor,
     )
     prediction = predict_loader(model, loader, device)
     return ModelPrediction(
         corrected_ps=np.asarray(prediction["corrected_ps"], dtype=np.float64),
         predicted_correction_ps=np.asarray(
-            prediction["prediction_ps"], dtype=np.float64
+            prediction.get("total_led_correction_ps", prediction["prediction_ps"]),
+            dtype=np.float64,
         ),
         raw_ps=np.asarray(prediction["led_ps"], dtype=np.float64),
         true_tof_ps=np.asarray(prediction["true_tof_ps"], dtype=np.float64),

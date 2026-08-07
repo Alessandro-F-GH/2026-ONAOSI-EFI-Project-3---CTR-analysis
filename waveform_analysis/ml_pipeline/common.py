@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import random
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -43,11 +45,72 @@ def source_signature(path: Path) -> dict[str, Any]:
 
 
 def atomic_json(path: Path, value: Any) -> None:
+    """Write JSON safely, avoiding redundant Windows file replacements.
+
+    Windows can temporarily deny ``os.replace`` when antivirus, indexing, or a
+    viewer has the destination open without delete sharing.  Study metadata is
+    requested after every fold even though it usually changes only when a new
+    trial/model/codebook is introduced.  Skipping byte-identical writes avoids
+    nearly all of those unnecessary rename operations.
+
+    For genuine updates we first retry the atomic replacement.  If Windows
+    continues to deny rename/delete sharing, we fall back to truncating and
+    rewriting the destination in place, which is allowed by many readers that
+    prohibit replacement.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(json_safe(value), stream, indent=2, allow_nan=False)
-    os.replace(temporary, path)
+    payload = json.dumps(
+        json_safe(value), indent=2, allow_nan=False
+    ).encode("utf-8")
+
+    # Most calls made while a fold is running produce identical metadata.
+    # Avoid touching the file at all in that common case.
+    try:
+        if path.is_file() and path.read_bytes() == payload:
+            return
+    except OSError:
+        # A transient read lock should not prevent us from attempting the write.
+        pass
+
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        delay_seconds = 0.05
+        last_error: PermissionError | None = None
+        for _attempt in range(8):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(delay_seconds)
+                delay_seconds = min(delay_seconds * 2.0, 0.8)
+
+        # Some Windows programs allow writing an open file but deny replacing
+        # it.  Preserve progress with a direct rewrite after atomic retries fail.
+        try:
+            with path.open("wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            return
+        except PermissionError as exc:
+            raise PermissionError(
+                f"Unable to update {path}. Close any program viewing this file "
+                "and resume the study; previously persisted fold rows remain safe."
+            ) from (last_error or exc)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -56,6 +119,25 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"Expected a JSON object in {path}")
     return value
+
+
+class _StudyProgressFilter(logging.Filter):
+    """Keep study progress plus warnings/errors, hiding verbose training INFO logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING or bool(
+            getattr(record, "study_progress", False)
+        )
+
+
+def restrict_to_study_progress(logger: logging.Logger) -> logging.Logger:
+    """Apply concise study logging without changing standalone training logging."""
+
+    for handler in logger.handlers:
+        # Avoid stacking equivalent filters when the runner is resumed/reconfigured.
+        if not any(isinstance(item, _StudyProgressFilter) for item in handler.filters):
+            handler.addFilter(_StudyProgressFilter())
+    return logger
 
 
 def setup_logging(log_path: Path, level: str = "INFO") -> logging.Logger:

@@ -41,6 +41,9 @@ class ChannelExtraction:
     led_time_fs: np.int64
     cfd_time_fs: np.int64
     window_mV: np.ndarray
+    window_anchor_time_fs: np.int64
+    reference_aligned_window_mV: np.ndarray | None
+    reference_aligned_window_anchor_time_fs: np.int64
     valid: bool
 
 
@@ -348,7 +351,8 @@ def _native_window(
     horizontal_offset_s: float,
     alignment_ns: float,
     relative_grid_ps: np.ndarray,
-) -> np.ndarray | None:
+    return_anchor: bool = False,
+) -> np.ndarray | None | tuple[np.ndarray | None, np.int64]:
     interval_s = float(horizontal_interval_s)
     interval_ps = interval_s * 1.0e12
     relative = np.asarray(relative_grid_ps, dtype=np.float64)
@@ -365,9 +369,12 @@ def _native_window(
     interval_ns = interval_s * 1.0e9
     anchor = int(np.rint((float(alignment_ns) - first_time_ns) / interval_ns))
     indices = anchor + sample_offsets
+    anchor_time_s = float(horizontal_offset_s) + anchor * interval_s
+    anchor_time_fs = np.int64(np.rint(anchor_time_s * 1.0e15))
     if indices.size == 0 or int(indices[0]) < 0 or int(indices[-1]) >= signal_mV.size:
-        return None
-    return np.asarray(signal_mV[indices], dtype=np.float32).copy()
+        return (None, anchor_time_fs) if return_anchor else None
+    window = np.asarray(signal_mV[indices], dtype=np.float32).copy()
+    return (window, anchor_time_fs) if return_anchor else window
 
 
 def extract_channel(
@@ -383,12 +390,15 @@ def extract_channel(
     timing_reference: TimingReference | None = None,
     compute_cfd: bool = True,
 ) -> ChannelExtraction:
-    """Extract one native-grid energy waveform window and its timing labels.
+    """Extract one native-grid waveform window and its timing labels.
 
     LED and CFD timestamps use linear interpolation only between the two native
     samples bracketing the crossing. The saved ML window itself is never
     interpolated: it is a direct slice of acquired samples, aligned to the native
-    sample nearest the selected LED timestamp.
+    sample nearest the channel's own LED timestamp.  When ``timing_reference``
+    is supplied, a second window aligned to that external LED is returned in
+    ``reference_aligned_window_mV``.  Keeping both alignments is essential for
+    experiments whose target can be either energy LED or timing LED.
     """
 
     invalid_window = np.full(relative_grid_ps.shape, np.nan, dtype=np.float32)
@@ -408,6 +418,9 @@ def extract_channel(
         led_time_fs=np.int64(INVALID_TIME_FS),
         cfd_time_fs=np.int64(INVALID_TIME_FS),
         window_mV=invalid_window,
+        window_anchor_time_fs=np.int64(INVALID_TIME_FS),
+        reference_aligned_window_mV=None,
+        reference_aligned_window_anchor_time_fs=np.int64(INVALID_TIME_FS),
         valid=False,
     )
     if basic.trigger_index < 0:
@@ -423,22 +436,36 @@ def extract_channel(
     )
     if not channel_timing.valid:
         return invalid
-    alignment_reference = channel_timing if timing_reference is None else timing_reference
-    if not alignment_reference.valid:
-        return invalid
-
-    alignment_ns = (
-        float(alignment_reference.led_time_fs) / FEMTOSECONDS_PER_NANOSECOND
-    )
-    window = _native_window(
+    alignment_ns = float(channel_timing.led_time_fs) / FEMTOSECONDS_PER_NANOSECOND
+    window, window_anchor_time_fs = _native_window(
         np.asarray(basic.corrected_signal_mV, dtype=np.float64),
         horizontal_interval_s=horizontal_interval_s,
         horizontal_offset_s=horizontal_offset_s,
         alignment_ns=alignment_ns,
         relative_grid_ps=relative_grid_ps,
+        return_anchor=True,
     )
     if window is None or np.any(~np.isfinite(window)):
         return invalid
+
+    reference_window: np.ndarray | None = None
+    reference_anchor_time_fs = np.int64(INVALID_TIME_FS)
+    if timing_reference is not None:
+        if timing_reference.valid:
+            reference_alignment_ns = (
+                float(timing_reference.led_time_fs) / FEMTOSECONDS_PER_NANOSECOND
+            )
+            reference_window, reference_anchor_time_fs = _native_window(
+                np.asarray(basic.corrected_signal_mV, dtype=np.float64),
+                horizontal_interval_s=horizontal_interval_s,
+                horizontal_offset_s=horizontal_offset_s,
+                alignment_ns=reference_alignment_ns,
+                relative_grid_ps=relative_grid_ps,
+                return_anchor=True,
+            )
+            if reference_window is not None and np.any(~np.isfinite(reference_window)):
+                reference_window = None
+                reference_anchor_time_fs = np.int64(INVALID_TIME_FS)
     return ChannelExtraction(
         amplitude_mV=basic.amplitude_mV,
         noise_rms_mV=basic.noise_rms_mV,
@@ -446,6 +473,9 @@ def extract_channel(
         led_time_fs=channel_timing.led_time_fs,
         cfd_time_fs=channel_timing.cfd_time_fs,
         window_mV=window,
+        window_anchor_time_fs=window_anchor_time_fs,
+        reference_aligned_window_mV=reference_window,
+        reference_aligned_window_anchor_time_fs=reference_anchor_time_fs,
         valid=True,
     )
 

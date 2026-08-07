@@ -35,8 +35,14 @@ def preprocess_dataset(config: dict[str, Any], *, rebuild: bool, logger: Any) ->
             rebuild=rebuild,
             logger=logger,
         )
+        first_label = (
+            "development"
+            if bool(config.get("split", {}).get("development_blind", False))
+            else "train/validation"
+        )
         logger.info(
-            "Frozen split saved separately | train/validation: %s | blind test: %s",
+            "Frozen split saved separately | %s: %s | blind test: %s",
+            first_label,
             training_dataset.directory,
             blind_dataset.directory,
         )

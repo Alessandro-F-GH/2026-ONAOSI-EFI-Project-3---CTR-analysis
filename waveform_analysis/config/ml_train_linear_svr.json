@@ -1,21 +1,24 @@
 {
   "datasets": [
-    "datasets/central_source_all/train_validation"
+    "datasets/central_source_all/train_validation_timing_led"
   ],
   "model": {
     "type": "linear_svr",
-    "name": "linear_svr_energy_conc",
+    "name": "linear_svr_energy",
     "C": 1.0,
     "epsilon_values": [
       0.0,
       1.0,
+      2.0,
+      5.0,
       10.0,
+      20.0,
       50.0
     ],
     "svm_loss": "epsilon_insensitive",
-    "loss": { 
+    "loss": {
       "type": "variance",
-      "bias_weight": 0.0
+      "bias_weight": 1.0
     },
     "tolerance": 0.0001,
     "max_iterations": 20000,
@@ -32,7 +35,10 @@
     "baseline_guard_metric": null
   },
   "fit": {
-    "histogram_range_ps": [-500.0, 500.0],
+    "histogram_range_ps": [
+      -500.0,
+      500.0
+    ],
     "histogram_bin_ps": 10.0,
     "initial_half_width_ps": 500.0,
     "iteration_sigma": 2.5,
@@ -43,7 +49,7 @@
     "minimum_sigma_bins": 0.5
   },
   "output": {
-    "train_dir": "results/all/train/linear_svr_energy_conc"
+    "train_dir": "results/all/train/linear_svr_energy"
   },
   "plotting": {
     "dpi": 180
@@ -51,7 +57,7 @@
   "logging": {
     "level": "INFO"
   },
-  "input_transform": "concatenate_diff",
+  "input_transform": "differentiate",
   "prediction": {
     "input_waveforms": "energy",
     "target": "energy_led"

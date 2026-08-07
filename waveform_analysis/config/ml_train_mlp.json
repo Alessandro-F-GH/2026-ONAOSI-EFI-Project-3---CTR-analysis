@@ -1,6 +1,6 @@
 {
   "datasets": [
-    "datasets/central_source_47V/train_validation"
+    "datasets/central_source_all/train_validation_timing_led"
   ],
   "model": {
     "type": "mlp_regressor",
@@ -10,7 +10,7 @@
     ],
     "activation": "silu",
     "loss": {
-      "type": "mse_bias",
+      "type": "var_bias",
       "bias_weight": 0.01
     },
     "dropout": 0.0,
@@ -58,7 +58,7 @@
     "minimum_sigma_bins": 0.5
   },
   "output": {
-    "train_dir": "results/47V/train/mlp_energy"
+    "train_dir": "results/all/train/mlp_energy"
   },
   "plotting": {
     "dpi": 180

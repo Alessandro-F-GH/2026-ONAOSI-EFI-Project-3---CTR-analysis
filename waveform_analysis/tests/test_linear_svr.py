@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from ml_pipeline.dataset import PreparedDataset
@@ -84,14 +85,17 @@ def test_linear_pair_svr_is_antisymmetric_before_global_calibration() -> None:
     assert torch.allclose(model(swapped), -model(pair))
 
 
-def test_linear_svr_scans_all_epsilons_and_replays_checkpoint(tmp_path: Path) -> None:
+@pytest.mark.parametrize("input_transform", ["none", "normalize"])
+def test_linear_svr_scans_all_epsilons_and_replays_checkpoint(
+    tmp_path: Path, input_transform: str
+) -> None:
     dataset = _dataset(tmp_path)
-    run_dir = tmp_path / "linear_svr_run"
+    run_dir = tmp_path / f"linear_svr_run_{input_transform}"
     config = {
         "datasets": [str(dataset.directory)],
         "model": {
             "type": "linear_svr",
-            "name": "tiny_linear_svr",
+            "name": f"tiny_linear_svr_{input_transform}",
             "C": 100.0,
             "epsilon_values": [0.0, 1.0, 5.0],
             "svm_loss": "epsilon_insensitive",
@@ -121,7 +125,7 @@ def test_linear_svr_scans_all_epsilons_and_replays_checkpoint(tmp_path: Path) ->
             "save_last_checkpoint": True,
             "save_summary": True,
         },
-        "input_transform": "none",
+        "input_transform": input_transform,
         "prediction": {"input_waveforms": "energy", "target": "prepared_led"},
     }
     summary = train_model(
@@ -142,6 +146,8 @@ def test_linear_svr_scans_all_epsilons_and_replays_checkpoint(tmp_path: Path) ->
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     assert payload["context"]["model_type"] == "linear_svr"
     assert payload["context"]["linear_svr"]["epsilon_values_ps"] == [0.0, 1.0, 5.0]
+    expected_strategy = "feature" if input_transform == "normalize" else "global"
+    assert payload["context"]["normalization"]["strategy"] == expected_strategy
 
     trained = TrainedModel(
         model_name=summary["model_name"],
@@ -149,7 +155,7 @@ def test_linear_svr_scans_all_epsilons_and_replays_checkpoint(tmp_path: Path) ->
         checkpoint=checkpoint,
         validation_rmse_ps=summary["best_validation_rmse_ps"],
         train_dir=run_dir,
-        input_transform="none",
+        input_transform=input_transform,
     )
     corrected = _evaluate_model(
         trained,

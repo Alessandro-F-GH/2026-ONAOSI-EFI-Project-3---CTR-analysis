@@ -1,18 +1,18 @@
 {
   "blind_tests": [
     {
-      "name": "central_source_47V_blind_test",
-      "dataset": "datasets/central_source_47V/blind_test"
+      "name": "central_source_all_blind_test_energy_timing",
+      "dataset": "datasets/central_source_all/blind_test_timing_led"
     }
   ],
   "models": [],
-  "model_search_dir": "results/47V/train",
+  "model_search_dir": "results/all/train",
   "device": "auto",
   "batch_size": 512,
   "num_workers": 0,
   "pin_memory": false,
   "output": {
-    "evaluation_dir": "results/47V/evaluation/central_source"
+    "evaluation_dir": "results/all/evaluation"
   },
   "fit": {
     "histogram_range_ps": [
@@ -47,5 +47,9 @@
     "top_n": 10,
     "minimum_improvement_ps": 0.0,
     "save_waveform_plots": true
+  },
+  "model_output_correlation": {
+    "enabled": true,
+    "annotate": true
   }
 }

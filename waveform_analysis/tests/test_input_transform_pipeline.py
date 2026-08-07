@@ -21,7 +21,11 @@ from ml_pipeline.input_transform import (
 )
 from ml_pipeline.models import build_model
 from ml_pipeline.prediction import prediction_dataset_view, resolve_prediction_config
-from ml_pipeline.torch_data import CorrectionDataset, Normalization
+from ml_pipeline.torch_data import (
+    CorrectionDataset,
+    Normalization,
+    compute_normalization,
+)
 
 
 def _prepared_dataset(tmp_path: Path) -> PreparedDataset:
@@ -274,7 +278,7 @@ def _write_zero_checkpoint(
 
 
 @pytest.mark.parametrize(
-    "input_transform", ["none", "differentiate", "concatenate_diff"]
+    "input_transform", ["none", "differentiate", "concatenate_diff", "normalize"]
 )
 def test_evaluation_replays_checkpoint_input_transform(
     tmp_path: Path, input_transform: str
@@ -296,7 +300,7 @@ def test_evaluation_replays_checkpoint_input_transform(
     np.testing.assert_allclose(corrected, expected_led_delta)
 
 @pytest.mark.parametrize(
-    "input_transform", ["none", "differentiate", "concatenate_diff"]
+    "input_transform", ["none", "differentiate", "concatenate_diff", "normalize"]
 )
 def test_train_then_evaluate_standard_and_differentiated_paths(
     tmp_path: Path, input_transform: str
@@ -377,6 +381,9 @@ def test_train_then_evaluate_standard_and_differentiated_paths(
     checkpoint = Path(summary["best_checkpoint"])
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     assert payload["context"]["input_transform"] == input_transform
+    if input_transform == "normalize":
+        assert payload["context"]["normalization"]["strategy"] == "feature"
+        assert len(payload["context"]["normalization"]["mean_mV"]) == dataset.input_length
     trained = TrainedModel(
         model_name=summary["model_name"],
         model_type=summary["model_type"],
@@ -515,3 +522,44 @@ def test_timing_model_evaluation_replays_waveform_and_target_source(tmp_path: Pa
         - dataset.timing_led_time_fs[dataset.evaluation, 1]
     ) / 1000.0
     np.testing.assert_allclose(corrected, expected)
+
+
+
+def test_normalize_is_featurewise_train_only_zscore(tmp_path: Path) -> None:
+    dataset = _prepared_dataset(tmp_path)
+    normalized, cache_dir = materialize_training_input_cache(
+        dataset, "normalize", tmp_path / "cache"
+    )
+    assert normalized is dataset
+    assert cache_dir is None
+    assert transformed_input_length(dataset.input_length, "normalize") == dataset.input_length
+    np.testing.assert_array_equal(
+        apply_input_transform(dataset.windows_mV[:1], "normalize"),
+        dataset.windows_mV[:1],
+    )
+
+    statistics = compute_normalization(
+        [(dataset, dataset.train)], featurewise=True, chunk_size=2
+    )
+    assert statistics.mode == "feature"
+    training_values = np.asarray(dataset.windows_mV[dataset.train], dtype=np.float64)
+    expected_mean = np.mean(training_values, axis=(0, 1))
+    expected_std = np.std(training_values, axis=(0, 1))
+    np.testing.assert_allclose(statistics.mean_mV, expected_mean)
+    np.testing.assert_allclose(statistics.std_mV, expected_std)
+
+    item = CorrectionDataset(
+        dataset,
+        np.asarray([dataset.train[0]], dtype=np.int64),
+        statistics,
+    )[0][0].numpy()
+    expected_item = (
+        dataset.windows_mV[dataset.train[0]] - expected_mean
+    ) / expected_std
+    np.testing.assert_allclose(item, expected_item, rtol=1e-6, atol=1e-6)
+
+    serialized = statistics.as_dict()
+    restored = Normalization.from_dict(serialized)
+    assert restored.mode == "feature"
+    np.testing.assert_allclose(restored.mean_mV, statistics.mean_mV)
+    np.testing.assert_allclose(restored.std_mV, statistics.std_mV)

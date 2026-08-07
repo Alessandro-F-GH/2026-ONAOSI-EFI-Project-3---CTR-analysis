@@ -12,7 +12,9 @@ from torch import nn
 from utils.plots import plot_best_fit
 
 from ..common import atomic_json, write_csv_rows
+from ..input_transform import component_subsampling_indices
 from ..training_context import TrainingContext
+from ..torch_data import factored_correction_target_ps
 from ..training_utils import (
     checkpoint_context,
     evaluate_model,
@@ -74,6 +76,11 @@ def validate_config(config: dict[str, Any]) -> None:
     _normalized_selection_loss(config)
     if float(loss.get("bias_weight", 0.0)) < 0.0:
         raise ValueError("loss.bias_weight must be non-negative")
+    normalization = str(loss.get("bias_normalization", "none"))
+    if normalization not in {"none", "target_std"}:
+        raise ValueError("loss.bias_normalization must be 'none' or 'target_std'")
+    if float(loss.get("minimum_scale", 1.0e-8)) <= 0.0:
+        raise ValueError("loss.minimum_scale must be positive")
 
 
 def validate_training_config(config: dict[str, Any]) -> None:
@@ -129,6 +136,8 @@ def build(config: dict[str, Any], input_length: int) -> nn.Module:
 
 
 class _ZeroCorrectionModel(nn.Module):
+    apply_window_anchor_shift = False
+
     def forward(self, waveform_pair: torch.Tensor) -> torch.Tensor:
         return torch.zeros(
             waveform_pair.shape[0],
@@ -151,8 +160,15 @@ def _split_matrix(
     features = np.empty((total, context.input_length), dtype=np.float64)
     target = np.empty(total, dtype=np.float64)
     cursor = 0
-    scale = float(context.normalization.std_mV)
-    if not math.isfinite(scale) or scale <= 0.0:
+    scale = np.asarray(context.normalization.std_mV, dtype=np.float64)
+    if scale.ndim not in {0, 1}:
+        raise ValueError("Invalid waveform normalization standard deviation shape")
+    if scale.ndim == 1 and int(scale.size) != int(context.input_length):
+        raise ValueError(
+            "Feature normalization length does not match linear_svr input: "
+            f"{scale.size} != {context.input_length}"
+        )
+    if not np.all(np.isfinite(scale)) or np.any(scale <= 0.0):
         raise ValueError("Invalid waveform normalization standard deviation")
 
     for dataset in context.datasets:
@@ -160,17 +176,25 @@ def _split_matrix(
         for start in range(0, indices.size, chunk_size):
             selected = indices[start : start + chunk_size]
             pair = np.asarray(dataset.windows_mV[selected], dtype=np.float64)
+            component_lengths = dataset.manifest.get("input_component_lengths")
+            lengths = (
+                [int(value) for value in component_lengths]
+                if isinstance(component_lengths, list)
+                else [int(dataset.input_length)]
+            )
+            source_indices = component_subsampling_indices(
+                lengths, context.subsampling_factor
+            )
+            pair = pair[..., source_indices]
             size = int(selected.size)
             # The common normalization mean cancels in the detector difference:
             # (s1 - mean)/std - (s2 - mean)/std = (s1 - s2)/std.
             features[cursor : cursor + size] = (
                 pair[:, 0, :] - pair[:, 1, :]
             ) / scale
-            led_delta_ps = (
-                np.asarray(dataset.led_time_fs[selected, 0], dtype=np.float64)
-                - np.asarray(dataset.led_time_fs[selected, 1], dtype=np.float64)
-            ) / 1000.0
-            target[cursor : cursor + size] = led_delta_ps - float(dataset.true_tof_ps)
+            target[cursor : cursor + size] = factored_correction_target_ps(
+                dataset, selected
+            )
             cursor += size
     return features, target
 
@@ -194,6 +218,7 @@ def _selection_value(
     *,
     loss_type: str,
     bias_weight: float,
+    bias_scale_ps: float = 1.0,
 ) -> float:
     if loss_type == "variance":
         return float(metrics["variance_ps2"])
@@ -202,9 +227,10 @@ def _selection_value(
     if loss_type == "variance_bias":
         # Bias is squared so both terms have units of ps^2 and positive/negative
         # validation bias cannot cancel the objective.
+        scale = max(float(bias_scale_ps), np.finfo(np.float64).eps)
         return float(
             metrics["variance_ps2"]
-            + bias_weight * metrics["bias_ps"] ** 2
+            + bias_weight * (metrics["bias_ps"] / scale) ** 2
         )
     raise ValueError(f"Unsupported linear_svr selection loss: {loss_type}")
 
@@ -282,6 +308,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
         config,
         device,
         shuffle=False,
+        subsampling_factor=context.subsampling_factor,
     )
     validation_loader = make_split_loader(
         context.datasets,
@@ -290,6 +317,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
         config,
         device,
         shuffle=False,
+        subsampling_factor=context.subsampling_factor,
     )
     zero_model = _ZeroCorrectionModel().to(device)
     baseline_train_metrics, baseline_train_fit, _ = evaluate_model(
@@ -337,7 +365,15 @@ def train(context: TrainingContext) -> dict[str, Any]:
 
     epsilon_values = [float(value) for value in model_config["epsilon_values"]]
     loss_type = _normalized_selection_loss(model_config)
-    bias_weight = float(model_config.get("loss", {}).get("bias_weight", 0.0))
+    loss_config = model_config.get("loss", {})
+    bias_weight = float(loss_config.get("bias_weight", 0.0))
+    bias_normalization = str(loss_config.get("bias_normalization", "none"))
+    minimum_scale = float(loss_config.get("minimum_scale", 1.0e-8))
+    bias_scale_ps = (
+        max(float(np.std(train_target, ddof=0)), minimum_scale)
+        if bias_normalization == "target_std"
+        else 1.0
+    )
     random_state = int(
         config["training"].get(
             "initialization_seed",
@@ -385,6 +421,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
             validation_metrics,
             loss_type=loss_type,
             bias_weight=bias_weight,
+            bias_scale_ps=bias_scale_ps,
         )
         row = {
             "scan_index": scan_index,
@@ -454,6 +491,8 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "epsilon_values_ps": epsilon_values,
         "selection_loss_type": loss_type,
         "bias_weight": bias_weight,
+        "bias_normalization": bias_normalization,
+        "bias_scale_ps": bias_scale_ps,
         **common_parameters,
     }
 
@@ -532,6 +571,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
         final_validation_residual_metrics,
         loss_type=loss_type,
         bias_weight=bias_weight,
+        bias_scale_ps=bias_scale_ps,
     )
     checkpoint_metadata["final_bias_calibration"] = {
         "enforced": True,
@@ -635,6 +675,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "train_dir": str(context.output_dir.resolve()),
         "input_length": int(context.input_length),
         "input_transform": context.input_transform,
+        "subsampling_factor": int(context.subsampling_factor),
         "input_waveform_source": context.input_waveform_source,
         "prediction_target": context.prediction_target,
         "input_cache_paths": [str(path) for path in context.input_cache_dirs],

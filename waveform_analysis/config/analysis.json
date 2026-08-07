@@ -1,8 +1,19 @@
 {
   "channels": {
-    "energy": [1, 2],
-    "timing": [3, 4],
-    "polarities": [1, 1, 1, 1]
+    "energy": [
+      1,
+      2
+    ],
+    "timing": [
+      3,
+      4
+    ],
+    "polarities": [
+      1,
+      1,
+      1,
+      1
+    ]
   },
   "io": {
     "step_size": "128 MB",
@@ -42,11 +53,17 @@
   },
   "selection": {
     "timing_noise_max_mV": 2.0,
-    "energy_trigger_index_range": [2000, 3500],
+    "energy_trigger_index_range": [
+      2000,
+      3500
+    ],
     "require_valid_timing_trigger": true
   },
   "fit": {
-    "histogram_range_ps": [-5000.0, 5000.0],
+    "histogram_range_ps": [
+      -5000.0,
+      5000.0
+    ],
     "histogram_bin_ps": 10.0,
     "initial_half_width_ps": 500.0,
     "iteration_sigma": 2.5,

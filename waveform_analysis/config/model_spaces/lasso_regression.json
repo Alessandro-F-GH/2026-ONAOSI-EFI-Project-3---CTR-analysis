@@ -1,0 +1,68 @@
+{
+  "id": "lasso_regression",
+  "model_type": "linear_regression",
+  "supported_losses": [
+    "mse",
+    "var_bias"
+  ],
+  "study_loss_mapping": {
+    "mse": {
+      "type": "rmse"
+    },
+    "var_bias": {
+      "type": "variance_bias"
+    }
+  },
+  "base_train_config": {
+    "model": {
+      "type": "linear_regression",
+      "name": "resolved_by_study",
+      "regularization": "lasso",
+      "alpha": 0.01,
+      "loss": {
+        "type": "rmse"
+      },
+      "tolerance": 1e-2,
+      "max_iterations": 10000,
+      "ridge_solver": "auto",
+      "lasso_selection": "cyclic"
+    },
+    "training": {
+      "device": "cpu",
+      "seed": 20260804,
+      "batch_size": 512,
+      "normalization_chunk_size": 2048,
+      "linear_materialization_chunk_size": 2048,
+      "num_workers": 0,
+      "pin_memory": false,
+      "random_pair_swap": false,
+      "baseline_guard_metric": null
+    },
+    "fit": {
+      "histogram_range_ps": [-300.0, 300.0],
+      "histogram_bin_ps": 10.0,
+      "initial_half_width_ps": 500.0,
+      "iteration_sigma": 2.5,
+      "max_iterations": 6,
+      "convergence_tolerance_ps": 0.01,
+      "min_events": 100,
+      "minimum_fit_bins": 9,
+      "minimum_sigma_bins": 0.5
+    },
+    "output": {
+      "train_dir": "resolved_by_study"
+    },
+    "plotting": {
+      "dpi": 180
+    },
+    "logging": {
+      "level": "INFO"
+    }
+  },
+  "search": {
+    "method": "grid",
+    "parameters": {
+      "model.alpha": [0.001, 0.01, 0.1, 1.0, 10.0]
+    }
+  }
+}

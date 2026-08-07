@@ -278,17 +278,25 @@ zero-phase Butterworth low-pass filter:
 
 The filter is applied before trigger, LED/CFD and ML-window extraction.
 
-## Experiments
+## Folder-driven experiment studies
 
-`ml_pipeline/experiments.py` remains model-neutral and supports grid, random and
-Optuna-TPE search, cross-validation, repeated seeds, waveform-window views and
-final refitting. The shapelet experiment searches physical lengths, shapelet
-counts, scan stride and soft-min temperature.
+`scripts/ml_experiment.py` now runs the narrow study protocol defined in
+`EXPERIMENT_STUDY.md`. A single config discovers ROOT files from a folder and
+expands channel modes, LED-relative windows, transformations, common losses and
+model-space files. Timing and energy preprocessing are independent; the default
+study filters energy waveforms but never timing waveforms. Energy inputs use
+energy-LED alignment for `energy_to_energy` and timing-LED alignment whenever
+the target is timing LED. Robust median/MAD
+outlier parameters are fitted inside each CV training fold. CV alone selects
+hyperparameters and windows, while blind results audit validation quality.
 
 ## Standard methods
 
 LED, CFD and linear spline remain under `ml_pipeline/standard_methods/` and are
-excluded from the trainable-model registry.
+excluded from the trainable-model registry. Folder studies nevertheless evaluate
+LED and CFD by default on every CV validation fold and blind fold. They are written
+as `standard_method` rows in the compact result tables and can win the overall
+CV-only comparison without creating checkpoints.
 
 ## Constructive identity MLP encoder
 

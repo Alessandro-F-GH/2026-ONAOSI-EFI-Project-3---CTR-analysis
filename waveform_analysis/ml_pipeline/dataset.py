@@ -14,8 +14,8 @@ from .common import atomic_json, canonical_hash, read_json, write_csv_rows
 if TYPE_CHECKING:
     from .data import EnergyCache, SplitData
 
-DATASET_FORMAT_VERSION = 2
-_SUPPORTED_DATASET_FORMAT_VERSIONS = {1, 2}
+DATASET_FORMAT_VERSION = 4
+_SUPPORTED_DATASET_FORMAT_VERSIONS = {1, 2, 3, 4}
 _ARRAY_NAMES = (
     "event_id", "event_index", "source_file_id", "source_run_index",
     "bias_voltage_V", "amplitude_mV", "noise_rms_mV", "trigger_index",
@@ -24,6 +24,12 @@ _ARRAY_NAMES = (
 _OPTIONAL_ARRAY_NAMES = (
     "energy_led_time_fs",
     "timing_led_time_fs",
+    "energy_cfd_time_fs",
+    "timing_cfd_time_fs",
+    "energy_window_anchor_time_fs",
+    "timing_aligned_energy_window_anchor_time_fs",
+    "timing_window_anchor_time_fs",
+    "timing_aligned_energy_windows_mV",
     "timing_windows_mV",
 )
 
@@ -46,6 +52,13 @@ class PreparedDataset:
     relative_time_ps: np.ndarray
     energy_led_time_fs: np.ndarray | None = None
     timing_led_time_fs: np.ndarray | None = None
+    energy_cfd_time_fs: np.ndarray | None = None
+    timing_cfd_time_fs: np.ndarray | None = None
+    energy_window_anchor_time_fs: np.ndarray | None = None
+    timing_aligned_energy_window_anchor_time_fs: np.ndarray | None = None
+    timing_window_anchor_time_fs: np.ndarray | None = None
+    window_anchor_time_fs: np.ndarray | None = None
+    timing_aligned_energy_windows_mV: np.ndarray | None = None
     timing_windows_mV: np.ndarray | None = None
     timing_relative_time_ps: np.ndarray | None = None
     train: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
@@ -105,6 +118,23 @@ def load_prepared_dataset(directory: str | Path) -> PreparedDataset:
         relative_time_ps=_load_array(directory, "relative_time_ps"),
         energy_led_time_fs=_load_optional_array(directory, "energy_led_time_fs"),
         timing_led_time_fs=_load_optional_array(directory, "timing_led_time_fs"),
+        energy_cfd_time_fs=_load_optional_array(directory, "energy_cfd_time_fs"),
+        timing_cfd_time_fs=_load_optional_array(directory, "timing_cfd_time_fs"),
+        energy_window_anchor_time_fs=_load_optional_array(
+            directory, "energy_window_anchor_time_fs"
+        ),
+        timing_aligned_energy_window_anchor_time_fs=_load_optional_array(
+            directory, "timing_aligned_energy_window_anchor_time_fs"
+        ),
+        timing_window_anchor_time_fs=_load_optional_array(
+            directory, "timing_window_anchor_time_fs"
+        ),
+        window_anchor_time_fs=_load_optional_array(
+            directory, "energy_window_anchor_time_fs"
+        ),
+        timing_aligned_energy_windows_mV=_load_optional_array(
+            directory, "timing_aligned_energy_windows_mV"
+        ),
         timing_windows_mV=_load_optional_array(directory, "timing_windows_mV"),
         timing_relative_time_ps=_load_optional_array(directory, "timing_relative_time_ps"),
         train=split_values["train"],
@@ -288,6 +318,9 @@ def _materialize_subset(
         "timing_channel_waveforms_saved": bool(
             getattr(cache, "timing_windows_mV", None) is not None
         ),
+        "timing_aligned_energy_waveforms_saved": bool(
+            getattr(cache, "timing_aligned_energy_windows_mV", None) is not None
+        ),
         "available_waveform_sources": [
             "energy",
             *(
@@ -309,6 +342,14 @@ def _materialize_subset(
                 else []
             ),
         ],
+        "available_standard_methods": ["led", "cfd"],
+        "target_specific_cfd_timestamps_saved": bool(
+            getattr(cache, "energy_cfd_time_fs", None) is not None
+            and (
+                getattr(cache, "timing_led_time_fs", None) is None
+                or getattr(cache, "timing_cfd_time_fs", None) is not None
+            )
+        ),
         "same_event_set_for_led_cfd_and_ml": True,
         "waveform_grid": cache.manifest.get(
             "waveform_grid", "legacy_materialized_interpolation"
@@ -318,6 +359,13 @@ def _materialize_subset(
         ),
         "ml_window_alignment_quantization": cache.manifest.get(
             "ml_window_alignment_quantization"
+        ),
+        "window_anchor_timestamps_saved": bool(
+            getattr(cache, "energy_window_anchor_time_fs", None) is not None
+        ),
+        "correction_target_reference": "interpolated_led",
+        "window_anchor_shift_factorization_supported": bool(
+            getattr(cache, "energy_window_anchor_time_fs", None) is not None
         ),
         "timing_crossing_interpolation": cache.manifest.get(
             "timing_crossing_interpolation"
@@ -366,6 +414,7 @@ def materialize_training_and_blind_datasets(
     training_link = {"name": blind_name, "path": str(blind_output), "relation": "held_out_blind_test"}
     blind_link = {"name": training_name, "path": str(training_output), "relation": "source_training_dataset"}
 
+    development_blind = bool(config.get("split", {}).get("development_blind", False))
     training_dataset = _materialize_subset(
         cache,
         splits,
@@ -379,7 +428,7 @@ def materialize_training_and_blind_datasets(
             "test": _empty_indices(),
         },
         evaluation_source=_empty_indices(),
-        subset_kind="training_validation",
+        subset_kind="development" if development_blind else "training_validation",
         linked_dataset=training_link,
         rebuild=rebuild,
         logger=logger,

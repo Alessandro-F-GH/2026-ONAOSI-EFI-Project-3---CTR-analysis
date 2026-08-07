@@ -13,6 +13,7 @@ from ..common import atomic_json, write_csv_rows
 from ..losses import mse_residual_loss, var_bias_loss, var_bias_value_from_metrics
 from ..plots import plot_training_history
 from ..training_context import TrainingContext
+from ..torch_data import factored_correction_target_ps
 from .spec import ModelSpec
 from ..training_utils import (
     checkpoint_context,
@@ -198,6 +199,8 @@ def build(config: dict[str, Any], input_length: int) -> nn.Module:
 
 
 class _ZeroCorrectionModel(nn.Module):
+    apply_window_anchor_shift = False
+
     def forward(self, waveform_pair: torch.Tensor) -> torch.Tensor:
         return torch.zeros(
             waveform_pair.shape[0],
@@ -266,11 +269,12 @@ def _target_scale_from_datasets(context: TrainingContext, minimum_scale: float) 
     values: list[torch.Tensor] = []
     for dataset in context.datasets:
         indices = dataset.train
-        led_delta = (
-            torch.as_tensor(dataset.led_time_fs[indices, 0].copy(), dtype=torch.float64)
-            - torch.as_tensor(dataset.led_time_fs[indices, 1].copy(), dtype=torch.float64)
-        ) / 1000.0
-        values.append(led_delta - float(dataset.true_tof_ps))
+        values.append(
+            torch.as_tensor(
+                factored_correction_target_ps(dataset, indices),
+                dtype=torch.float64,
+            )
+        )
     target = torch.cat(values)
     return max(float(torch.std(target, unbiased=False).item()), minimum_scale)
 
@@ -285,13 +289,16 @@ def train(context: TrainingContext) -> dict[str, Any]:
 
     device = resolve_device(config["training"].get("device", "auto"))
     train_loader = make_split_loader(
-        context.datasets, "train", context.normalization, config, device, shuffle=True
+        context.datasets, "train", context.normalization, config, device, shuffle=True,
+        subsampling_factor=context.subsampling_factor,
     )
     train_eval_loader = make_split_loader(
-        context.datasets, "train", context.normalization, config, device, shuffle=False
+        context.datasets, "train", context.normalization, config, device, shuffle=False,
+        subsampling_factor=context.subsampling_factor,
     )
     validation_loader = make_split_loader(
-        context.datasets, "validation", context.normalization, config, device, shuffle=False
+        context.datasets, "validation", context.normalization, config, device, shuffle=False,
+        subsampling_factor=context.subsampling_factor,
     )
     zero_model = _ZeroCorrectionModel().to(device)
     baseline_train_metrics, _baseline_train_fit, _ = evaluate_model(
@@ -398,14 +405,17 @@ def train(context: TrainingContext) -> dict[str, Any]:
     context.logger.info("Training %s with Adam on %s", context.model_name, device)
     for epoch in range(1, epochs + 1):
         model.train()
-        for waveforms, target, led_delta, cfd_delta, true_tof in train_loader:
+        for waveforms, target, led_delta, cfd_delta, true_tof, anchor_shift in train_loader:
             if random_pair_swap:
-                waveforms, target, led_delta, cfd_delta, true_tof = randomly_swap_paired_batch(
+                (
+                    waveforms, target, led_delta, cfd_delta, true_tof, anchor_shift
+                ) = randomly_swap_paired_batch(
                     waveforms,
                     target,
                     led_delta,
                     cfd_delta,
                     true_tof,
+                    anchor_shift,
                     generator=pair_swap_generator,
                     probability=0.5,
                 )

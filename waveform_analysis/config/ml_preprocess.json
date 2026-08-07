@@ -8,15 +8,19 @@
       "output_dir": "datasets/central_source_all/blind_test"
     }
   },
-  "cfd_timestamp_source": "energy_channels",
-
   "data": {
     "input_root": "processed_data/combined/all.root",
     "true_tof_ps": 0.0
   },
   "channels": {
-    "energy": [1, 2],
-    "polarities": [1, 1]
+    "energy": [
+      1,
+      2
+    ],
+    "polarities": [
+      1,
+      1
+    ]
   },
   "io": {
     "step_size": "128 MB",
@@ -37,7 +41,7 @@
       "after": 60.0
     },
     "led_threshold_mV": 7.0,
-    "cfd_fraction": 0.03,
+    "cfd_fraction": 0.045,
     "ml_window_ns": {
       "before": 4,
       "after": 60.0
@@ -45,7 +49,7 @@
   },
   "selection": {
     "energy_noise_max_mV": null,
-    "energy_trigger_index_range":null,
+    "energy_trigger_index_range": null,
     "minimum_events_per_split": 100,
     "led_outlier_rejection": {
       "enabled": true,
@@ -67,7 +71,7 @@
   "split": {
     "strategy": "contiguous_blocks",
     "seed": 20260725,
-    "train_fraction": 0.70,
+    "train_fraction": 0.7,
     "validation_fraction": 0.15,
     "test_fraction": 0.15,
     "guard_gap_events": 1000

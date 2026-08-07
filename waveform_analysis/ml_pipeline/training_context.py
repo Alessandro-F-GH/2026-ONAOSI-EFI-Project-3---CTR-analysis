@@ -28,3 +28,4 @@ class TrainingContext:
     checkpoint_dir: Path
     logger: Any
     data_view: dict[str, Any]
+    subsampling_factor: int = 1
