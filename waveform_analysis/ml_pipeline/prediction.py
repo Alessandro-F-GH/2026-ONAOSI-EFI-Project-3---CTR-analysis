@@ -103,6 +103,21 @@ def _target_array(dataset: PreparedDataset, target: str) -> np.ndarray:
 
 
 
+
+
+def _cfd_target_array(dataset: PreparedDataset, target: str) -> np.ndarray:
+    target = normalize_prediction_target(target)
+    if target == TARGET_PREPARED_LED:
+        return dataset.cfd_time_fs
+    if target == TARGET_ENERGY_LED:
+        if dataset.energy_cfd_time_fs is None:
+            raise ValueError(f"Dataset {dataset.directory} does not contain energy CFD timestamps")
+        return dataset.energy_cfd_time_fs
+    if dataset.timing_cfd_time_fs is None:
+        raise ValueError(f"Dataset {dataset.directory} does not contain timing CFD timestamps")
+    return dataset.timing_cfd_time_fs
+
+
 def _target_uses_timing_led(dataset: PreparedDataset, target: str) -> bool:
     normalized = normalize_prediction_target(target)
     if normalized == TARGET_TIMING_LED:
@@ -201,6 +216,7 @@ def prediction_window_dataset_view(
     input_waveforms = normalize_input_waveforms(input_waveforms)
     target = normalize_prediction_target(target)
     target_values = _target_array(dataset, target)
+    target_cfd_values = _cfd_target_array(dataset, target)
 
     if input_waveforms == INPUT_WAVEFORMS_ENERGY:
         energy_source, energy_alignment = _energy_windows_for_target(dataset, target)
@@ -265,6 +281,12 @@ def prediction_window_dataset_view(
         "input_waveforms": input_waveforms,
         "target": target,
     }
+    if target == TARGET_TIMING_LED:
+        manifest["led_timestamp_source"] = "timing_channels"
+        manifest["cfd_timestamp_source"] = "timing_channels"
+    elif target == TARGET_ENERGY_LED:
+        manifest["led_timestamp_source"] = "energy_channels"
+        manifest["cfd_timestamp_source"] = "energy_channels"
     manifest["input_components"] = components
     manifest["input_component_lengths"] = component_lengths
     manifest["input_component_alignments"] = component_alignments
@@ -288,6 +310,7 @@ def prediction_window_dataset_view(
         windows_mV=windows,
         relative_time_ps=relative,
         led_time_fs=target_values,
+        cfd_time_fs=target_cfd_values,
         window_anchor_time_fs=anchor_values,
     )
 
@@ -342,11 +365,18 @@ def prediction_dataset_view(
         factorization_anchor_component = "timing"
 
     target_values = _target_array(dataset, target)
+    target_cfd_values = _cfd_target_array(dataset, target)
     manifest = dict(dataset.manifest)
     manifest["prediction_view"] = {
         "input_waveforms": input_waveforms,
         "target": target,
     }
+    if target == TARGET_TIMING_LED:
+        manifest["led_timestamp_source"] = "timing_channels"
+        manifest["cfd_timestamp_source"] = "timing_channels"
+    elif target == TARGET_ENERGY_LED:
+        manifest["led_timestamp_source"] = "energy_channels"
+        manifest["cfd_timestamp_source"] = "energy_channels"
     manifest["input_component_alignments"] = component_alignments
     manifest["ml_window_alignment_source"] = component_alignments[0]
     manifest["input_length"] = int(windows.shape[2])
@@ -362,5 +392,6 @@ def prediction_dataset_view(
         windows_mV=windows,
         relative_time_ps=relative_time,
         led_time_fs=target_values,
+        cfd_time_fs=target_cfd_values,
         window_anchor_time_fs=anchor_values,
     )

@@ -1,392 +1,105 @@
-# Waveform timing-analysis pipeline
+# CTR waveform-ML analysis
 
-## Main commands
+This repository is intentionally narrow: it searches the best CTR obtainable from antisymmetric waveform corrections, compares them with LED/CFD, explains the learned waveform information, and compares the result with a reduced-data multithreshold SVR.
 
-Build a joint canonical dataset containing both energy and timing waveforms:
+## Supported models
 
-```bash
-python scripts/ml_preprocess.py --config config/ml_preprocess_timing_led.json --rebuild
-```
+- **Linear SVR** — full-waveform linear baseline; exact pair correction `g(s1) - g(s2)`.
+- **Constructive MLP** — nonlinear units added progressively; every new unit sees the raw waveform plus all frozen accepted units.
+- **CNN** — nonlinear 1-D convolutional shared scorer; exact pair correction `g(s1) - g(s2)`.
+- **Multithreshold SVR** — separate reduced-data study using raw threshold crossings only, with linear/RBF kernels.
 
-Train separate MLP corrections from the same prepared dataset:
+Obsolete threshold regressors, shapelets/RDST/BORF, autoencoders, feature regressions and the old generic MLP experiment paths were removed.
 
-```bash
-# Energy waveforms -> energy-channel LED correction
-python scripts/ml_train.py --config config/ml_train_mlp.json --restart
+## Scientific protocol
 
-# Timing waveforms -> timing-channel LED correction
-python scripts/ml_train.py --config config/ml_train_mlp_timing.json --restart
+`ROOT -> permanent prepared dataset -> random development/blind split`
 
-# Optional cross-channel task: energy waveforms -> timing-channel LED correction
-python scripts/ml_train.py --config config/ml_train_mlp_energy_to_timing.json --restart
+Waveform-ML candidate evaluation uses:
 
-# Linear SVR with an epsilon scan (energy waveforms -> energy LED)
-python scripts/ml_train.py --config config/ml_train_linear_svr.json --restart
+`development -> K-fold CV -> (K-1 folds -> fit + early-stop) -> untouched score fold`
 
-# Lightweight shared-branch 1-D CNN on differentiated waveforms
-python scripts/ml_train.py --config config/ml_train_cnn.json --restart
+The score fold is never used for early stopping. Pooled out-of-fold predictions from all K score folds are fitted once with the global CTR fitter and used to rank a candidate. After selecting a candidate for each model family, the model is trained from scratch on the complete development population split into fit/early-stop with the same candidate fraction, then evaluated once on blind data.
 
-# Matching raw-waveform CNN for a controlled raw-vs-difference comparison
-python scripts/ml_train.py --config config/ml_train_cnn_raw.json --restart
+Linear SVR has no early stopping and uses the complete K-1 fold training pool (or all development in the final fit).
 
-python scripts/ml_evaluate.py --config config/ml_evaluate_cnn.json
-```
+The multithreshold study uses the same random development/blind population and pooled OOF selection, but no early-stop split because SVR has no iterative stopping criterion.
 
-`ml_evaluate` can also rank the events for which the ML model makes the largest
-useful correction. A correction is useful when it reduces the absolute distance
-from the known TOF:
+## Permanent preprocessing
 
-```text
-improvement_ps = |raw - true_TOF| - |corrected - true_TOF|
-```
+Photopeak selection and optional gross LED mismatch rejection are dataset-preparation operations. They happen once per ROOT file, before any ML split. LED mismatch rejection uses a configurable robust z-score, `abs(delta_LED - median) / (1.4826 * MAD)`, with standard-deviation fallback only for a degenerate MAD. The default study enables it at `zscore_limit = 6`. The retained events are written as NumPy `.npy` arrays and loaded with memory mapping, so large waveform matrices do not need to be duplicated in RAM.
 
-Enable it in `config/ml_evaluate.json`:
+LED/CFD timestamps are extracted from the **raw** baseline-corrected signals and are frozen. The regular waveform-ML input variant is fixed independently by channel type through `preprocessing.input_variant_by_channel`; it is not a search dimension. For example, the default study uses denoised energy waveforms and raw timing waveforms. Only the requested denoised channel families are materialized. Multithreshold SVR always bypasses this policy and reads the canonical raw representation, with no denoising option.
 
-```json
-"correction_analysis": {
-  "enabled": true,
-  "top_n": 10,
-  "minimum_improvement_ps": 0.0,
-  "save_waveform_plots": true
-}
-```
+Prepared datasets contain no train/CV/blind split. Splits are deterministic in-memory random index arrays generated from the experiment seed.
 
-For each model and blind test, evaluation writes `top_right_corrections.csv`, a
-JSON summary, and one waveform diagnostic per ranked event under
-`top_corrections/`. The evaluation log and metrics CSV also report
-`top_right_correction_ps`.
-
-The same analysis can be run independently:
+Run preprocessing alone with:
 
 ```bash
-python scripts/plot_top_corrections.py \
-  --dataset datasets/central_source_all/blind_test_timing_led \
-  --model results/all/train/<model-run> \
-  --output results/top_corrections \
-  --top-n 10
+python scripts/ml_preprocess.py --config config/experiments/ctr_ml_search.json
 ```
 
-## Energy and timing waveform inputs
+One example plot per ROOT file is produced with the first retained energy/timing waveforms on a fine major/minor grid.
 
-When `channels.timing` is configured and
-`waveform.timing_channel_led.enabled` is true, preprocessing writes one canonical
-prepared dataset with:
+## Run the experiment
 
-- `windows_mV.npy`: standard energy-channel windows;
-- `timing_windows_mV.npy`: standard timing-channel windows;
-- `energy_led_time_fs.npy`: locally interpolated energy LED timestamps;
-- `timing_led_time_fs.npy`: locally interpolated timing LED timestamps;
-- `energy_cfd_time_fs.npy`: energy-channel CFD timestamps;
-- `timing_cfd_time_fs.npy`: timing-channel CFD timestamps;
-- `energy_window_anchor_time_fs.npy`: native energy-sample anchors used by energy windows;
-- `timing_aligned_energy_window_anchor_time_fs.npy`: native energy-sample anchors used by timing-LED-aligned energy windows;
-- `timing_window_anchor_time_fs.npy`: native timing-sample anchors used by timing windows;
-- `led_time_fs.npy` and `cfd_time_fs.npy`: legacy/default timestamp families,
-  retained for compatibility.
-
-Both waveform families remain on their original acquisition grids. No waveform
-upsampling is materialized. Energy windows keep the existing alignment behavior:
-in timing-reference mode they are aligned to the timing LED. Timing windows are
-aligned to their own timing LED.
-
-Training selects a view from that single dataset:
-
-```json
-"prediction": {
-  "input_waveforms": "energy",
-  "target": "energy_led"
-}
-```
-
-or:
-
-```json
-"prediction": {
-  "input_waveforms": "timing",
-  "target": "timing_led"
-}
-```
-
-The original cross-channel experiment remains available with
-`input_waveforms = "energy"` and `target = "timing_led"`. Old configs without a
-`prediction` section remain compatible and resolve to energy waveforms with the
-legacy `prepared_led` target.
-
-
-### Interpolated-LED target with native-window shift factorization
-
-LED remains a locally interpolated timestamp, while the waveform input remains a
-direct slice of acquired samples. For detector `j`, preprocessing stores the
-nearest native sample time `t_anchor,j` used to center the selected waveform and
-computes the exact fractional offset
-
-```text
-delta_j = t_LED,j - t_anchor,j.
-```
-
-For an ordered detector pair, the model does not learn this deterministic grid
-quantization term. Its target is
-
-```text
-c_model = [(t_LED,1 - t_LED,2) - TOF_true] - (delta_1 - delta_2)
-        = (t_anchor,1 - t_anchor,2) - TOF_true.
-```
-
-At inference, the full correction to the interpolated LED is reconstructed as
-
-```text
-c_LED = c_model_prediction + (delta_1 - delta_2),
-TOF_corrected = Delta t_LED - c_LED.
-```
-
-Thus no waveform samples are interpolated, but the label no longer contains the
-nearest-sample rounding discontinuity. For combined energy+timing input targeting
-timing LED, the timing-window native anchor is the canonical factorization anchor;
-the independently sampled energy component remains an auxiliary input.
-
-## Optional model-input transformations
-
-Set `input_transform` to `none`, `differentiate`, `concatenate_diff`, or
-`normalize`. `concatenate_diff` stores the raw waveform samples first and then
-appends the first differences, producing `2L-1` input values from a waveform of
-length `L`. Differentiated representations are cached after selecting the
-energy/timing waveform family.
-
-`normalize` performs a featurewise z-score. For every time position, the mean and
-standard deviation are estimated from the current fold's training events only,
-pooling the two detector channels. The same statistics are then applied to that
-fold's validation and blind events. Constant features use a scale of one. This
-transform is intentionally not materialized globally, preventing CV leakage.
-Evaluation replays the transformation from statistics stored in the checkpoint.
-
-## Enforced final train-bias calibration
-
-Every MLP, lightweight CNN, and linear SVR checkpoint is calibrated after model selection.
-The arithmetic mean of the corrected residual on the training split is measured
-and removed through `pair_output_bias_ps`. The calibrated state overwrites the
-best checkpoint and is the state used during evaluation.
-
-The final calibration always uses residual semantics:
-
-```text
-mean(target - calibrated_prediction) = 0
-```
-
-For the MLP, an optional `training.zero_bias_constraint` can still perform
-additional per-epoch calibration. Final train-bias removal remains mandatory for
-both model families.
-
-
-## Lightweight shared-branch 1-D CNN
-
-`cnn_regressor` preserves the same detector-pair structure used by the MLP:
-
-```text
-correction(s1, s2) = g_cnn(s1) - g_cnn(s2) + pair_output_bias
-```
-
-The two detector waveforms always pass through the same CNN weights. The default
-configuration is designed for long, strongly autocorrelated signals and limited
-compute: three small strided convolutions reduce the temporal length by a factor
-of 64 before a single linear output layer. No dense layer is applied directly to
-the original waveform, so the parameter count remains small even for 20k-sample
-inputs.
-
-The first configuration uses differentiated input and a linear head:
-
-```json
-"channels": [8, 16, 24],
-"kernel_sizes": [17, 9, 5],
-"strides": [8, 4, 2],
-"adaptive_pool_length": null,
-"dense_units": []
-```
-
-`adaptive_pool_length = null` preserves every downsampled temporal position.
-`dense_units = []` means the head is one simple `Linear` layer. Use
-`config/ml_train_cnn_raw.json` as the otherwise matched raw-waveform control.
-
-## Linear SVR epsilon scan
-
-`linear_svr` trains on the normalized pair difference `s1 - s2`, preserving the
-same shared-branch logic as the MLP. A true SVR is fitted with an
-epsilon-insensitive objective for every value in `model.epsilon_values`. The best
-epsilon is selected with `model.loss.type`: `variance` (default), `rmse`, or
-`variance_bias`, where the latter is `variance + bias_weight * bias^2`.
-
-The scan is written to `epsilon_scan.csv`; the selected checkpoint remains fully
-compatible with `ml_evaluate.py`.
-
-## Position-aware shapelet regressor
-
-`shapelet_regressor` replaces the previous CART/interval-feature strategy. It
-uses one shared differentiable model `g` for both time channels:
-
-```text
-correction(s1, s2) = g(s1) - g(s2)
-```
-
-The model is trained directly against the complete LED correction target:
-
-```text
-y = LED_delta - true_TOF
-```
-
-No artificial single-channel targets or iterative tree refits are required.
-
-### Physical time configuration
-
-All temporal controls are written in nanoseconds:
-
-```json
-"shapelets": {
-  "lengths_ns": [0.08, 0.16, 0.32, 0.64],
-  "count_per_length": [8, 8, 8, 8],
-  "search_region_ns": {
-    "start": -1.0,
-    "stop": 3.0
-  },
-  "stride_ns": 0.02
-}
-```
-
-At training time, the pipeline reads `relative_time_ps.npy`, verifies a uniform
-time grid and converts each nanosecond value into an integer sample count. The
-requested and actual physical values are saved in the checkpoint and
-`training_summary.json`. Evaluation therefore rebuilds exactly the same model
-without relying on an implicit hard-coded sampling frequency.
-
-### Features produced by each shapelet
-
-Each learnable shapelet scans only the configured physical search region. A
-soft minimum over normalized sliding-window distances produces:
-
-- normalized shape distance;
-- soft match position in ns;
-- local waveform mean;
-- local waveform standard deviation;
-- optional signed correlation.
-
-The default linear head keeps the model interpretable. A small MLP head can be
-selected through `model.head.type`.
-
-### Efficient matching
-
-Sliding distances are computed with batched one-dimensional convolutions. The
-model never constructs a tabular matrix with one column for every one of the
-20,000 waveform samples. Computation is controlled mainly by:
-
-- number of shapelets;
-- physical shapelet lengths;
-- search-region duration;
-- `stride_ns`;
-- batch size.
-
-Train with:
+Validate configuration/model availability first:
 
 ```bash
-python scripts/ml_train.py \
-  --config config/ml_train_shapelet.json \
-  --restart
+python scripts/ml_experiment.py --config config/experiments/ctr_ml_search.json --check
 ```
 
-Main artifacts include:
-
-- `checkpoints/best.pt`;
-- `training_metrics.csv`;
-- `learned_shapelets.npz`;
-- `shapelet_metadata.csv`;
-- `shapelet_head_features.csv`;
-- one plot for each shapelet-length bank.
-
-## Pipeline separation
-
-- `ml_pipeline/models/`: trainable ML models only.
-- `ml_pipeline/standard_methods/`: LED, CFD and linear-spline estimators.
-- `ml_pipeline/study.py`: folder-driven multi-file CV and blind-audit orchestration,
-  with target-specific LED-relative windows and unfiltered timing inputs.
-- `ml_pipeline/evaluation.py`: blind comparison of models and standard methods.
-
-## Adding a trainable model
-
-Create one file under `ml_pipeline/models/` and export:
-
-```python
-MODEL_SPEC = ModelSpec(
-    name="new_model",
-    builder=build,
-    validator=validate_config,
-    training_validator=validate_training_config,
-    trainer=train,
-)
-```
-
-The registry discovers the file automatically.
-
-## Constructive encoder
-
-A new `constructive_mlp_encoder` model grows identity-activated units
-sequentially. Previous units are frozen, each new unit receives the raw waveform
-plus all frozen hidden values, and growth stops when validation-RMSE improvement
-is marginal. The accepted hidden values can be exported as a compressed dataset
-with `scripts/ml_encode_constructive.py`.
+Run everything:
 
 ```bash
-python scripts/ml_train.py --config config/ml_train_constructive_encoder.json --restart
+python scripts/ml_experiment.py --config config/experiments/ctr_ml_search.json
 ```
 
-Because the activation is identity, the encoder is a learned affine projection;
-it is intended as supervised dimensionality reduction rather than a nonlinear
-network.
+Run only the multithreshold comparison using the same preparation/evaluation implementation:
 
-## Compact folder-study reporting
-
-The folder experiment writes two human-readable final tables:
-
-```text
-results/studies/<study>/summary_results.csv
-results/studies/<study>/model_loss_results.csv
+```bash
+python scripts/ml_multithreshold.py --config config/experiments/ctr_ml_search.json
 ```
 
-`summary_results.csv` contains one overall CV-selected winner per ROOT file and
-channel mode. LED and CFD participate in this CV comparison as non-trainable
-`standard_method` entries and may therefore be the reported winner.
-`model_loss_results.csv` contains one row per ROOT file, channel mode, trainable
-model/loss pair, plus one row each for LED and CFD. For trainable models, the best
-input transform and window are selected using mean CV CTR only. Standard-method
-rows use `loss_id=evaluation_mse`, `input_transform=not_applicable`, and have no
-window. Fold-level persistence remains under the private `_state/` directory for
-restartability.
+## One global CTR fit
 
+`fit` is configured once at experiment level and is used identically for LED, CFD, pooled OOF predictions, final ML predictions and multithreshold predictions.
 
-Standard methods are enabled by default in the study configuration:
+The fitter:
 
-```json
-"standard_methods": ["led", "cfd"]
+1. uses **all prepared evaluation events** (no fit-time outlier rejection),
+2. estimates a robust preliminary width,
+3. sets histogram width proportional to preliminary FWHM,
+4. scans several bin-origin phases at fixed width,
+5. fits a bin-integrated Gaussian likelihood,
+6. selects the phase with minimum reduced Poisson deviance (the count-data analogue of chi-square),
+7. records phase-to-phase CTR spread as a stability diagnostic.
+
+If numerical optimization reports a line-search failure for an extremely poor/non-Gaussian candidate, the same all-event histogram is evaluated with the direct Gaussian mean/std estimate instead of aborting the entire experiment. This is a numerical fallback only; it never rejects events.
+
+If an event is invalid for a requested final method, evaluation fails rather than silently removing it. Dataset-level filtering must be fixed upstream.
+
+## Compact outputs
+
+A normal study keeps only final-level information:
+
+- `results.csv` — numeric/coded rows for every pooled-OOF candidate and final blind LED/CFD/selected-model result;
+- `manifest.json` — codebooks, candidate parameter dictionaries, protocol and the single global fit configuration;
+- `models/` — only final development-trained waveform models (no CV-fold checkpoints);
+- `ctr_vs_voltage.png` — final blind CTR versus voltage, where voltage is parsed from filenames such as `45V-400mV.root -> 45 V`;
+- `preprocessing_examples/` — one signal example figure per input file;
+- final-fit/XAI figures when enabled.
+
+Temporary fold directories are removed immediately after OOF prediction. The data cache is memory-mapped and reused between candidates; only tiny fit-subset normalization statistics are cached across candidates that use the identical data view, while model objects are released between folds/candidates.
+
+## Explainability
+
+The retained waveform models expose a shared single-channel scorer. Final selected models can therefore be compared through temporal Integrated Gradients and through blind correction-output correlations. Linear SVR weights provide the direct linear reference.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
-Use an empty list to exclude both. CFD always follows the target timestamp family:
-energy-channel CFD for `energy_to_energy`, and timing-channel CFD for every
-timing-LED target mode. Both timestamp families are materialized during
-preprocessing so the comparison uses the same selected events as ML.
-
-Final plots include:
-
-- one validation/blind Gaussian-fit figure per ROOT file;
-- one best mean-CV-CTR versus window-size figure per ROOT file, with one line per
-  model and one panel per channel mode;
-- one optional `CTR vs voltage` figure for all files.
-
-Voltage extraction is optional and configured by a filename regular expression, e.g.
-`45V_*.root`:
-
-```json
-"reporting": {
-  "voltage_from_filename": {
-    "enabled": true,
-    "pattern": "^(?P<voltage>\\d+(?:\\.\\d+)?)V",
-    "group": "voltage",
-    "plot_ctr_vs_voltage": true
-  }
-}
-```
+The protocol tests cover partition isolation, channel-specific raw/denoised routing, all-event Gaussian fitting, filename voltage parsing and exact antisymmetry of the retained waveform models.

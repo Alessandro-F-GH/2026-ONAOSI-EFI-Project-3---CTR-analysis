@@ -83,3 +83,19 @@ def validate_model_training(model_type: str, config: dict[str, Any]) -> None:
 
 def train_registered_model(model_type: str, context: TrainingContext) -> dict[str, Any]:
     return _spec(model_type).trainer(context)
+
+
+def has_checkpoint_predictor(model_type: str) -> bool:
+    return _spec(model_type).checkpoint_predictor is not None
+
+
+def predict_registered_checkpoint(
+    model_type: str,
+    payload: dict[str, Any],
+    dataset: Any,
+    config: dict[str, Any],
+):
+    predictor = _spec(model_type).checkpoint_predictor
+    if predictor is None:
+        raise ValueError(f"Model type {model_type!r} has no custom checkpoint predictor")
+    return predictor(payload, dataset, config)

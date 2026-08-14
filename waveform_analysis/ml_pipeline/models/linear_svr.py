@@ -18,6 +18,7 @@ from ..torch_data import factored_correction_target_ps
 from ..training_utils import (
     checkpoint_context,
     evaluate_model,
+    evaluate_model_with_optional_fit,
     make_split_loader,
     resolve_device,
 )
@@ -105,8 +106,7 @@ class LinearPairSVR(nn.Module):
     """Linear shared-branch pair model.
 
     For a single-channel score ``g(s) = w^T s``, the pair correction is
-    ``g(s1) - g(s2) = w^T (s1 - s2)``.  The explicit scalar offset is reserved
-    for the same analytic train-bias calibration used by the MLP pipeline.
+    exactly ``g(s1) - g(s2) = w^T (s1 - s2)``.
     """
 
     def __init__(self, input_length: int) -> None:
@@ -116,10 +116,6 @@ class LinearPairSVR(nn.Module):
             torch.zeros(self.input_length, dtype=torch.float32),
             requires_grad=False,
         )
-        self.pair_output_bias_ps = nn.Parameter(
-            torch.zeros((), dtype=torch.float32),
-            requires_grad=False,
-        )
 
     def forward(self, waveform_pair: torch.Tensor) -> torch.Tensor:
         if waveform_pair.ndim != 3 or waveform_pair.shape[1] != 2:
@@ -127,7 +123,7 @@ class LinearPairSVR(nn.Module):
         if waveform_pair.shape[2] != self.input_length:
             raise ValueError(f"Expected waveform length {self.input_length}")
         difference = waveform_pair[:, 0, :] - waveform_pair[:, 1, :]
-        return difference @ self.weight + self.pair_output_bias_ps
+        return difference @ self.weight
 
 
 def build(config: dict[str, Any], input_length: int) -> nn.Module:
@@ -238,7 +234,6 @@ def _selection_value(
 def _assign_model(
     model: LinearPairSVR,
     coefficient: np.ndarray,
-    pair_bias_ps: float,
 ) -> None:
     coefficient = np.asarray(coefficient, dtype=np.float32).reshape(-1)
     if coefficient.shape != (model.input_length,):
@@ -248,16 +243,6 @@ def _assign_model(
         )
     with torch.no_grad():
         model.weight.copy_(torch.from_numpy(coefficient).to(model.weight.device))
-        model.pair_output_bias_ps.fill_(float(pair_bias_ps))
-
-
-def _calibrated_bias(
-    coefficient: np.ndarray,
-    features: np.ndarray,
-    target: np.ndarray,
-) -> float:
-    raw_prediction = features @ np.asarray(coefficient, dtype=np.float64)
-    return float(np.mean(np.asarray(target, dtype=np.float64) - raw_prediction))
 
 
 def _plot_epsilon_scan(rows: list[dict[str, Any]], path: Path, dpi: int) -> None:
@@ -295,8 +280,11 @@ def train(context: TrainingContext) -> dict[str, Any]:
     artifacts = dict(config.get("artifacts", {}))
     save_history = bool(artifacts.get("save_history", True))
     save_plots = bool(artifacts.get("save_plots", True))
+    save_best_checkpoint = bool(artifacts.get("save_best_checkpoint", True))
     save_last_checkpoint = bool(artifacts.get("save_last_checkpoint", True))
     save_summary = bool(artifacts.get("save_summary", True))
+    save_model_artifacts = bool(artifacts.get("save_model_artifacts", True))
+    perform_internal_fit = bool(artifacts.get("perform_internal_gaussian_fit", True))
 
     # LinearSVR/liblinear training is CPU-only.  The configured device is still
     # used for the common final evaluation path and checkpoint compatibility.
@@ -320,21 +308,23 @@ def train(context: TrainingContext) -> dict[str, Any]:
         subsampling_factor=context.subsampling_factor,
     )
     zero_model = _ZeroCorrectionModel().to(device)
-    baseline_train_metrics, baseline_train_fit, _ = evaluate_model(
+    baseline_train_metrics, baseline_train_fit, _ = evaluate_model_with_optional_fit(
         zero_model,
         train_loader,
         device,
         config["fit"],
         "Uncorrected train LED",
+        perform_fit=perform_internal_fit,
     )
-    baseline_validation_metrics, baseline_validation_fit, _ = evaluate_model(
+    baseline_validation_metrics, baseline_validation_fit, _ = evaluate_model_with_optional_fit(
         zero_model,
         validation_loader,
         device,
         config["fit"],
         "Uncorrected validation LED",
+        perform_fit=perform_internal_fit,
     )
-    context.logger.info(
+    context.logger.debug(
         "Uncorrected LED baseline | train RMSE %.3f ps | validation RMSE %.3f ps "
         "CTR %.3f ps bias %.3f ps",
         baseline_train_metrics["rmse_ps"],
@@ -357,7 +347,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
     validation_features, validation_target = _split_matrix(
         context, "validation", chunk_size=chunk_size
     )
-    context.logger.info(
+    context.logger.debug(
         "Linear SVR matrices | train %s | validation %s | dtype float64",
         tuple(train_features.shape),
         tuple(validation_features.shape),
@@ -396,9 +386,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
     best_rmse = math.inf
     best_epsilon = float("nan")
     best_coefficient: np.ndarray | None = None
-    best_pair_bias_ps = 0.0
     last_coefficient: np.ndarray | None = None
-    last_pair_bias_ps = 0.0
     last_epsilon = float("nan")
 
     for scan_index, epsilon in enumerate(epsilon_values, start=1):
@@ -410,9 +398,8 @@ def train(context: TrainingContext) -> dict[str, Any]:
             issubclass(item.category, ConvergenceWarning) for item in caught
         )
         coefficient = np.asarray(estimator.coef_, dtype=np.float64).reshape(-1)
-        pair_bias_ps = _calibrated_bias(coefficient, train_features, train_target)
-        train_prediction = train_features @ coefficient + pair_bias_ps
-        validation_prediction = validation_features @ coefficient + pair_bias_ps
+        train_prediction = train_features @ coefficient
+        validation_prediction = validation_features @ coefficient
         train_metrics = _residual_metrics(train_target, train_prediction)
         validation_metrics = _residual_metrics(
             validation_target, validation_prediction
@@ -439,7 +426,6 @@ def train(context: TrainingContext) -> dict[str, Any]:
             "selection_loss_type": loss_type,
             "bias_weight": bias_weight,
             "validation_selection_loss": objective,
-            "pair_output_bias_ps": pair_bias_ps,
             "selected_best": False,
         }
         better = (
@@ -456,13 +442,11 @@ def train(context: TrainingContext) -> dict[str, Any]:
             best_rmse = validation_metrics["rmse_ps"]
             best_epsilon = epsilon
             best_coefficient = coefficient.copy()
-            best_pair_bias_ps = pair_bias_ps
             row["selected_best"] = True
         rows.append(row)
         last_coefficient = coefficient.copy()
-        last_pair_bias_ps = pair_bias_ps
         last_epsilon = epsilon
-        context.logger.info(
+        context.logger.debug(
             "SVR epsilon %g ps | val variance %.6f ps^2 | val RMSE %.3f ps | "
             "val bias %.3f ps | objective %.6f | converged=%s",
             epsilon,
@@ -478,7 +462,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
 
     model = build(model_config, context.input_length).to(device)
     assert isinstance(model, LinearPairSVR)
-    _assign_model(model, best_coefficient, best_pair_bias_ps)
+    _assign_model(model, best_coefficient)
     checkpoint_metadata = checkpoint_context(
         context,
         training_strategy=(
@@ -496,25 +480,24 @@ def train(context: TrainingContext) -> dict[str, Any]:
         **common_parameters,
     }
 
-    # Re-apply the mandatory calibration from the exact materialized training
-    # matrix before final common evaluation/checkpointing.
-    final_pair_bias_ps = _calibrated_bias(
-        best_coefficient, train_features, train_target
-    )
-    _assign_model(model, best_coefficient, final_pair_bias_ps)
-    train_metrics, train_fit, _ = evaluate_model(
+    # No additive calibration is permitted: the selected model remains exactly
+    # c(s1,s2)=g(s1)-g(s2).
+    _assign_model(model, best_coefficient)
+    train_metrics, train_fit, _ = evaluate_model_with_optional_fit(
         model,
         train_loader,
         device,
         config["fit"],
-        "Final calibrated linear SVR train residual",
+        "Final linear SVR train residual",
+        perform_fit=perform_internal_fit,
     )
-    validation_metrics, validation_fit, _ = evaluate_model(
+    validation_metrics, validation_fit, _ = evaluate_model_with_optional_fit(
         model,
         validation_loader,
         device,
         config["fit"],
-        "Final calibrated linear SVR validation residual",
+        "Final linear SVR validation residual",
+        perform_fit=perform_internal_fit,
     )
 
     baseline_guard_metric = config["training"].get("baseline_guard_metric")
@@ -529,16 +512,13 @@ def train(context: TrainingContext) -> dict[str, Any]:
         if corrected_value > baseline_value:
             context.logger.warning(
                 "Linear SVR is worse than the uncorrected baseline on %s "
-                "(%.3f > %.3f); selecting calibrated constant correction",
+                "(%.3f > %.3f); selecting zero correction",
                 baseline_guard_metric,
                 corrected_value,
                 baseline_value,
             )
             best_coefficient = np.zeros(context.input_length, dtype=np.float64)
-            final_pair_bias_ps = _calibrated_bias(
-                best_coefficient, train_features, train_target
-            )
-            _assign_model(model, best_coefficient, final_pair_bias_ps)
+            _assign_model(model, best_coefficient)
             baseline_guard_applied = True
             best_epsilon = float("nan")
             checkpoint_metadata["linear_svr"]["selected_epsilon_ps"] = None
@@ -548,14 +528,14 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 train_loader,
                 device,
                 config["fit"],
-                "Selected calibrated baseline train residual",
+                "Selected zero-correction train residual",
             )
             validation_metrics, validation_fit, _ = evaluate_model(
                 model,
                 validation_loader,
                 device,
                 config["fit"],
-                "Selected calibrated baseline validation residual",
+                "Selected zero-correction validation residual",
             )
 
     final_validation_residual_metrics = {
@@ -573,29 +553,23 @@ def train(context: TrainingContext) -> dict[str, Any]:
         bias_weight=bias_weight,
         bias_scale_ps=bias_scale_ps,
     )
-    checkpoint_metadata["final_bias_calibration"] = {
-        "enforced": True,
-        "reference_split": "train",
-        "quantity_zeroed": "arithmetic mean of corrected residual",
-        "mode": "residual_mean",
-        "pair_output_bias_ps": float(final_pair_bias_ps),
-        "final_train_bias_ps": float(train_metrics["bias_ps"]),
-    }
+
 
     best_path = context.checkpoint_dir / "best.pt"
     last_path = context.checkpoint_dir / "last.pt"
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "epoch": 0,
-            "context": checkpoint_metadata,
-        },
-        best_path,
-    )
+    if save_best_checkpoint:
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "epoch": 0,
+                "context": checkpoint_metadata,
+            },
+            best_path,
+        )
     if save_last_checkpoint and last_coefficient is not None:
         last_model = build(model_config, context.input_length)
         assert isinstance(last_model, LinearPairSVR)
-        _assign_model(last_model, last_coefficient, last_pair_bias_ps)
+        _assign_model(last_model, last_coefficient)
         last_context = dict(checkpoint_metadata)
         last_context["linear_svr"] = dict(checkpoint_metadata["linear_svr"])
         last_context["linear_svr"]["selected_epsilon_ps"] = last_epsilon
@@ -610,23 +584,23 @@ def train(context: TrainingContext) -> dict[str, Any]:
 
     if save_history:
         write_csv_rows(context.output_dir / "epsilon_scan.csv", rows)
-    np.save(
-        context.output_dir / "linear_svr_weight.npy",
-        model.weight.detach().cpu().numpy(),
-    )
-    atomic_json(
-        context.output_dir / "linear_svr_selection.json",
-        {
-            "selected_epsilon_ps": None
-            if not math.isfinite(best_epsilon)
-            else best_epsilon,
-            "selection_loss_type": loss_type,
-            "bias_weight": bias_weight,
-            "selection_value": best_value,
-            "pair_output_bias_ps": float(final_pair_bias_ps),
-            "baseline_guard_applied": baseline_guard_applied,
-        },
-    )
+    if save_model_artifacts:
+        np.save(
+            context.output_dir / "linear_svr_weight.npy",
+            model.weight.detach().cpu().numpy(),
+        )
+        atomic_json(
+            context.output_dir / "linear_svr_selection.json",
+            {
+                "selected_epsilon_ps": None
+                if not math.isfinite(best_epsilon)
+                else best_epsilon,
+                "selection_loss_type": loss_type,
+                "bias_weight": bias_weight,
+                "selection_value": best_value,
+                "baseline_guard_applied": baseline_guard_applied,
+            },
+        )
 
     if save_plots:
         context.plot_dir.mkdir(parents=True, exist_ok=True)
@@ -670,7 +644,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
         ),
         "baseline_guard_metric": baseline_guard_metric,
         "baseline_guard_applied": baseline_guard_applied,
-        "best_checkpoint": str(best_path.resolve()),
+        "best_checkpoint": str(best_path.resolve()) if best_path.is_file() else "",
         "last_checkpoint": str(last_path.resolve()) if last_path.is_file() else "",
         "train_dir": str(context.output_dir.resolve()),
         "input_length": int(context.input_length),
@@ -679,13 +653,6 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "input_waveform_source": context.input_waveform_source,
         "prediction_target": context.prediction_target,
         "input_cache_paths": [str(path) for path in context.input_cache_dirs],
-        "pair_output_bias_ps": float(final_pair_bias_ps),
-        "final_bias_calibration": {
-            "enforced": True,
-            "reference_split": "train",
-            "mode": "residual_mean",
-            "final_train_bias_ps": float(train_metrics["bias_ps"]),
-        },
         "normalization": context.normalization.as_dict(),
         "training_datasets": [str(dataset.directory) for dataset in context.datasets],
         "optimizer": "scikit-learn LinearSVR (liblinear)",
@@ -696,10 +663,12 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "data_seed": int(
             config["training"].get("data_seed", config["training"].get("seed", 12345))
         ),
-        "model_parameter_count": int(context.input_length + 1),
+        "model_parameter_count": int(context.input_length),
     }
     if save_summary:
         atomic_json(context.output_dir / "training_summary.json", summary)
+    summary["_trained_model"] = model
+    summary["_checkpoint_context"] = checkpoint_metadata
     return summary
 
 

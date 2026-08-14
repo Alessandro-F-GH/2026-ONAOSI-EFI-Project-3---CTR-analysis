@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import hashlib
 import math
 from typing import Any
@@ -116,24 +118,6 @@ def validate_training_config(config: dict[str, Any]) -> None:
     random_pair_swap = training.get("random_pair_swap", False)
     if not isinstance(random_pair_swap, bool):
         raise ValueError("training.random_pair_swap must be a boolean")
-    zero_bias = training.get("zero_bias_constraint", {"enabled": False})
-    if isinstance(zero_bias, bool):
-        zero_bias = {"enabled": zero_bias}
-    if not isinstance(zero_bias, dict):
-        raise ValueError("training.zero_bias_constraint must be boolean or an object")
-    if not isinstance(zero_bias.get("enabled", False), bool):
-        raise ValueError("training.zero_bias_constraint.enabled must be boolean")
-    mode = str(zero_bias.get("mode", "prediction_mean"))
-    if mode not in ("prediction_mean", "residual_mean"):
-        raise ValueError(
-            "training.zero_bias_constraint.mode must be "
-            "'prediction_mean' or 'residual_mean'"
-        )
-    if bool(zero_bias.get("enabled", False)) and bool(random_pair_swap):
-        raise ValueError(
-            "training.zero_bias_constraint cannot be combined with random_pair_swap: "
-            "a constant pair-output offset is not antisymmetric under detector swapping"
-        )
     baseline_guard_metric = training.get("baseline_guard_metric")
     if baseline_guard_metric not in (None, "validation_rmse", "validation_ctr"):
         raise ValueError(
@@ -280,21 +264,6 @@ class AntisymmetricCNNRegressor(nn.Module):
         super().__init__()
         self.shared = SingleChannelCNN(config, input_length)
         self.input_length = int(input_length)
-        self.pair_output_bias_ps = nn.Parameter(
-            torch.zeros((), dtype=torch.float32), requires_grad=False
-        )
-
-    def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict, missing_keys,
-        unexpected_keys, error_msgs
-    ):
-        key = prefix + "pair_output_bias_ps"
-        if key not in state_dict:
-            state_dict[key] = torch.zeros_like(self.pair_output_bias_ps)
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys,
-            unexpected_keys, error_msgs
-        )
 
     def forward(self, waveform_pair: torch.Tensor) -> torch.Tensor:
         if waveform_pair.ndim != 3 or waveform_pair.shape[1] != 2:
@@ -305,7 +274,7 @@ class AntisymmetricCNNRegressor(nn.Module):
         output = self.shared(
             waveform_pair.reshape(batch * 2, self.input_length)
         ).reshape(batch, 2)
-        return output[:, 0] - output[:, 1] + self.pair_output_bias_ps
+        return output[:, 0] - output[:, 1]
 
 
 def build(config: dict[str, Any], input_length: int) -> nn.Module:
@@ -331,52 +300,6 @@ def _set_zero_correction(model: AntisymmetricCNNRegressor) -> None:
         final_linear.weight.zero_()
         if final_linear.bias is not None:
             final_linear.bias.zero_()
-        model.pair_output_bias_ps.zero_()
-
-
-def _resolve_zero_bias_constraint(training: dict[str, Any]) -> dict[str, Any]:
-    value = training.get("zero_bias_constraint", {"enabled": False})
-    if isinstance(value, bool):
-        value = {"enabled": value}
-    resolved = dict(value)
-    resolved.setdefault("enabled", False)
-    resolved.setdefault("mode", "prediction_mean")
-    return resolved
-
-
-def _apply_zero_bias_constraint(
-    model: AntisymmetricCNNRegressor,
-    loader,
-    device: torch.device,
-    *,
-    mode: str,
-) -> tuple[float, float]:
-    """Analytically update the pair-output offset from the training split.
-
-    ``prediction_mean`` enforces E[prediction]=0 exactly, matching the literal
-    requested constraint. ``residual_mean`` enforces E[prediction-target]=0,
-    which is the usual statistical definition of an unbiased predictor.
-    """
-
-    result = predict_loader(model, loader, device)
-    prediction = torch.as_tensor(result["prediction_ps"], dtype=torch.float64)
-    target = torch.as_tensor(result["target_ps"], dtype=torch.float64)
-    if mode == "prediction_mean":
-        measured = float(torch.mean(prediction).item())
-    elif mode == "residual_mean":
-        measured = float(torch.mean(prediction - target).item())
-    else:
-        raise ValueError(f"Unsupported zero-bias constraint mode: {mode}")
-    adjustment = -measured
-    with torch.no_grad():
-        model.pair_output_bias_ps.add_(
-            torch.tensor(
-                adjustment,
-                dtype=model.pair_output_bias_ps.dtype,
-                device=model.pair_output_bias_ps.device,
-            )
-        )
-    return adjustment, float(model.pair_output_bias_ps.detach().cpu().item())
 
 
 def _target_scale_from_datasets(context: TrainingContext, minimum_scale: float) -> float:
@@ -398,8 +321,10 @@ def train(context: TrainingContext) -> dict[str, Any]:
     artifacts = dict(config.get("artifacts", {}))
     save_history = bool(artifacts.get("save_history", True))
     save_plots = bool(artifacts.get("save_plots", True))
+    save_best_checkpoint = bool(artifacts.get("save_best_checkpoint", True))
     save_last_checkpoint = bool(artifacts.get("save_last_checkpoint", True))
     save_summary = bool(artifacts.get("save_summary", True))
+    perform_internal_fit = bool(artifacts.get("perform_internal_gaussian_fit", True))
 
     device = resolve_device(config["training"].get("device", "auto"))
     train_loader = make_split_loader(
@@ -415,13 +340,15 @@ def train(context: TrainingContext) -> dict[str, Any]:
         subsampling_factor=context.subsampling_factor,
     )
     zero_model = _ZeroCorrectionModel().to(device)
-    baseline_train_metrics, _baseline_train_fit, _ = evaluate_model(
-        zero_model, train_eval_loader, device, config["fit"], "Uncorrected train LED"
+    baseline_train_metrics, _baseline_train_fit, _ = evaluate_model_with_optional_fit(
+        zero_model, train_eval_loader, device, config["fit"], "Uncorrected train LED",
+        perform_fit=perform_internal_fit,
     )
-    baseline_validation_metrics, _baseline_validation_fit, _ = evaluate_model(
-        zero_model, validation_loader, device, config["fit"], "Uncorrected validation LED"
+    baseline_validation_metrics, _baseline_validation_fit, _ = evaluate_model_with_optional_fit(
+        zero_model, validation_loader, device, config["fit"], "Uncorrected validation LED",
+        perform_fit=perform_internal_fit,
     )
-    context.logger.info(
+    context.logger.debug(
         "Uncorrected LED baseline | train RMSE %.3f ps CTR %.3f ps | "
         "validation RMSE %.3f ps CTR %.3f ps bias %.3f ps",
         baseline_train_metrics["rmse_ps"],
@@ -443,7 +370,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
     model = build(context.model_config, context.input_length).to(device)
     assert isinstance(model, AntisymmetricCNNRegressor)
     parameter_count = int(sum(parameter.numel() for parameter in model.parameters()))
-    context.logger.info(
+    context.logger.debug(
         "CNN architecture | input length %d | encoded length %d | total stride %d | parameters %d | dense units %s",
         context.input_length,
         model.shared.encoded_length,
@@ -453,7 +380,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
     )
     initial_state_hash = model_state_hash(model)
     first_parameter = next(model.parameters()).detach().reshape(-1)[0].item()
-    context.logger.info(
+    context.logger.debug(
         "Actual model initialization seed %d | hash %s | first weight %.9g",
         initialization_seed,
         initial_state_hash[:12],
@@ -480,6 +407,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
     history: list[dict[str, Any]] = []
     best_path = context.checkpoint_dir / "best.pt"
     last_path = context.checkpoint_dir / "last.pt"
+    best_state: dict[str, torch.Tensor] | None = None
     checkpoint_metadata = checkpoint_context(
         context,
         training_strategy="Adam optimization of a shared strided 1-D CNN with antisymmetric pair output",
@@ -514,19 +442,10 @@ def train(context: TrainingContext) -> dict[str, Any]:
         int(config["training"].get("data_seed", config["training"].get("seed", 12345)))
     )
     if random_pair_swap:
-        context.logger.info(
+        context.logger.debug(
             "Random ordered-pair swapping enabled for training batches (probability 0.5)"
         )
-    zero_bias_constraint = _resolve_zero_bias_constraint(config["training"])
-    zero_bias_enabled = bool(zero_bias_constraint["enabled"])
-    zero_bias_mode = str(zero_bias_constraint["mode"])
-    if zero_bias_enabled:
-        context.logger.info(
-            "Epoch-end zero-bias constraint enabled | mode=%s | reference split=train",
-            zero_bias_mode,
-        )
-
-    context.logger.info("Training %s with Adam on %s", context.model_name, device)
+    context.logger.debug("Training %s with Adam on %s", context.model_name, device)
     for epoch in range(1, epochs + 1):
         model.train()
         for waveforms, target, led_delta, cfd_delta, true_tof, anchor_shift in train_loader:
@@ -563,13 +482,6 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(gradient_clip))
             scaler.step(optimizer)
             scaler.update()
-
-        zero_bias_adjustment = 0.0
-        pair_output_bias = float(model.pair_output_bias_ps.detach().cpu().item())
-        if zero_bias_enabled:
-            zero_bias_adjustment, pair_output_bias = _apply_zero_bias_constraint(
-                model, train_eval_loader, device, mode=zero_bias_mode
-            )
 
         fit_train, fit_validation = fit_schedule_for_epoch(
             config["training"], epoch, selection_metric=selection_metric
@@ -638,10 +550,6 @@ def train(context: TrainingContext) -> dict[str, Any]:
             "validation_prediction_mean_ps": float(
                 torch.as_tensor(validation_prediction["prediction_ps"], dtype=torch.float64).mean().item()
             ),
-            "zero_bias_constraint_enabled": zero_bias_enabled,
-            "zero_bias_constraint_mode": zero_bias_mode if zero_bias_enabled else "",
-            "zero_bias_adjustment_ps": float(zero_bias_adjustment),
-            "pair_output_bias_ps": float(pair_output_bias),
             "bias_penalty": float(validation_bias_penalty),
             "train_fit_performed": bool(train_metrics["fit_performed"]),
             "validation_fit_performed": bool(validation_metrics["fit_performed"]),
@@ -659,10 +567,12 @@ def train(context: TrainingContext) -> dict[str, Any]:
             best_epoch = epoch
             bad_epochs = 0
             row["selected_best"] = True
-            torch.save(
-                {"model_state": model.state_dict(), "epoch": epoch, "context": checkpoint_metadata},
-                best_path,
-            )
+            best_state = copy.deepcopy(model.state_dict())
+            if save_best_checkpoint:
+                torch.save(
+                    {"model_state": best_state, "epoch": epoch, "context": checkpoint_metadata},
+                    best_path,
+                )
         else:
             bad_epochs += 1
         history.append(row)
@@ -671,29 +581,29 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 {"model_state": model.state_dict(), "epoch": epoch, "context": checkpoint_metadata},
                 last_path,
             )
-        context.logger.info(
-            "Epoch %d/%d | train RMSE %.3f ps | val RMSE %.3f ps | val CTR %s | val bias %.3f ps | output bias %.3f ps",
+        context.logger.debug(
+            "Epoch %d/%d | train RMSE %.3f ps | val RMSE %.3f ps | val CTR %s | val bias %.3f ps",
             epoch,
             epochs,
             row["train_rmse_ps"],
             row["validation_rmse_ps"],
             (f"{row['validation_ctr_ps']:.3f} ps" if math.isfinite(row["validation_ctr_ps"]) else "not fitted"),
             row["validation_bias_ps"],
-            row["pair_output_bias_ps"],
         )
         if bad_epochs >= patience:
-            context.logger.info("Early stopping after %d epochs without improvement", bad_epochs)
+            context.logger.debug("Early stopping after %d epochs without improvement", bad_epochs)
             break
 
-    if not best_path.is_file():
-        raise RuntimeError("Training completed without a valid checkpoint")
-    best_checkpoint = torch.load(best_path, map_location=device, weights_only=False)
-    model.load_state_dict(best_checkpoint["model_state"])
-    train_metrics, train_fit, _ = evaluate_model(
-        model, train_eval_loader, device, config["fit"], "Best train residual"
+    if best_state is None:
+        raise RuntimeError("Training completed without a valid in-memory best state")
+    model.load_state_dict(best_state)
+    train_metrics, train_fit, _ = evaluate_model_with_optional_fit(
+        model, train_eval_loader, device, config["fit"], "Best train residual",
+        perform_fit=perform_internal_fit,
     )
-    validation_metrics, validation_fit, _ = evaluate_model(
-        model, validation_loader, device, config["fit"], "Best validation residual"
+    validation_metrics, validation_fit, _ = evaluate_model_with_optional_fit(
+        model, validation_loader, device, config["fit"], "Best validation residual",
+        perform_fit=perform_internal_fit,
     )
 
     baseline_guard_metric = config["training"].get("baseline_guard_metric")
@@ -721,10 +631,12 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 baseline_value,
             )
             _set_zero_correction(model)
-            torch.save(
-                {"model_state": model.state_dict(), "epoch": 0, "context": checkpoint_metadata},
-                best_path,
-            )
+            best_state = copy.deepcopy(model.state_dict())
+            if save_best_checkpoint:
+                torch.save(
+                    {"model_state": best_state, "epoch": 0, "context": checkpoint_metadata},
+                    best_path,
+                )
             best_epoch = 0
             best_value = baseline_value
             baseline_guard_applied = True
@@ -735,64 +647,19 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 model, validation_loader, device, config["fit"], "Selected uncorrected validation LED"
             )
 
-    # Mandatory final calibration: remove the arithmetic training residual bias
-    # from the selected model through its scalar prediction offset.  This is
-    # applied after early stopping and any baseline guard, and the calibrated
-    # state is the checkpoint used for every later evaluation.
-    final_bias_calibration_adjustment_ps, final_pair_output_bias_ps = (
-        _apply_zero_bias_constraint(
-            model,
-            train_eval_loader,
-            device,
-            mode="residual_mean",
-        )
-    )
-    train_metrics, train_fit, _ = evaluate_model(
-        model, train_eval_loader, device, config["fit"], "Final calibrated train residual"
-    )
-    validation_metrics, validation_fit, _ = evaluate_model(
-        model, validation_loader, device, config["fit"], "Final calibrated validation residual"
-    )
+    # Exact antisymmetry is preserved through finalization: there is no additive
+    # pair-output calibration after early stopping. Persist the selected state as-is.
     final_train_bias_ps = float(train_metrics["bias_ps"])
-    if loss_type == "var_bias":
-        final_validation_loss, _final_validation_variance, _final_bias_penalty = (
-            var_bias_value_from_metrics(
-                rmse_ps=float(validation_metrics["rmse_ps"]),
-                bias_ps=float(validation_metrics["bias_ps"]),
-                bias_weight=bias_weight,
-                target_scale=target_scale,
-            )
+    best_state = copy.deepcopy(model.state_dict())
+    if save_best_checkpoint:
+        torch.save(
+            {
+                "model_state": best_state,
+                "epoch": int(best_epoch),
+                "context": checkpoint_metadata,
+            },
+            best_path,
         )
-    else:
-        final_validation_loss = float(validation_metrics["rmse_ps"] ** 2)
-    final_selection_values = {
-        "validation_rmse": float(validation_metrics["rmse_ps"]),
-        "validation_loss": final_validation_loss,
-        "absolute_validation_bias": abs(float(validation_metrics["bias_ps"])),
-        "validation_ctr": float(validation_metrics["ctr_ps"]),
-    }
-    best_value = float(final_selection_values[selection_metric])
-    checkpoint_metadata["final_bias_calibration"] = {
-        "enforced": True,
-        "reference_split": "train",
-        "quantity_zeroed": "arithmetic mean of corrected residual",
-        "mode": "residual_mean",
-        "adjustment_ps": float(final_bias_calibration_adjustment_ps),
-        "final_train_bias_ps": final_train_bias_ps,
-    }
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "epoch": int(best_epoch),
-            "context": checkpoint_metadata,
-        },
-        best_path,
-    )
-    context.logger.info(
-        "Final train-bias calibration | adjustment %.6f ps | final train bias %.9f ps",
-        final_bias_calibration_adjustment_ps,
-        final_train_bias_ps,
-    )
 
     if save_history:
         write_csv_rows(context.output_dir / "training_metrics.csv", history)
@@ -821,7 +688,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "uncorrected_led_validation_bias_ps": float(baseline_validation_metrics["bias_ps"]),
         "baseline_guard_metric": baseline_guard_metric,
         "baseline_guard_applied": baseline_guard_applied,
-        "best_checkpoint": str(best_path.resolve()),
+        "best_checkpoint": str(best_path.resolve()) if best_path.is_file() else "",
         "last_checkpoint": str(last_path.resolve()) if last_path.is_file() else "",
         "train_dir": str(context.output_dir.resolve()),
         "input_length": int(context.input_length),
@@ -829,21 +696,6 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "input_waveform_source": context.input_waveform_source,
         "prediction_target": context.prediction_target,
         "input_cache_paths": [str(path) for path in context.input_cache_dirs],
-        "zero_bias_constraint": {
-            "enabled": zero_bias_enabled,
-            "mode": zero_bias_mode,
-            "reference_split": "train",
-        },
-        "pair_output_bias_ps": float(
-            model.pair_output_bias_ps.detach().cpu().item()
-        ),
-        "final_bias_calibration": {
-            "enforced": True,
-            "reference_split": "train",
-            "mode": "residual_mean",
-            "adjustment_ps": float(final_bias_calibration_adjustment_ps),
-            "final_train_bias_ps": float(final_train_bias_ps),
-        },
         "normalization": context.normalization.as_dict(),
         "training_datasets": [str(dataset.directory) for dataset in context.datasets],
         "optimizer": "Adam",
@@ -878,6 +730,10 @@ def train(context: TrainingContext) -> dict[str, Any]:
     }
     if save_summary:
         atomic_json(context.output_dir / "training_summary.json", summary)
+    # Private in-process handles are intentionally added only after serialization.
+    # CV callers use them to score the untouched fold without writing checkpoints.
+    summary["_trained_model"] = model
+    summary["_checkpoint_context"] = checkpoint_metadata
     return summary
 
 

@@ -45,9 +45,9 @@ def _model_state_hash(model: nn.Module) -> str:
 
 
 def validate_config(config: dict[str, Any]) -> None:
-    activation = str(config.get("activation", "identity"))
-    if activation != "identity":
-        raise ValueError("constructive_mlp_encoder requires activation='identity'")
+    activation = str(config.get("activation", "silu")).lower()
+    if activation not in {"silu", "tanh", "gelu", "relu", "identity"}:
+        raise ValueError("constructive_mlp_encoder activation must be silu, tanh, gelu, relu or identity")
     max_units = int(config.get("max_units", 16))
     if max_units <= 0:
         raise ValueError("max_units must be positive")
@@ -110,8 +110,8 @@ def validate_training_config(config: dict[str, Any]) -> None:
         raise ValueError("model.loss.bias_weight must be non-negative")
 
 
-class ConstructiveIdentityUnit(nn.Module):
-    """One scalar identity-activated unit fed by raw input and frozen units."""
+class ConstructiveUnit(nn.Module):
+    """One scalar nonlinear unit fed by raw input and all frozen units."""
 
     def __init__(
         self,
@@ -119,6 +119,7 @@ class ConstructiveIdentityUnit(nn.Module):
         previous_units: int,
         *,
         bias: bool,
+        activation: str,
     ) -> None:
         super().__init__()
         self.raw_input_length = int(input_length)
@@ -128,6 +129,16 @@ class ConstructiveIdentityUnit(nn.Module):
             1,
             bias=bias,
         )
+        key = str(activation).lower()
+        activations: dict[str, nn.Module] = {
+            "silu": nn.SiLU(),
+            "tanh": nn.Tanh(),
+            "gelu": nn.GELU(),
+            "relu": nn.ReLU(),
+            "identity": nn.Identity(),
+        }
+        self.activation_name = key
+        self.activation = activations[key]
 
     def forward(
         self,
@@ -140,26 +151,29 @@ class ConstructiveIdentityUnit(nn.Module):
             if previous_hidden is None or previous_hidden.shape[1] != self.previous_units:
                 raise ValueError("Incorrect number of frozen hidden-unit inputs")
             values = torch.cat([waveform, previous_hidden], dim=1)
-        return self.linear(values)
+        return self.activation(self.linear(values))
 
 
-class ConstructiveIdentityEncoder(nn.Module):
+class ConstructiveEncoder(nn.Module):
     def __init__(
         self,
         input_length: int,
         unit_count: int,
         *,
         unit_bias: bool,
+        activation: str,
     ) -> None:
         super().__init__()
         self.input_length = int(input_length)
         self.unit_bias = bool(unit_bias)
+        self.activation_name = str(activation).lower()
         self.units = nn.ModuleList(
             [
-                ConstructiveIdentityUnit(
+                ConstructiveUnit(
                     self.input_length,
                     previous_units=index,
                     bias=self.unit_bias,
+                    activation=self.activation_name,
                 )
                 for index in range(int(unit_count))
             ]
@@ -173,10 +187,11 @@ class ConstructiveIdentityEncoder(nn.Module):
         torch.manual_seed(int(seed))
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(seed))
-        unit = ConstructiveIdentityUnit(
+        unit = ConstructiveUnit(
             self.input_length,
             previous_units=self.unit_count,
             bias=self.unit_bias,
+            activation=self.activation_name,
         ).to(device)
         self.units.append(unit)
 
@@ -195,37 +210,6 @@ class ConstructiveIdentityEncoder(nn.Module):
             return waveform.new_empty((waveform.shape[0], 0))
         return torch.cat(hidden, dim=1)
 
-    def effective_affine_map(self) -> tuple[np.ndarray, np.ndarray]:
-        """Collapse the identity cascade to H = X W^T + b."""
-
-        effective_weights: list[np.ndarray] = []
-        effective_biases: list[float] = []
-        for index, unit in enumerate(self.units):
-            weight = (
-                unit.linear.weight.detach().cpu().numpy().reshape(-1).astype(np.float64)
-            )
-            raw_weight = weight[: self.input_length].copy()
-            previous_weight = weight[self.input_length :]
-            bias = (
-                float(unit.linear.bias.detach().cpu().item())
-                if unit.linear.bias is not None
-                else 0.0
-            )
-            if index:
-                previous_matrix = np.stack(effective_weights, axis=0)
-                previous_bias = np.asarray(effective_biases, dtype=np.float64)
-                raw_weight += previous_weight @ previous_matrix
-                bias += float(previous_weight @ previous_bias)
-            effective_weights.append(raw_weight)
-            effective_biases.append(bias)
-        if not effective_weights:
-            return (
-                np.empty((0, self.input_length), dtype=np.float64),
-                np.empty(0, dtype=np.float64),
-            )
-        return np.stack(effective_weights, axis=0), np.asarray(
-            effective_biases, dtype=np.float64
-        )
 
 
 class AntisymmetricConstructiveMLPEncoder(nn.Module):
@@ -235,11 +219,13 @@ class AntisymmetricConstructiveMLPEncoder(nn.Module):
         super().__init__()
         self.input_length = int(input_length)
         self.unit_bias = bool(config.get("unit_bias", True))
+        self.activation_name = str(config.get("activation", "silu")).lower()
         unit_count = int(config.get(_TRAINED_UNITS_KEY, config.get("initial_units", 1)))
-        self.encoder = ConstructiveIdentityEncoder(
+        self.encoder = ConstructiveEncoder(
             self.input_length,
             unit_count,
             unit_bias=self.unit_bias,
+            activation=self.activation_name,
         )
         self.output_weights = nn.ParameterList(
             [nn.Parameter(torch.tensor(1.0, dtype=torch.float32)) for _ in range(unit_count)]
@@ -308,18 +294,6 @@ class AntisymmetricConstructiveMLPEncoder(nn.Module):
             single = self.output_bound_ps * torch.tanh(single / self.output_bound_ps)
         return single[:, 0] - single[:, 1]
 
-    def effective_encoder(self) -> tuple[np.ndarray, np.ndarray]:
-        return self.encoder.effective_affine_map()
-
-    def overall_effective_weight(self) -> np.ndarray:
-        weights, _biases = self.effective_encoder()
-        if weights.shape[0] == 0:
-            return np.zeros(self.input_length, dtype=np.float64)
-        coefficients = np.asarray(
-            [float(value.detach().cpu().item()) for value in self.output_weights],
-            dtype=np.float64,
-        )
-        return coefficients @ weights
 
 
 def build(config: dict[str, Any], input_length: int) -> nn.Module:
@@ -374,59 +348,28 @@ def _save_encoder_artifacts(
     model: AntisymmetricConstructiveMLPEncoder,
     output_dir: Path,
 ) -> dict[str, str]:
-    effective_weights, effective_bias = model.effective_encoder()
+    """Persist compact structural information for the selected nonlinear model."""
     output_weights = np.asarray(
         [float(value.detach().cpu().item()) for value in model.output_weights],
         dtype=np.float64,
     )
-    overall = model.overall_effective_weight()
-    np.save(output_dir / "encoder_effective_weights.npy", effective_weights)
-    np.save(output_dir / "encoder_effective_bias.npy", effective_bias)
     np.save(output_dir / "encoder_output_weights.npy", output_weights)
-    np.save(output_dir / "overall_effective_weight.npy", overall)
-
     rows = []
-    for index in range(model.unit_count):
-        direct = (
-            model.encoder.units[index]
-            .linear.weight.detach()
-            .cpu()
-            .numpy()
-            .reshape(-1)
-            .astype(np.float64)
-        )
+    for index, unit in enumerate(model.encoder.units):
+        direct = unit.linear.weight.detach().cpu().numpy().reshape(-1).astype(np.float64)
         rows.append(
             {
                 "unit_index": index,
-                "feature_name": f"constructive_unit_{index:03d}",
-                "raw_input_weight_l2": float(
-                    np.linalg.norm(direct[: model.input_length])
-                ),
-                "previous_unit_weight_l2": float(
-                    np.linalg.norm(direct[model.input_length :])
-                ),
-                "effective_raw_weight_l2": float(
-                    np.linalg.norm(effective_weights[index])
-                ),
-                "effective_bias": float(effective_bias[index]),
+                "raw_input_weight_l2": float(np.linalg.norm(direct[: model.input_length])),
+                "previous_unit_weight_l2": float(np.linalg.norm(direct[model.input_length :])),
                 "output_weight": float(output_weights[index]),
                 "absolute_output_weight": float(abs(output_weights[index])),
+                "activation": model.activation_name,
             }
         )
     write_csv_rows(output_dir / "encoder_units.csv", rows)
     return {
-        "encoder_effective_weights": str(
-            (output_dir / "encoder_effective_weights.npy").resolve()
-        ),
-        "encoder_effective_bias": str(
-            (output_dir / "encoder_effective_bias.npy").resolve()
-        ),
-        "encoder_output_weights": str(
-            (output_dir / "encoder_output_weights.npy").resolve()
-        ),
-        "overall_effective_weight": str(
-            (output_dir / "overall_effective_weight.npy").resolve()
-        ),
+        "encoder_output_weights": str((output_dir / "encoder_output_weights.npy").resolve()),
         "encoder_units": str((output_dir / "encoder_units.csv").resolve()),
     }
 
@@ -456,8 +399,11 @@ def train(context: TrainingContext) -> dict[str, Any]:
     artifacts = dict(config.get("artifacts", {}))
     save_history = bool(artifacts.get("save_history", True))
     save_plots = bool(artifacts.get("save_plots", True))
+    save_best_checkpoint = bool(artifacts.get("save_best_checkpoint", True))
     save_last_checkpoint = bool(artifacts.get("save_last_checkpoint", True))
     save_summary = bool(artifacts.get("save_summary", True))
+    save_model_artifacts = bool(artifacts.get("save_model_artifacts", True))
+    perform_internal_fit = bool(artifacts.get("perform_internal_gaussian_fit", True))
 
     device = resolve_device(config["training"].get("device", "auto"))
     train_loader = make_split_loader(
@@ -552,7 +498,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
     )
 
     context.logger.info(
-        "Constructive identity encoder | max units %d | epochs/unit %d | "
+        "Constructive nonlinear encoder | max units %d | epochs/unit %d | "
         "minimum validation RMSE improvement %.6g ps",
         max_units,
         epochs_per_unit,
@@ -583,7 +529,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
         stage_best_epoch = 0
         bad_epochs = 0
 
-        context.logger.info(
+        context.logger.debug(
             "Training constructive unit %d/%d with %d trainable parameters",
             unit_index + 1,
             max_units,
@@ -704,7 +650,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 "selected_best": selected,
             }
             history.append(row)
-            context.logger.info(
+            context.logger.debug(
                 "Unit %d | epoch %d/%d | train RMSE %.3f ps | val RMSE %.3f ps | "
                 "val CTR %.3f ps | val bias %.3f ps",
                 unit_index + 1,
@@ -716,7 +662,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 row["validation_bias_ps"],
             )
             if bad_epochs >= patience:
-                context.logger.info(
+                context.logger.debug(
                     "Unit %d early stopping after %d epochs without improvement",
                     unit_index + 1,
                     bad_epochs,
@@ -728,19 +674,21 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 f"Constructive unit {unit_index + 1} produced no finite validation metric"
             )
         model.load_state_dict(stage_best_state)
-        train_metrics, train_fit, _ = evaluate_model(
+        train_metrics, train_fit, _ = evaluate_model_with_optional_fit(
             model,
             train_eval_loader,
             device,
             config["fit"],
             f"Constructive {unit_index + 1}-unit train residual",
+            perform_fit=perform_internal_fit,
         )
-        validation_metrics, validation_fit, _ = evaluate_model(
+        validation_metrics, validation_fit, _ = evaluate_model_with_optional_fit(
             model,
             validation_loader,
             device,
             config["fit"],
             f"Constructive {unit_index + 1}-unit validation residual",
+            perform_fit=perform_internal_fit,
         )
 
         improvement = (
@@ -800,9 +748,9 @@ def train(context: TrainingContext) -> dict[str, Any]:
             context,
             model_config=accepted_config,
             training_strategy=(
-                "Greedy constructive identity encoder: train one new unit on raw "
-                "waveform plus frozen hidden units, freeze it, and stop when validation "
-                "RMSE improvement is marginal"
+                "Greedy constructive nonlinear encoder: train one new unit on the full "
+                "waveform plus all frozen hidden units, freeze it, and stop when early-stop "
+                "validation improvement is marginal"
             ),
         )
         payload = {
@@ -811,7 +759,8 @@ def train(context: TrainingContext) -> dict[str, Any]:
             "unit_count": int(accepted_units),
             "context": metadata,
         }
-        torch.save(payload, best_path)
+        if save_best_checkpoint:
+            torch.save(payload, best_path)
         if save_last_checkpoint:
             torch.save(payload, last_path)
         context.logger.info(
@@ -823,27 +772,30 @@ def train(context: TrainingContext) -> dict[str, Any]:
             else f" | improvement {improvement:.3f} ps",
         )
 
-    if accepted_state is None or not best_path.is_file():
+    if accepted_state is None:
         raise RuntimeError("Constructive training completed without an accepted unit")
     accepted_config = _checkpoint_model_config(model_config, accepted_units)
     model = build(accepted_config, context.input_length).to(device)
     assert isinstance(model, AntisymmetricConstructiveMLPEncoder)
     model.load_state_dict(accepted_state)
     model.freeze_all()
-    train_metrics, train_fit, _ = evaluate_model(
-        model, train_eval_loader, device, config["fit"], "Best constructive train residual"
+    train_metrics, train_fit, _ = evaluate_model_with_optional_fit(
+        model, train_eval_loader, device, config["fit"], "Best constructive train residual",
+        perform_fit=perform_internal_fit,
     )
-    validation_metrics, validation_fit, _ = evaluate_model(
+    validation_metrics, validation_fit, _ = evaluate_model_with_optional_fit(
         model,
         validation_loader,
         device,
         config["fit"],
         "Best constructive validation residual",
+        perform_fit=perform_internal_fit,
     )
 
     if save_history:
         write_csv_rows(context.output_dir / "training_metrics.csv", history)
-    write_csv_rows(context.output_dir / "constructive_growth.csv", growth_rows)
+    if save_model_artifacts:
+        write_csv_rows(context.output_dir / "constructive_growth.csv", growth_rows)
     dpi = int(config.get("plotting", {}).get("dpi", 180))
     if save_plots:
         context.plot_dir.mkdir(parents=True, exist_ok=True)
@@ -863,7 +815,9 @@ def train(context: TrainingContext) -> dict[str, Any]:
             context.plot_dir / "best_validation_gaussian_fit.png",
             dpi=dpi,
         )
-    encoder_artifacts = _save_encoder_artifacts(model, context.output_dir)
+    encoder_artifacts = (
+        _save_encoder_artifacts(model, context.output_dir) if save_model_artifacts else {}
+    )
 
     summary = {
         "model_type": context.model_type,
@@ -874,7 +828,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "best_validation_rmse_ps": float(validation_metrics["rmse_ps"]),
         "best_validation_ctr_ps": float(validation_metrics["ctr_ps"]),
         "best_validation_bias_ps": float(validation_metrics["bias_ps"]),
-        "best_checkpoint": str(best_path.resolve()),
+        "best_checkpoint": str(best_path.resolve()) if best_path.is_file() else "",
         "last_checkpoint": str(last_path.resolve()) if last_path.is_file() else "",
         "train_dir": str(context.output_dir.resolve()),
         "input_length": int(context.input_length),
@@ -887,7 +841,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
         "stop_reason": stop_reason,
         "minimum_unit_improvement_ps": float(minimum_improvement),
         "minimum_relative_unit_improvement": float(minimum_relative),
-        "activation": "identity",
+        "activation": model.activation_name,
         "normalization": context.normalization.as_dict(),
         "training_datasets": [str(dataset.directory) for dataset in context.datasets],
         "optimizer": "Adam",
@@ -911,19 +865,30 @@ def train(context: TrainingContext) -> dict[str, Any]:
             if loss_type == "var_bias"
             else "Direct MSE of g(s1)-g(s2) against LED_delta-true_TOF"
         ),
-        "linearity_note": (
-            "Because every hidden activation is identity, the complete encoder and "
-            "predictor are affine/linear functions of the normalized waveform."
+        "architecture_note": (
+            "Each accepted unit receives the full normalized waveform plus all previously "
+            "accepted frozen units; only the new unit and its output coefficient are trained."
         ),
         "artifacts": {
             **encoder_artifacts,
-            "constructive_growth": str(
-                (context.output_dir / "constructive_growth.csv").resolve()
+            **(
+                {"constructive_growth": str((context.output_dir / "constructive_growth.csv").resolve())}
+                if save_model_artifacts
+                else {}
             ),
         },
     }
     if save_summary:
         atomic_json(context.output_dir / "training_summary.json", summary)
+    summary["_trained_model"] = model
+    summary["_checkpoint_context"] = checkpoint_context(
+        context,
+        model_config=accepted_config,
+        training_strategy=(
+            "Greedy constructive nonlinear encoder: train one new unit on the full waveform "
+            "plus all frozen hidden units, then freeze accepted units"
+        ),
+    )
     return summary
 
 

@@ -201,14 +201,15 @@ def window_anchor_shift_pair_ps(
 def factored_correction_target_ps(
     dataset: PreparedDataset, indices: np.ndarray
 ) -> np.ndarray:
-    """Correction learned in the native-window anchor coordinate system.
+    """Direct antisymmetric LED correction target in ps.
 
-    Full correction to interpolated LED:
-        c_LED = (Delta t_LED - TOF_true).
-    Known quantization term:
-        delta = (t_LED,1 - t_anchor,1) - (t_LED,2 - t_anchor,2).
-    Learned target:
-        c_model = c_LED - delta = Delta t_anchor - TOF_true.
+    Every waveform model learns exactly
+
+        c(s1, s2) = g(s1) - g(s2) = Delta t_LED - TOF_true.
+
+    Native-grid anchor timestamps remain available for diagnostics and the
+    multithreshold feature construction, but no event-wise anchor term is added
+    analytically to the ML correction.
     """
 
     selected = np.asarray(indices, dtype=np.int64)
@@ -216,19 +217,15 @@ def factored_correction_target_ps(
         np.asarray(dataset.led_time_fs[selected, 0], dtype=np.float64)
         - np.asarray(dataset.led_time_fs[selected, 1], dtype=np.float64)
     ) / 1000.0
-    return (
-        led_delta_ps
-        - float(dataset.true_tof_ps)
-        - window_anchor_shift_pair_ps(dataset, selected)
-    )
+    return led_delta_ps - float(dataset.true_tof_ps)
 
 
 class CorrectionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
     """View of a post-selection prepared dataset.
 
-    The applied correction still refers to the interpolated LED timestamp.
-    The model learns the residual in native-anchor coordinates, while the exact
-    interpolated-LED/native-anchor shift is added analytically at inference.
+    The target is the full LED correction. No event-wise analytic anchor
+    correction is added at inference; the learned correction is exactly the
+    antisymmetric model output g(s1)-g(s2).
     """
 
     def __init__(
@@ -286,8 +283,8 @@ class CorrectionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
             int(self.dataset.cfd_time_fs[index, 0]) - int(self.dataset.cfd_time_fs[index, 1])
         ) / 1000.0
         true_tof_ps = self.dataset.true_tof_ps
-        anchor_shift_ps = float(window_anchor_shift_pair_ps(self.dataset, index))
-        target_ps = led_delta_ps - true_tof_ps - anchor_shift_ps
+        anchor_shift_ps = 0.0
+        target_ps = led_delta_ps - true_tof_ps
         return (
             torch.from_numpy(pair),
             torch.tensor(target_ps, dtype=torch.float32),

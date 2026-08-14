@@ -1,5 +1,12 @@
-"""Post-selection ML pipeline for energy-waveform CTR correction."""
+"""Compact waveform-ML and multithreshold CTR analysis pipeline."""
 
 __all__ = [
-    "config", "data", "dataset", "preprocessing", "training", "evaluation", "models"
+    "config",
+    "data",
+    "dataset",
+    "prepared_data",
+    "training",
+    "models",
+    "study",
+    "study_config",
 ]

@@ -288,15 +288,7 @@ def checkpoint_context(
             "subsampling_factor": int(context.subsampling_factor),
             "subsampling_mode": "componentwise_stride",
         },
-        "input_representation": (
-            "first_difference"
-            if context.input_transform == "differentiate"
-            else (
-                "raw_waveform_then_first_difference"
-                if context.input_transform == "concatenate_diff"
-                else "standard_waveform"
-            )
-        ),
+        "input_representation": "prepared_waveform",
         "source_input_length": int(
             context.datasets[0].manifest.get("model_input", {}).get(
                 "input_length_before_transform", context.input_length
@@ -309,15 +301,12 @@ def checkpoint_context(
         "training_dataset_paths": [str(dataset.directory) for dataset in context.datasets],
         "input_cache_paths": [str(path) for path in context.input_cache_dirs],
         "target_definition": (
-            "learned native-anchor correction = "
-            f"({context.prediction_target} interpolated LED difference - true TOF) "
-            "- [(LED1-anchor1) - (LED2-anchor2)]; the known anchor shift is "
-            "added back analytically before correcting interpolated LED"
+            f"direct antisymmetric correction = {context.prediction_target} LED pair difference "
+            "- true TOF; model output is exactly g(s1)-g(s2) with no event-wise analytic "
+            "anchor correction or additive pair bias"
         ),
         "correction_output_reference": "interpolated_led",
-        "window_anchor_shift_factored": bool(
-            context.datasets[0].manifest.get("window_anchor_shift_factored", False)
-        ),
+        "window_anchor_shift_factored": False,
         "training_strategy": training_strategy,
         "data_view": dict(context.data_view),
         "relative_time_ps_start": float(context.datasets[0].relative_time_ps[0]),

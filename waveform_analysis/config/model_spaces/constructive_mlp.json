@@ -1,0 +1,58 @@
+{
+  "id": "constructive_mlp",
+  "model_type": "constructive_mlp_encoder",
+  "base_train_config": {
+    "model": {
+      "type": "constructive_mlp_encoder",
+      "name": "constructive_mlp",
+      "activation": "silu",
+      "max_units": 20,
+      "unit_bias": true,
+      "max_abs_single_channel_output_ps": null,
+      "loss": {
+        "type": "mse"
+      }
+    },
+    "optimizer": {
+      "learning_rate": 0.01,
+      "weight_decay": 1e-05
+    },
+    "training": {
+      "device": "auto",
+      "seed": 20260813,
+      "epochs_per_unit": 100,
+      "batch_size": 128,
+      "mixed_precision": true,
+      "gradient_clip_norm": 10.0,
+      "unit_early_stopping_patience": 10,
+      "unit_early_stopping_min_delta_ps": 0.1,
+      "min_unit_improvement_ps": 0.05,
+      "min_relative_unit_improvement": 0.005,
+      "normalization_chunk_size": 4096,
+      "num_workers": 0,
+      "pin_memory": false,
+      "fit_interval_epochs": 0,
+      "fit_train_during_training": false,
+      "fit_validation_during_training": false,
+      "selection_metric": "validation_rmse",
+      "random_pair_swap": true,
+      "baseline_guard_metric": null
+    },
+    "output": {
+      "train_dir": "resolved_by_study"
+    }
+  },
+  "search": {
+    "method": "grid",
+    "parameters": {
+      "model.activation": {
+        "type": "categorical",
+        "values": [
+          "silu",
+          "tanh",
+          "relu"
+        ]
+      }
+    }
+  }
+}

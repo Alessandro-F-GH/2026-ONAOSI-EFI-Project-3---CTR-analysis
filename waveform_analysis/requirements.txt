@@ -1,9 +1,8 @@
-awkward
-matplotlib
-numpy
-pandas
-scikit-learn>=1.3
-scipy
-torch
-uproot
-optuna
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
+pandas>=2.1
+scikit-learn>=1.4
+torch>=2.2
+uproot>=5.2
+awkward>=2.6

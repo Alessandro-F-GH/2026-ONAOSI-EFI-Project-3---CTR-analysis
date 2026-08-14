@@ -5,11 +5,10 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .common import atomic_json, set_global_seed
+from .common import atomic_json, canonical_hash, set_global_seed
 from .config import resolve_fit_config
 from .dataset import PreparedDataset, load_prepared_dataset_spec
 from .input_transform import (
-    INPUT_TRANSFORM_NORMALIZE,
     materialize_training_input_cache,
     normalize_subsampling_factor,
     resolve_input_transform,
@@ -17,7 +16,7 @@ from .input_transform import (
 )
 from .models import train_registered_model
 from .prediction import prediction_dataset_view, resolve_prediction_config
-from .torch_data import compute_normalization
+from .torch_data import Normalization, compute_normalization
 from .training_context import TrainingContext
 
 
@@ -89,6 +88,7 @@ def train_model(
     logger: Any,
     prepared_datasets: list[PreparedDataset] | None = None,
     data_view: dict[str, Any] | None = None,
+    normalization_override: Normalization | None = None,
 ) -> dict[str, Any]:
     """Unified entry point for every automatically discovered model.
 
@@ -201,19 +201,45 @@ def train_model(
     training_config = config["training"]
     data_seed = int(training_config.get("data_seed", training_config.get("seed", 12345)))
     set_global_seed(data_seed)
-    normalization = compute_normalization(
-        [(dataset, dataset.train) for dataset in datasets],
-        chunk_size=int(config["training"].get("normalization_chunk_size", 2048)),
-        featurewise=input_transform == INPUT_TRANSFORM_NORMALIZE,
-        subsampling_factor=subsampling_factor,
-    )
 
     model_config = dict(config["model"])
     model_type = str(model_config.pop("type"))
     model_name = str(model_config.pop("name"))
+
+    # All retained waveform models consume the same normalized prepared input.
+    # The experiment engine may reuse the tiny train-only normalization statistics
+    # across hyperparameter candidates that share exactly the same fit subset.
+    normalization = normalization_override
+    if normalization is None:
+        normalization = compute_normalization(
+            [(dataset, dataset.train) for dataset in datasets],
+            chunk_size=int(config["training"].get("normalization_chunk_size", 2048)),
+            featurewise=False,
+            subsampling_factor=subsampling_factor,
+        )
     artifacts = dict(config.get("artifacts", {}))
     if bool(artifacts.get("save_config", True)):
         atomic_json(output_dir / "train_config_used.json", config)
+
+    representation_descriptor = {
+        "input_transform": input_transform,
+        "subsampling_factor": int(subsampling_factor),
+        "input_length": int(input_length),
+        "input_waveforms": prediction["input_waveforms"],
+        "prediction_target": prediction["target"],
+        "data_view": dict(data_view or {}),
+        "datasets": [
+            {
+                "fingerprint": dataset.manifest.get("fingerprint"),
+                "prediction_view": dataset.manifest.get("prediction_view", {}),
+                "input_component_lengths": dataset.manifest.get("input_component_lengths"),
+                "window_before_ns": dataset.manifest.get("window_before_ns"),
+                "window_after_ns": dataset.manifest.get("window_after_ns"),
+            }
+            for dataset in datasets
+        ],
+    }
+    config["representation_fingerprint"] = canonical_hash(representation_descriptor)
 
     context = TrainingContext(
         config=config,

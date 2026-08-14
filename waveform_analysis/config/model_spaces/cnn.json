@@ -1,0 +1,123 @@
+{
+  "id": "cnn",
+  "model_type": "cnn_regressor",
+
+  "base_train_config": {
+    "model": {
+      "type": "cnn_regressor",
+      "name": "cnn",
+
+      "channels": [
+        16,
+        32,
+        64
+      ],
+
+      "kernel_sizes": [
+        17,
+        9,
+        5
+      ],
+
+      "strides": [
+        4,
+        2,
+        2
+      ],
+
+      "dilations": [
+        1,
+        2,
+        4
+      ],
+
+      "activation": "silu",
+
+      "normalization": "batch",
+      "group_norm_groups": 4,
+
+      "conv_dropout": 0.0,
+
+      "adaptive_pool_length": 16,
+
+      "dense_units": [
+        32
+      ],
+
+      "dense_dropout": 0.0,
+
+      "max_abs_single_channel_output_ps": null,
+
+      "loss": {
+        "type": "mse"
+      }
+    },
+
+    "optimizer": {
+      "learning_rate": 0.001,
+      "weight_decay": 1e-5
+    },
+
+    "training": {
+      "device": "auto",
+      "seed": 20260813,
+
+      "epochs": 300,
+      "batch_size": 128,
+
+      "mixed_precision": true,
+      "gradient_clip_norm": 10.0,
+
+      "early_stopping_patience": 10,
+      "early_stopping_min_delta_ps": 0.01,
+
+      "normalization_chunk_size": 4096,
+
+      "num_workers": 0,
+      "pin_memory": false,
+
+      "fit_interval_epochs": 0,
+      "fit_train_during_training": false,
+      "fit_validation_during_training": false,
+
+      "selection_metric": "validation_rmse",
+
+      "random_pair_swap": true,
+      "baseline_guard_metric": null
+    },
+
+    "output": {
+      "train_dir": "resolved_by_study"
+    }
+  },
+
+  "search": {
+    "method": "grid",
+
+    "parameters": {
+      "model.dilations": {
+        "type": "categorical",
+        "values": [
+          [
+            1,
+            1,
+            2
+          ],
+          [
+            1,
+            2,
+            4
+          ]
+        ]
+      },
+
+      "model.adaptive_pool_length": {
+        "type": "categorical",
+        "values": [
+          8,
+          16
+        ]
+      }
+    }
+  }
+}

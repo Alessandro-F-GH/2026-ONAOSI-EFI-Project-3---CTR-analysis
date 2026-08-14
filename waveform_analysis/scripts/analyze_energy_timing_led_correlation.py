@@ -5,6 +5,11 @@ import copy
 import json
 import logging
 from pathlib import Path
+import sys
+
+PROJECT = Path(__file__).resolve().parents[1]
+if str(PROJECT) not in sys.path:
+    sys.path.insert(0, str(PROJECT))
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,6 +17,7 @@ import pandas as pd
 from scipy.stats import pearsonr, spearmanr
 
 from ml_pipeline.data import prepare_energy_cache
+from ml_pipeline.prepared_data import robust_led_zscore_mask
 from utils.photopeak import fit_photopeak, photopeak_mask
 
 
@@ -456,24 +462,18 @@ def main() -> None:
 )
 
     if bool(outlier_config.get("enabled", False)):
-        max_distance_ps = float(
-            outlier_config["max_distance_ps"]
-        )
-
-        timing_median_ps = float(
-            np.median(timing_delta_ps)
-        )
-
-        outlier_mask = (
-            np.abs(timing_delta_ps - timing_median_ps)
-            <= max_distance_ps
+        z_limit = float(outlier_config.get("zscore_limit", 6.0))
+        outlier_mask, timing_median_ps, timing_sigma_ps, scale_source = robust_led_zscore_mask(
+            timing_delta_ps, zscore_limit=z_limit
         )
 
         logger.info(
-            "Timing LED outlier rejection | median %.3f ps | "
-            "maximum distance %.3f ps | retained %d/%d",
+            "Timing LED robust-z rejection | median %.3f ps | sigma %.3f ps (%s) | "
+            "z <= %.2f | retained %d/%d",
             timing_median_ps,
-            max_distance_ps,
+            timing_sigma_ps,
+            scale_source,
+            z_limit,
             int(np.count_nonzero(outlier_mask)),
             int(outlier_mask.size),
         )
