@@ -19,17 +19,17 @@ Waveform-ML candidate evaluation uses:
 
 `development -> K-fold CV -> (K-1 folds -> fit + early-stop) -> untouched score fold`
 
-The score fold is never used for early stopping. Pooled out-of-fold predictions from all K score folds are fitted once with the global CTR fitter and used to rank a candidate. After selecting a candidate for each model family, the model is trained from scratch on the complete development population split into fit/early-stop with the same candidate fraction, then evaluated once on blind data.
+The score fold is never used for early stopping. Each score fold is evaluated independently with the model trained for that fold. CTR is computed directly from that fold's ordinary sample standard deviation, and candidate selection uses the arithmetic mean of the fold CTR values. Predictions from different fitted models are never concatenated to estimate CTR. After selecting a candidate for each model family, the model is trained from scratch on the complete development population split into fit/early-stop with the same candidate fraction, then evaluated once on blind data.
 
 Linear SVR has no early stopping and uses the complete K-1 fold training pool (or all development in the final fit).
 
-The multithreshold study uses the same random development/blind population and pooled OOF selection, but no early-stop split because SVR has no iterative stopping criterion.
+The multithreshold study uses the same random development/blind population and fold-wise CTR selection, but no early-stop split because SVR has no iterative stopping criterion.
 
 ## Permanent preprocessing
 
-Photopeak selection and optional gross LED mismatch rejection are dataset-preparation operations. They happen once per ROOT file, before any ML split. LED mismatch rejection uses a configurable robust z-score, `abs(delta_LED - median) / (1.4826 * MAD)`, with standard-deviation fallback only for a degenerate MAD. The default study enables it at `zscore_limit = 6`. The retained events are written as NumPy `.npy` arrays and loaded with memory mapping, so large waveform matrices do not need to be duplicated in RAM.
+Preprocessing uses two ROOT passes. The **first pass reads only the two raw energy channels** and computes the cheap quantities needed for event selection (baseline, amplitude, noise RMS and trigger). Trigger/noise cuts and photopeak fitting are applied here. No denoising, timing-channel processing, LED/CFD extraction or waveform windowing is performed for events that fail this first-stage selection. The transient waveform cache is therefore allocated only for the retained photopeak population.
 
-LED/CFD timestamps are extracted from the **raw** baseline-corrected signals and are frozen. The regular waveform-ML input variant is fixed independently by channel type through `preprocessing.input_variant_by_channel`; it is not a search dimension. For example, the default study uses denoised energy waveforms and raw timing waveforms. Only the requested denoised channel families are materialized. Multithreshold SVR always bypasses this policy and reads the canonical raw representation, with no denoising option.
+The **second pass performs the expensive timing preprocessing only on those retained events**. Channel preprocessing is applied before timing extraction, so LED/CFD, anchor and ML window all come from the same signal representation later consumed by ML (for the default study: denoised energy and raw timing). A dedicated raw extraction is retained only where needed by multithreshold SVR, which is always raw. Optional gross LED mismatch rejection is then applied once, before any ML split, using `abs(delta_LED - median) / (1.4826 * MAD)` with standard-deviation fallback only for degenerate MAD. The final `ml_prepared` dataset therefore contains only first-pass-selected photopeak events that also pass the configured timing-validity/mismatch requirements. Arrays are stored as NumPy `.npy` files and loaded with memory mapping.
 
 Prepared datasets contain no train/CV/blind split. Splits are deterministic in-memory random index arrays generated from the experiment seed.
 
@@ -61,36 +61,27 @@ Run only the multithreshold comparison using the same preparation/evaluation imp
 python scripts/ml_multithreshold.py --config config/experiments/ctr_ml_search.json
 ```
 
-## One global CTR fit
+## CTR estimation
 
-`fit` is configured once at experiment level and is used identically for LED, CFD, pooled OOF predictions, final ML predictions and multithreshold predictions.
+The experiment runner does not perform a Gaussian fit for model selection or final reporting. For every individual evaluation population it keeps all prepared events and computes the ordinary sample mean and sample standard deviation (`ddof=1`). CTR is the Gaussian-equivalent FWHM
 
-The fitter:
+`CTR = 2 * sqrt(2 * ln(2)) * sample_std`.
 
-1. uses **all prepared evaluation events** (no fit-time outlier rejection),
-2. estimates a robust preliminary width,
-3. sets histogram width proportional to preliminary FWHM,
-4. scans several bin-origin phases at fixed width,
-5. fits a bin-integrated Gaussian likelihood,
-6. selects the phase with minimum reduced Poisson deviance (the count-data analogue of chi-square),
-7. records phase-to-phase CTR spread as a stability diagnostic.
-
-If numerical optimization reports a line-search failure for an extremely poor/non-Gaussian candidate, the same all-event histogram is evaluated with the direct Gaussian mean/std estimate instead of aborting the entire experiment. This is a numerical fallback only; it never rejects events.
-
-If an event is invalid for a requested final method, evaluation fails rather than silently removing it. Dataset-level filtering must be fixed upstream.
+During cross-validation this calculation is done independently for each untouched score fold. The compact candidate result stores the arithmetic mean fold CTR and the standard deviation of the fold CTR values. Model outputs from different folds are never pooled. Final blind CTR is computed once from the single final model's blind residual distribution. Bias is not part of candidate selection.
 
 ## Compact outputs
 
 A normal study keeps only final-level information:
 
-- `results.csv` — numeric/coded rows for every pooled-OOF candidate and final blind LED/CFD/selected-model result;
-- `manifest.json` — codebooks, candidate parameter dictionaries, protocol and the single global fit configuration;
+- `results.csv` — numeric/coded rows for every CV candidate summary and final blind LED/CFD/selected-model result;
+- `results.csv` is updated atomically after every completed CV candidate and blind result; rerun with `--resume` after interruption to skip completed candidates;
+- `manifest.json` — codebooks, candidate parameter dictionaries, protocol and CTR-estimator definition;
 - `models/` — only final development-trained waveform models (no CV-fold checkpoints);
 - `ctr_vs_voltage.png` — final blind CTR versus voltage, where voltage is parsed from filenames such as `45V-400mV.root -> 45 V`;
 - `preprocessing_examples/` — one signal example figure per input file;
-- final-fit/XAI figures when enabled.
+- final-distribution/XAI figures when enabled.
 
-Temporary fold directories are removed immediately after OOF prediction. The data cache is memory-mapped and reused between candidates; only tiny fit-subset normalization statistics are cached across candidates that use the identical data view, while model objects are released between folds/candidates.
+Temporary fold directories are removed immediately after score-fold prediction. The data cache is memory-mapped and reused between candidates; only tiny fit-subset normalization statistics are cached across candidates that use the identical data view, while model objects are released between folds/candidates.
 
 ## Explainability
 
@@ -102,4 +93,14 @@ The retained waveform models expose a shared single-channel scorer. Final select
 python -m unittest discover -s tests -v
 ```
 
-The protocol tests cover partition isolation, channel-specific raw/denoised routing, all-event Gaussian fitting, filename voltage parsing and exact antisymmetry of the retained waveform models.
+The protocol tests cover partition isolation, channel-specific raw/denoised routing, classical all-event CTR statistics, filename voltage parsing and exact antisymmetry of the retained waveform models.
+
+## Waveform-ML target and resume contract
+
+Waveform models operate on native-sample windows translated to the nearest LED anchor. For each detector the alignment residual is `delta = t_LED - t_anchor`; the supervised target removes the pairwise residual still encoded as sub-sample phase:
+
+`g(s1)-g(s2) = Delta t_LED - Delta(delta) - true_TOF`.
+
+No anchor/alignment term is added analytically at inference; the learned output itself is the correction applied to the measured LED difference. Multithreshold SVR remains raw-only and keeps its own LED-relative threshold feature formulation.
+
+Study progress is persisted after every completed CV candidate. `--resume` reuses compatible completed candidates and completed files; an interrupted in-progress candidate is retrained from the beginning and no fold checkpoint is retained.

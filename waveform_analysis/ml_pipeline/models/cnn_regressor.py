@@ -282,7 +282,7 @@ def build(config: dict[str, Any], input_length: int) -> nn.Module:
 
 
 class _ZeroCorrectionModel(nn.Module):
-    apply_window_anchor_shift = False
+    apply_window_anchor_shift = True
 
     def forward(self, waveform_pair: torch.Tensor) -> torch.Tensor:
         return torch.zeros(

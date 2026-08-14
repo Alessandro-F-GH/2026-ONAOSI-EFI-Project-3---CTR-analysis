@@ -16,7 +16,7 @@ ModelTrainer = Callable[[TrainingContext], dict[str, Any]]
 ModelComplexityCounter = Callable[[dict[str, Any], int], int]
 # Optional non-Torch inference hook. It receives the loaded checkpoint payload,
 # the already-resolved/materialized dataset view and the evaluation config, and
-# returns the learned native-anchor correction in ps for dataset.evaluation.
+# returns the learned anchor-relative correction in ps for dataset.evaluation.
 CheckpointPredictor = Callable[[dict[str, Any], Any, dict[str, Any]], np.ndarray]
 
 

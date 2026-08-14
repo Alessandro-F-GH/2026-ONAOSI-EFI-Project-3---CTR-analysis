@@ -162,16 +162,17 @@ def predict_loader(
     led_delta = np.concatenate(led)
     cfd_delta = np.concatenate(cfd)
     true = np.concatenate(true_tof)
-    anchor_shift = np.concatenate(anchor_shifts)
-    apply_anchor_shift = bool(getattr(model, "apply_window_anchor_shift", True))
-    effective_anchor_shift = anchor_shift if apply_anchor_shift else np.zeros_like(anchor_shift)
-    total_led_correction = prediction + effective_anchor_shift
+    alignment_residual = np.concatenate(anchor_shifts)
+    # The target already removes the continuous-vs-discrete alignment residual.
+    # Never add an LED-derived anchor term analytically at inference: the model
+    # output itself is the complete learned correction applied to Delta t_LED.
+    total_led_correction = prediction
     corrected = led_delta - total_led_correction
     residual = corrected - true
     return {
         "prediction_ps": prediction,
         "total_led_correction_ps": total_led_correction,
-        "window_anchor_shift_ps": effective_anchor_shift,
+        "window_alignment_residual_ps": alignment_residual,
         "target_ps": target,
         "led_ps": led_delta,
         "cfd_ps": cfd_delta,
@@ -269,6 +270,7 @@ def checkpoint_context(
         "window_anchor_timestamps_saved",
         "correction_target_reference",
         "window_anchor_shift_factored",
+        "alignment_residual_removed_from_target",
         "factorization_anchor_source",
         "factorization_anchor_component",
     )
@@ -301,11 +303,12 @@ def checkpoint_context(
         "training_dataset_paths": [str(dataset.directory) for dataset in context.datasets],
         "input_cache_paths": [str(path) for path in context.input_cache_dirs],
         "target_definition": (
-            f"direct antisymmetric correction = {context.prediction_target} LED pair difference "
-            "- true TOF; model output is exactly g(s1)-g(s2) with no event-wise analytic "
-            "anchor correction or additive pair bias"
+            f"relative antisymmetric correction = {context.prediction_target} LED pair "
+            "difference - pairwise (continuous LED shift - discrete native shift) - true TOF; "
+            "model output is exactly g(s1)-g(s2), with no LED-derived anchor term added "
+            "analytically at inference and no additive learned pair bias"
         ),
-        "correction_output_reference": "interpolated_led",
+        "correction_output_reference": "relative_led_without_alignment_residual",
         "window_anchor_shift_factored": False,
         "training_strategy": training_strategy,
         "data_view": dict(context.data_view),

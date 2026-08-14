@@ -198,18 +198,52 @@ def window_anchor_shift_pair_ps(
     return (per_detector_shift_fs[..., 0] - per_detector_shift_fs[..., 1]) / 1000.0
 
 
+def window_anchor_delta_pair_ps(
+    dataset: PreparedDataset, indices: np.ndarray | int
+) -> np.ndarray:
+    """Return the native-window anchor pair difference in ps.
+
+    The ML waveform for detector ``j`` is translated by an integer number of
+    acquisition samples so that its native anchor sample becomes the local
+    origin.  Consequently the global pair offset
+
+        Delta t_anchor = t_anchor,1 - t_anchor,2
+
+    is no longer present in the waveform values and must be handled
+    analytically.  Legacy/synthetic datasets without anchor timestamps receive
+    zero so their previous behaviour is preserved.
+    """
+
+    selected = np.asarray(indices, dtype=np.int64)
+    if dataset.window_anchor_time_fs is None:
+        return np.zeros(selected.shape, dtype=np.float64)
+    anchor = np.asarray(dataset.window_anchor_time_fs[selected], dtype=np.float64)
+    return (anchor[..., 0] - anchor[..., 1]) / 1000.0
+
+
 def factored_correction_target_ps(
     dataset: PreparedDataset, indices: np.ndarray
 ) -> np.ndarray:
-    """Direct antisymmetric LED correction target in ps.
+    """Relative LED target with native-grid alignment error removed.
 
-    Every waveform model learns exactly
+    For detector ``j`` the continuous shift needed to place the interpolated
+    LED at the local origin is ``t_LED,j`` while the native-grid window can only
+    apply the discrete shift ``t_anchor,j``. Their residual mismatch is
 
-        c(s1, s2) = g(s1) - g(s2) = Delta t_LED - TOF_true.
+        delta_j = t_LED,j - t_anchor,j.
 
-    Native-grid anchor timestamps remain available for diagnostics and the
-    multithreshold feature construction, but no event-wise anchor term is added
-    analytically to the ML correction.
+    The ordered-pair mismatch still encoded as sub-sample phase in the shifted
+    waveforms is therefore
+
+        Delta delta = delta_1 - delta_2.
+
+    Remove that directly LED-derived alignment residual from the supervision
+    target:
+
+        g(s1) - g(s2) = Delta t_LED - Delta delta - TOF_true.
+
+    No anchor or alignment term is added analytically at inference. The model
+    output itself is the complete learned correction applied to Delta t_LED.
     """
 
     selected = np.asarray(indices, dtype=np.int64)
@@ -217,15 +251,16 @@ def factored_correction_target_ps(
         np.asarray(dataset.led_time_fs[selected, 0], dtype=np.float64)
         - np.asarray(dataset.led_time_fs[selected, 1], dtype=np.float64)
     ) / 1000.0
-    return led_delta_ps - float(dataset.true_tof_ps)
+    alignment_residual_ps = window_anchor_shift_pair_ps(dataset, selected)
+    return led_delta_ps - alignment_residual_ps - float(dataset.true_tof_ps)
 
 
 class CorrectionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
     """View of a post-selection prepared dataset.
 
-    The target is the full LED correction. No event-wise analytic anchor
-    correction is added at inference; the learned correction is exactly the
-    antisymmetric model output g(s1)-g(s2).
+    The target removes only the pairwise residual between the continuous LED
+    alignment that would be required and the discrete native-sample shift that
+    was actually applied. No LED-derived shift is added back at inference.
     """
 
     def __init__(
@@ -283,13 +318,13 @@ class CorrectionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
             int(self.dataset.cfd_time_fs[index, 0]) - int(self.dataset.cfd_time_fs[index, 1])
         ) / 1000.0
         true_tof_ps = self.dataset.true_tof_ps
-        anchor_shift_ps = 0.0
-        target_ps = led_delta_ps - true_tof_ps
+        alignment_residual_ps = float(window_anchor_shift_pair_ps(self.dataset, index))
+        target_ps = led_delta_ps - alignment_residual_ps - true_tof_ps
         return (
             torch.from_numpy(pair),
             torch.tensor(target_ps, dtype=torch.float32),
             torch.tensor(led_delta_ps, dtype=torch.float32),
             torch.tensor(cfd_delta_ps, dtype=torch.float32),
             torch.tensor(true_tof_ps, dtype=torch.float32),
-            torch.tensor(anchor_shift_ps, dtype=torch.float32),
+            torch.tensor(alignment_residual_ps, dtype=torch.float32),
         )

@@ -26,7 +26,7 @@
       "gradient_clip_norm": 10.0,
       "unit_early_stopping_patience": 10,
       "unit_early_stopping_min_delta_ps": 0.1,
-      "min_unit_improvement_ps": 0.05,
+      "min_unit_improvement_ps": 0.1,
       "min_relative_unit_improvement": 0.005,
       "normalization_chunk_size": 4096,
       "num_workers": 0,

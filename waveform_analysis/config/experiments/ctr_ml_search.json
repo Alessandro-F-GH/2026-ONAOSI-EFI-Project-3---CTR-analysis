@@ -28,12 +28,14 @@
     }
   },
   "models": [
+
+    "linear_svr",
     
     "cnn",
 
-    "constructive_mlp",
+    "constructive_mlp"
     
-    "linear_svr"
+    
   ],
   "model_spaces_dir": "config/model_spaces",
   "channel_modes": [
@@ -42,11 +44,6 @@
     "timing_to_timing"
   ],
   "windows_ns": [
-    {
-      "id": "m1_p1",
-      "start_ns": -1.0,
-      "end_ns": 1.0
-    },
     {
       "id": "m2_p2",
       "start_ns": -2.0,
@@ -127,11 +124,6 @@
     "early_stop_fraction": 0.15,
     "seed": 20260813
   },
-  "fit": {
-  "min_events": 100,
-  "histogram_bin_ps": 10.0,
-  "bin_phase_count": 10
-  },
   "multithreshold": {
     "enabled": true,
     "window_id": "m4_p40",
@@ -161,7 +153,6 @@
       120
     ],
     "gamma_values": [
-      "scale",
       "auto"
     ]
   },
