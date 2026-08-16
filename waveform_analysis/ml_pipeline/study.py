@@ -11,7 +11,7 @@ import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,11 +20,8 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
-from utils.fit import FitResult
-
 from .common import atomic_json, canonical_hash
 from .dataset import PreparedDataset
-from .metrics import fit_times_ps
 from .models import validate_model, validate_model_training
 from .prediction import prediction_window_dataset_view
 from .prepared_data import (
@@ -43,6 +40,7 @@ _STAGE_BLIND = 1
 _MODEL_LED = "led"
 _MODEL_CFD = "cfd"
 _MODEL_MULTITHRESHOLD = "multithreshold_svr"
+_TARGET_PROTOCOL_VERSION = "channel_preprocessing_led_consistent_v3"
 
 
 def _seed_for(base: int, *parts: Any) -> int:
@@ -112,42 +110,166 @@ def _voltage_from_name(name: str, pattern: str) -> float:
         return float(match.group(1))
 
 
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def _write_csv(path, rows, *, logger=None, retries=8, retry_delay_s=0.5):
+    import csv
+    import os
+    import time
+    from pathlib import Path
+
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = list(rows)
     if not rows:
-        path.write_text("", encoding="utf-8")
         return
-    fields: list[str] = []
-    for row in rows:
-        for key in row:
-            if key not in fields:
-                fields.append(key)
+
     temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
+
+    fieldnames = list(rows[0].keys())
+
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    os.replace(temporary, path)
+
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    for attempt in range(retries):
+        try:
+            os.replace(temporary, path)
+            return
+
+        except PermissionError:
+            if attempt + 1 < retries:
+                time.sleep(retry_delay_s)
+                continue
+
+    # Do NOT kill a long experiment because the user has results.csv open.
+    if logger is not None:
+        logger.warning(
+            "Could not update %s because it is locked by another process. "
+            "Keeping the pending update in %s; training will continue. "
+            "Close the CSV so the next persistence point can update it.",
+            path,
+            temporary,
+        )
 
 
-def _fit_row(values_ps: np.ndarray, *, method: str, fit_config: dict[str, Any]) -> tuple[FitResult, dict[str, Any]]:
+_RESULT_INT_FIELDS = {
+    "stage", "file_id", "mode_id", "model_id", "candidate_id", "window_id",
+    "variant_id", "subsampling", "selected", "n",
+}
+_RESULT_FLOAT_FIELDS = {
+    "coverage", "voltage_V", "mean_ps", "std_ps", "ctr_ps",
+    "ctr_fold_std_ps", "rmse_ps", "rmse_fold_std_ps",
+}
+
+
+def _read_results_csv(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file() or path.stat().st_size == 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        for raw in csv.DictReader(stream):
+            row: dict[str, Any] = {}
+            for key, value in raw.items():
+                if value is None or value == "":
+                    continue
+                if key in _RESULT_INT_FIELDS:
+                    row[key] = int(float(value))
+                elif key in _RESULT_FLOAT_FIELDS:
+                    row[key] = float(value)
+                else:
+                    row[key] = value
+            rows.append(row)
+    return rows
+
+
+def _result_key(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    return (
+        int(row["stage"]), int(row["file_id"]), int(row["mode_id"]),
+        int(row["model_id"]), int(row["candidate_id"]),
+    )
+
+
+def _find_result_row(
+    rows: list[dict[str, Any]], *, stage: int, file_id: int, mode_id: int,
+    model_id: int, candidate_id: int,
+) -> dict[str, Any] | None:
+    key = (int(stage), int(file_id), int(mode_id), int(model_id), int(candidate_id))
+    for row in rows:
+        if _result_key(row) == key:
+            return row
+    return None
+
+
+def _upsert_result_row(rows: list[dict[str, Any]], new_row: dict[str, Any]) -> None:
+    key = _result_key(new_row)
+    for index, row in enumerate(rows):
+        if _result_key(row) == key:
+            rows[index] = new_row
+            return
+    rows.append(new_row)
+
+
+def _candidate_id_for_key(candidate_ids: dict[str, int], key: str) -> int:
+    if key in candidate_ids:
+        return int(candidate_ids[key])
+    next_id = max((int(value) for value in candidate_ids.values()), default=-1) + 1
+    candidate_ids[key] = next_id
+    return next_id
+
+
+_FWHM_PER_SIGMA = 2.0 * math.sqrt(2.0 * math.log(2.0))
+
+
+def _distribution_stats(values_ps: np.ndarray, *, method: str) -> dict[str, Any]:
+    """Classical all-event timing statistics for one fitted model/output population.
+
+    No Gaussian fit and no event rejection are performed here.  CTR is reported
+    as the Gaussian-equivalent FWHM corresponding to the ordinary sample
+    standard deviation: ``CTR = 2*sqrt(2 ln 2) * s``.
+    """
     values = np.asarray(values_ps, dtype=np.float64).reshape(-1)
-    if values.size == 0 or np.any(~np.isfinite(values)):
-        raise RuntimeError(f"{method}: final evaluation requires one finite value for every event")
-    fit = fit_times_ps(values, method, fit_config)
-    if not fit.success:
-        raise RuntimeError(f"{method}: Gaussian fit failed: {fit.message}")
-    return fit, {
+    if values.size < 2 or np.any(~np.isfinite(values)):
+        raise RuntimeError(f"{method}: evaluation requires at least two finite values and keeps every event")
+    mean = float(np.mean(values))
+    std = float(np.std(values, ddof=1))
+    return {
         "n": int(values.size),
-        "ctr_ps": float(fit.ctr_ps),
-        "ctr_err_ps": float(fit.ctr_error_ps),
-        "mean_ps": float(fit.mean_ps),
+        "mean_ps": mean,
+        "std_ps": std,
+        "ctr_ps": float(_FWHM_PER_SIGMA * std),
         "rmse_ps": float(np.sqrt(np.mean(values * values))),
-        "bias_ps": float(np.mean(values)),
-        "dev_ndof": float(fit.chi2_ndof),
-        "bin_ps": float(fit.bin_width_ps),
-        "phase_ps": float(fit.bin_phase_ps),
-        "phase_ctr_std_ps": float(fit.phase_ctr_std_ps),
+    }
+
+
+def _aggregate_fold_stats(fold_metrics: list[dict[str, Any]], *, method: str) -> dict[str, Any]:
+    """Summarize independent score-fold metrics without pooling model outputs.
+
+    Each score fold is evaluated on predictions from its own fitted model.  We
+    only take arithmetic summaries of the fold-level statistics; predictions
+    from different models are never concatenated for CTR estimation.
+    """
+    if not fold_metrics:
+        raise RuntimeError(f"{method}: no CV score-fold metrics were produced")
+
+    def _mean(key: str) -> float:
+        return float(np.mean([float(row[key]) for row in fold_metrics]))
+
+    def _std(key: str) -> float:
+        values = np.asarray([float(row[key]) for row in fold_metrics], dtype=np.float64)
+        return float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+
+    return {
+        "n": int(sum(int(row["n"]) for row in fold_metrics)),
+        "mean_ps": _mean("mean_ps"),
+        "std_ps": _mean("std_ps"),
+        "ctr_ps": _mean("ctr_ps"),
+        "ctr_fold_std_ps": _std("ctr_ps"),
+        "rmse_ps": _mean("rmse_ps"),
+        "rmse_fold_std_ps": _std("rmse_ps"),
     }
 
 
@@ -189,7 +311,6 @@ def _candidate_training_config(
     final: bool,
 ) -> dict[str, Any]:
     cfg = _apply_overrides(space["base_train_config"], overrides)
-    cfg["fit"] = copy.deepcopy(study["fit"])
     input_waveforms, target = CHANNEL_MODES[mode]
     cfg["prediction"] = {"input_waveforms": input_waveforms, "target": target}
     cfg["input_transform"] = "none"
@@ -200,8 +321,8 @@ def _candidate_training_config(
     training["seed"] = int(seed)
     training["data_seed"] = int(seed)
     training["initialization_seed"] = int(seed)
-    # Early stopping should be stable and cheap; pooled OOF CTR, not the early-
-    # stop metric, performs scientific candidate selection.
+    # Early stopping remains an optimization criterion only. Scientific model
+    # selection is performed later from independent score-fold CTR estimates.
     if cfg["model"]["type"] in {"cnn_regressor", "constructive_mlp_encoder"}:
         training["selection_metric"] = "validation_rmse"
         training["fit_interval_epochs"] = 0
@@ -376,7 +497,7 @@ def _waveform_oof_candidate(
     work_root: Path,
     logger: Any,
     normalization_cache: dict[str, Normalization],
-) -> tuple[np.ndarray, FitResult, dict[str, Any]]:
+) -> dict[str, Any]:
     input_waveforms, target = CHANNEL_MODES[mode]
     source = input_channel_variant_dataset_view(dataset, input_waveforms, variant)
     view = prediction_window_dataset_view(
@@ -386,7 +507,7 @@ def _waveform_oof_candidate(
         before_ns=float(window["before_ns"]),
         after_ns=float(window["after_ns"]),
     )
-    oof = np.full(dataset.event_id.size, np.nan, dtype=np.float64)
+    fold_metrics: list[dict[str, Any]] = []
     base_seed = int(study["cross_validation"]["seed"])
     for fold_index, (train_pool, score_idx) in enumerate(folds):
         candidate_seed = _seed_for(base_seed, file_id, mode, window["id"], variant, subsampling, space["id"], candidate_id, fold_index)
@@ -394,7 +515,7 @@ def _waveform_oof_candidate(
             study, space, overrides, mode=mode, subsampling=subsampling,
             train_dir=work_root / f"f{fold_index}", seed=candidate_seed, final=False,
         )
-        if preview_cfg["model"]["type"] == "linear_svr":
+        if preview_cfg["model"]["type"] in {"linear_svr"}:
             fit_idx, early_idx = np.asarray(train_pool), np.asarray(train_pool)
         else:
             fraction = _early_fraction(study, preview_cfg)
@@ -416,14 +537,15 @@ def _waveform_oof_candidate(
             data_view={"stage": "oof", "fold": fold_index, "candidate_id": candidate_id},
             normalization_override=cached_normalization,
         )
-        oof[score_idx] = _predict_indices(model, normalization, preview_cfg, fold_view, score_idx)
+        fold_values = _predict_indices(model, normalization, preview_cfg, fold_view, score_idx)
+        fold_metrics.append(
+            _distribution_stats(
+                fold_values,
+                method=f"CV {space['id']} fold {fold_index + 1}",
+            )
+        )
         _cleanup_training(model, Path(preview_cfg["output"]["train_dir"]))
-    values = oof[development]
-    if np.any(~np.isfinite(values)):
-        missing = int(np.count_nonzero(~np.isfinite(values)))
-        raise RuntimeError(f"Candidate {candidate_id} has {missing} missing OOF predictions")
-    fit, metrics = _fit_row(values, method=f"OOF {space['id']}", fit_config=study["fit"])
-    return values, fit, metrics
+    return _aggregate_fold_stats(fold_metrics, method=f"CV {space['id']}")
 
 
 
@@ -502,7 +624,7 @@ def _waveform_final(
     checkpoint_path: Path,
     logger: Any,
     normalization_cache: dict[str, Normalization],
-) -> tuple[np.ndarray, FitResult, dict[str, Any], dict[str, Any], tuple[np.ndarray, np.ndarray] | None]:
+) -> tuple[np.ndarray, dict[str, Any], dict[str, Any], tuple[np.ndarray, np.ndarray] | None]:
     input_waveforms, target = CHANNEL_MODES[mode]
     source = input_channel_variant_dataset_view(dataset, input_waveforms, variant)
     view = prediction_window_dataset_view(
@@ -514,7 +636,7 @@ def _waveform_final(
         study, space, overrides, mode=mode, subsampling=subsampling,
         train_dir=work_dir, seed=seed, final=True,
     )
-    if cfg["model"]["type"] == "linear_svr":
+    if cfg["model"]["type"] in {"linear_svr"}:
         fit_idx, early_idx = development, development
     else:
         fit_idx, early_idx = _fit_early_split(
@@ -532,7 +654,7 @@ def _waveform_final(
         normalization_override=cached_normalization,
     )
     residual = _predict_indices(model, normalization, cfg, final_view, blind)
-    fit, metrics = _fit_row(residual, method=f"Blind {space['id']}", fit_config=study["fit"])
+    metrics = _distribution_stats(residual, method=f"Blind {space['id']}")
     # XAI can be computed before the model is released; caller receives only compact metadata.
     final_meta = {
         "best_epoch": int(summary.get("best_epoch", 0)),
@@ -541,14 +663,18 @@ def _waveform_final(
     }
     xai_profile = None
     xai_cfg = study.get("reporting", {}).get("xai", {}) or {}
-    if bool(xai_cfg.get("enabled", True)):
+    if (
+        bool(xai_cfg.get("enabled", True))
+    ):
         xai_profile = _integrated_gradient_profile(
             model, normalization, cfg, final_view, blind,
             max_events=int(xai_cfg.get("max_events", 512)),
             steps=int(xai_cfg.get("integrated_gradient_steps", 16)),
         )
+    elif bool(xai_cfg.get("enabled", True)):
+        logger.info("Integrated gradients skipped | model=multirocket_hydra")
     _cleanup_training(model, work_dir, keep_best=checkpoint_path)
-    return residual, fit, metrics, final_meta, xai_profile
+    return residual, metrics, final_meta, xai_profile
 
 
 def _threshold_crossing_matrix(view: PreparedDataset, thresholds_mV: np.ndarray, *, chunk_size: int = 2048) -> np.ndarray:
@@ -632,6 +758,7 @@ def _multithreshold_oof_select(
     rows: list[dict[str, Any]],
     voltage: float,
     logger: Any,
+    persist_progress: Callable[[], None] | None = None,
 ) -> dict[str, Any] | None:
     """Select multithreshold-SVR settings using development OOF predictions only."""
     cfg = study["multithreshold"]
@@ -650,7 +777,7 @@ def _multithreshold_oof_select(
     features_all = _threshold_crossing_matrix(
         view, thresholds, chunk_size=int(cfg.get("chunk_size", 2048))
     )
-    led_ps, _ = _target_deltas(dataset, mode, np.arange(dataset.event_id.size))
+    led_ps, _ = _target_deltas(raw, mode, np.arange(dataset.event_id.size))
     target_correction = led_ps - float(dataset.true_tof_ps)
 
     best: tuple[float, dict[str, Any], int] | None = None
@@ -659,7 +786,7 @@ def _multithreshold_oof_select(
             "family": _MODEL_MULTITHRESHOLD, "mode": mode,
             "window": window["id"], **params,
         })
-        candidate_id = candidate_ids.setdefault(key, len(candidate_ids))
+        candidate_id = _candidate_id_for_key(candidate_ids, key)
         candidate_manifest[str(candidate_id)] = {
             "family": _MODEL_MULTITHRESHOLD,
             "mode": mode,
@@ -674,33 +801,47 @@ def _multithreshold_oof_select(
         if not np.all(valid[development]):
             continue
 
-        oof = np.full(dataset.event_id.size, np.nan, dtype=np.float64)
-        for train_pool, score_idx in folds:
-            estimator = make_pipeline(
-                StandardScaler(),
-                SVR(
-                    kernel=params["kernel"], C=params["C"],
-                    epsilon=params["epsilon_ps"], gamma=params["gamma"],
-                ),
-            )
-            estimator.fit(features_all[np.ix_(train_pool, cols)], target_correction[train_pool])
-            correction = estimator.predict(features_all[np.ix_(score_idx, cols)])
-            oof[score_idx] = led_ps[score_idx] - correction - float(dataset.true_tof_ps)
-        values = oof[development]
-        if np.any(~np.isfinite(values)):
-            raise RuntimeError("Multithreshold OOF prediction is incomplete")
-        _fit, metrics = _fit_row(
-            values, method="OOF multithreshold SVR", fit_config=study["fit"]
+        existing = _find_result_row(
+            rows, stage=_STAGE_OOF, file_id=file_id, mode_id=mode_id,
+            model_id=model_id, candidate_id=candidate_id,
         )
-        rows.append({
-            "stage": _STAGE_OOF, "file_id": file_id, "mode_id": mode_id,
-            "model_id": model_id, "candidate_id": candidate_id,
-            "voltage_V": voltage, "window_id": window_id,
-            "variant_id": 0, "subsampling": 1, "selected": 0,
-            "coverage": 1.0, **metrics,
-        })
-        if best is None or metrics["ctr_ps"] < best[0]:
-            best = (metrics["ctr_ps"], params, candidate_id)
+        if existing is not None:
+            metrics = existing
+            logger.info(
+                "CV resume | mode=%s | model=multithreshold_svr | candidate=%d | CTR=%.3f ps",
+                mode, candidate_id, float(metrics["ctr_ps"]),
+            )
+        else:
+            fold_metrics: list[dict[str, Any]] = []
+            for fold_index, (train_pool, score_idx) in enumerate(folds):
+                estimator = make_pipeline(
+                    StandardScaler(),
+                    SVR(
+                        kernel=params["kernel"], C=params["C"],
+                        epsilon=params["epsilon_ps"], gamma=params["gamma"],
+                    ),
+                )
+                estimator.fit(features_all[np.ix_(train_pool, cols)], target_correction[train_pool])
+                correction = estimator.predict(features_all[np.ix_(score_idx, cols)])
+                fold_values = led_ps[score_idx] - correction - float(dataset.true_tof_ps)
+                fold_metrics.append(
+                    _distribution_stats(
+                        fold_values,
+                        method=f"CV multithreshold SVR fold {fold_index + 1}",
+                    )
+                )
+            metrics = _aggregate_fold_stats(fold_metrics, method="CV multithreshold SVR")
+            _upsert_result_row(rows, {
+                "stage": _STAGE_OOF, "file_id": file_id, "mode_id": mode_id,
+                "model_id": model_id, "candidate_id": candidate_id,
+                "voltage_V": voltage, "window_id": window_id,
+                "variant_id": 0, "subsampling": 1, "selected": 0,
+                "coverage": 1.0, **metrics,
+            })
+            if persist_progress is not None:
+                persist_progress()
+        if best is None or float(metrics["ctr_ps"]) < best[0]:
+            best = (float(metrics["ctr_ps"]), params, candidate_id)
 
     if best is None:
         logger.warning(
@@ -712,13 +853,14 @@ def _multithreshold_oof_select(
     _, params, selected_candidate = best
     for row in rows:
         if (
-            row["stage"] == _STAGE_OOF
-            and row["file_id"] == file_id
-            and row["mode_id"] == mode_id
-            and row["model_id"] == model_id
-            and row["candidate_id"] == selected_candidate
+            int(row["stage"]) == _STAGE_OOF
+            and int(row["file_id"]) == file_id
+            and int(row["mode_id"]) == mode_id
+            and int(row["model_id"]) == model_id
         ):
-            row["selected"] = 1
+            row["selected"] = int(int(row["candidate_id"]) == selected_candidate)
+    if persist_progress is not None:
+        persist_progress()
     return {
         "params": params,
         "candidate_id": selected_candidate,
@@ -735,7 +877,7 @@ def _multithreshold_final(
     development: np.ndarray,
     blind: np.ndarray,
     selected: dict[str, Any],
-) -> tuple[np.ndarray, FitResult, dict[str, Any]]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     """Fit the selected multithreshold SVR on development and open blind once."""
     params = selected["params"]
     cols = params["threshold_indices"]
@@ -760,10 +902,8 @@ def _multithreshold_final(
     )
     correction = estimator.predict(features_all[np.ix_(blind, cols)])
     residual = selected["led_ps"][blind] - correction - float(dataset.true_tof_ps)
-    fit, metrics = _fit_row(
-        residual, method="Blind multithreshold SVR", fit_config=study["fit"]
-    )
-    return residual, fit, metrics
+    metrics = _distribution_stats(residual, method="Blind multithreshold SVR")
+    return residual, metrics
 
 def _plot_final_file(
     destination: Path,
@@ -773,15 +913,73 @@ def _plot_final_file(
 ) -> None:
     if not panels:
         return
+
+    def _robust_bounds(values: np.ndarray) -> tuple[float, float]:
+        """Return a wide, outlier-resistant display interval for one method.
+
+        This is reporting-only: it never changes evaluation arrays or metrics.
+        Eight robust standard deviations keep the complete central distribution
+        visible while preventing isolated catastrophic residuals from setting the
+        plot scale.
+        """
+        center = float(np.median(values))
+        mad = float(np.median(np.abs(values - center)))
+        scale = 1.4826 * mad
+        if not np.isfinite(scale) or scale <= 0.0:
+            q25, q75 = np.percentile(values, [25.0, 75.0])
+            scale = float((q75 - q25) / 1.349)
+        if not np.isfinite(scale) or scale <= 0.0:
+            scale = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+        if not np.isfinite(scale) or scale <= 0.0:
+            scale = 1.0
+        return center - 8.0 * scale, center + 8.0 * scale
+
     modes = list(panels)
     fig, axes = plt.subplots(len(modes), 1, figsize=(10, 3.6 * len(modes)), squeeze=False)
     for ax, mode in zip(axes[:, 0], modes):
         methods = panels[mode]
-        for label, values in methods.items():
-            values = np.asarray(values, dtype=np.float64)
-            # Reporting follows the evaluation invariant: display every prepared
-            # blind event rather than clipping tails by quantiles.
-            ax.hist(values, bins=80, histtype="step", density=True, label=label)
+        prepared: dict[str, np.ndarray] = {}
+        method_bounds: list[tuple[float, float]] = []
+        for label, raw_values in methods.items():
+            values = np.asarray(raw_values, dtype=np.float64).reshape(-1)
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                continue
+            prepared[label] = values
+            method_bounds.append(_robust_bounds(values))
+
+        if not prepared:
+            ax.set_visible(False)
+            continue
+
+        # One common display range per mode, wide enough to contain the robust
+        # central region of every method.  Only gross tails outside this union
+        # are hidden from the visualization.
+        x_min = min(bounds[0] for bounds in method_bounds)
+        x_max = max(bounds[1] for bounds in method_bounds)
+        span = x_max - x_min
+        if not np.isfinite(span) or span <= 0.0:
+            span = 2.0
+            midpoint = 0.5 * (x_min + x_max)
+            x_min, x_max = midpoint - 1.0, midpoint + 1.0
+        padding = 0.05 * span
+        x_min -= padding
+        x_max += padding
+        bins = np.linspace(x_min, x_max, 81)
+
+        for label, values in prepared.items():
+            visible = (values >= x_min) & (values <= x_max)
+            outside_count = int(values.size - np.count_nonzero(visible))
+            if np.any(visible):
+                ax.hist(
+                    values[visible],
+                    bins=bins,
+                    histtype="step",
+                    density=True,
+                    label=f"{label} (outside={outside_count})",
+                )
+
+        ax.set_xlim(x_min, x_max)
         ax.set_title(mode)
         ax.set_xlabel("Residual timing error [ps]")
         ax.set_ylabel("Density")
@@ -853,10 +1051,9 @@ def _plot_ctr_vs_voltage(
         subset = [r for r in blind if int(r["mode_id"]) == mode_id]
         for model_id in sorted({int(r["model_id"]) for r in subset}):
             points = sorted((r for r in subset if int(r["model_id"]) == model_id), key=lambda r: float(r["voltage_V"]))
-            ax.errorbar(
+            ax.plot(
                 [float(r["voltage_V"]) for r in points],
                 [float(r["ctr_ps"]) for r in points],
-                yerr=[float(r["ctr_err_ps"]) for r in points],
                 marker="o", label=reverse_model.get(model_id, str(model_id)),
             )
         ax.set_title(reverse_mode.get(mode_id, str(mode_id)))
@@ -882,16 +1079,6 @@ def run_study(
     output.mkdir(parents=True, exist_ok=True)
     results_path = output / "results.csv"
     manifest_path = output / "manifest.json"
-    if resume and results_path.is_file() and manifest_path.is_file():
-        with manifest_path.open("r", encoding="utf-8") as stream:
-            manifest = json.load(stream)
-        if manifest.get("config_hash") != config.get("_config_hash"):
-            raise RuntimeError(
-                "Existing compact results were produced by a different configuration. "
-                "Use --restart or a different experiment.output_dir."
-            )
-        logger.info("Complete compact result set already exists; reuse %s", output)
-        return {"output_dir": str(output), "row_count": int(manifest.get("row_count", 0)), "resumed": True}
 
     root_files = discover_root_files(config)
     logger.info("Study %s | files=%d | random CV only", config["experiment"]["name"], len(root_files))
@@ -904,7 +1091,9 @@ def run_study(
             "prepared_dir": config["preprocessing"]["prepared_dir"],
         }
     if not root_files:
-        raise FileNotFoundError(f"No ROOT files match {config['data']['root_glob']} in {config['data']['root_folder']}")
+        raise FileNotFoundError(
+            f"No ROOT files match {config['data']['root_glob']} in {config['data']['root_folder']}"
+        )
 
     codebooks = {
         "file": {path.name: i for i, path in enumerate(root_files)},
@@ -914,8 +1103,6 @@ def run_study(
             **{space["id"]: i + 2 for i, space in enumerate(config["_model_spaces"])},
         },
         "window": {w["id"]: i for i, w in enumerate(config["windows_ns"])},
-        # Keep raw=0 permanently because multithreshold is hard-wired to raw.
-        # Denoised is present only when at least one ML channel requests it.
         "variant": {
             name: i
             for i, name in enumerate(
@@ -930,18 +1117,141 @@ def run_study(
     candidate_ids: dict[str, int] = {}
     candidate_manifest: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
-    normalization_cache: dict[str, Normalization] = {}
     final_metadata: dict[str, Any] = {}
+    completed_files: set[int] = set()
+    prepared_fingerprints: dict[str, str] = {}
+
+    if resume:
+        if not manifest_path.is_file():
+            if results_path.is_file():
+                raise RuntimeError(
+                    "Cannot safely resume: results.csv exists but manifest.json is missing. "
+                    "Use --restart."
+                )
+        else:
+            with manifest_path.open("r", encoding="utf-8") as stream:
+                previous = json.load(stream)
+            if previous.get("config_hash") != config.get("_config_hash"):
+                raise RuntimeError(
+                    "Existing results were produced by a different configuration. "
+                    "Use --restart or a different experiment.output_dir."
+                )
+            if previous.get("target_protocol_version") != _TARGET_PROTOCOL_VERSION:
+                raise RuntimeError(
+                    "Existing results use an older ML target definition. The native-alignment "
+                    "target changed; restart this study once with --restart."
+                )
+            if previous.get("codebooks") != codebooks:
+                raise RuntimeError(
+                    "Input files/modes/models differ from the persisted run. Use --restart."
+                )
+            if previous.get("status") == "complete" and results_path.is_file():
+                logger.info("Complete compact result set already exists; reuse %s", output)
+                return {
+                    "output_dir": str(output),
+                    "row_count": int(previous.get("row_count", 0)),
+                    "resumed": True,
+                }
+            rows = _read_results_csv(results_path)
+            candidate_manifest = dict(previous.get("candidate_parameters", {}))
+            candidate_ids = {
+                str(key): int(value)
+                for key, value in previous.get("candidate_key_to_id", {}).items()
+            }
+            final_metadata = dict(previous.get("final_models", {}))
+            completed_files = {int(value) for value in previous.get("completed_files", [])}
+            prepared_fingerprints = {
+                str(key): str(value)
+                for key, value in previous.get("prepared_fingerprints", {}).items()
+            }
+            logger.info(
+                "Resuming partial study | completed_rows=%d | completed_files=%d",
+                len(rows), len(completed_files),
+            )
+    elif results_path.is_file() or manifest_path.is_file():
+        raise RuntimeError(
+            "An existing study state is present. Use --resume to continue it or --restart "
+            "to discard it."
+        )
+
+    normalization_cache: dict[str, Normalization] = {}
     dpi = int(config["reporting"]["dpi"])
     base_seed = int(config["cross_validation"]["seed"])
     work_root = output / ".work"
     checkpoint_root = output / "models"
     signal_plot_root = output / "preprocessing_examples"
 
+    def _progress_manifest(status: str) -> dict[str, Any]:
+        return {
+            "schema_version": 5,
+            "status": status,
+            "target_protocol_version": _TARGET_PROTOCOL_VERSION,
+            "experiment": config["experiment"]["name"],
+            "config_hash": config["_config_hash"],
+            "config_path": config["_config_path"],
+            "prepared_dir": config["preprocessing"]["prepared_dir"],
+            "prepared_fingerprints": dict(prepared_fingerprints),
+            "row_count": len(rows),
+            "completed_files": sorted(completed_files),
+            "codebooks": codebooks,
+            "candidate_key_to_id": dict(candidate_ids),
+            "candidate_parameters": candidate_manifest,
+            "final_models": final_metadata,
+            "ctr_estimator": {
+                "distribution": "ordinary sample mean and sample standard deviation (ddof=1), all events",
+                "ctr_definition": "2*sqrt(2*ln(2))*sample_std",
+                "cv_selection": "lowest arithmetic mean of independent score-fold CTR values",
+            },
+            "target_definition": {
+                "waveform_ml": (
+                    "g(s1)-g(s2) = Delta t_LED - Delta(shift_needed - shift_applied) - true TOF; "
+                    "the LED and native anchor are extracted after the configured channel preprocessing "
+                    "from the same signal representation consumed by ML; no LED-derived anchor/alignment "
+                    "term is added analytically at inference"
+                ),
+                "multithreshold": "unchanged raw threshold-crossing SVR target",
+            },
+            "protocol": {
+                "split": "single deterministic random development/blind split per file",
+                "cv": "random K-fold on development; each score fold is evaluated separately and model outputs are never pooled",
+                "early_stop": "neural fit set + disjoint early-stop subset carved only from K-1 training folds",
+                "final": "all candidate selections are frozen before blind is opened; selected configurations are retrained from scratch on development fit/early-stop splits and blind is evaluated once",
+                "evaluation_rejection": "none; every prepared event in the requested split is included",
+                "multithreshold_denoising": False,
+                "resume": "candidate summaries are persisted atomically; an interrupted candidate is retrained, completed candidates are skipped",
+            },
+            "result_columns": {
+                "stage": {"0": "cv_candidate_summary", "1": "blind"},
+                "candidate_id": "parameters stored once in candidate_parameters; -1 for fixed LED/CFD",
+            },
+        }
+
+    def persist_progress(status: str = "in_progress") -> None:
+        _write_csv(results_path, rows)
+        atomic_json(manifest_path, _progress_manifest(status))
+
+    # Create progress files before the first expensive candidate so the run is
+    # resumable even if it is interrupted very early.
+    persist_progress("in_progress")
+
     for root_file in root_files:
         file_id = codebooks["file"][root_file.name]
         logger.info("File %d/%d | %s", file_id + 1, len(root_files), root_file.name)
         dataset = prepare_file_dataset(config, root_file, rebuild=rebuild_preprocessing, logger=logger)
+        prepared_fingerprint = str(
+            dataset.manifest.get("request_fingerprint", dataset.manifest.get("fingerprint", ""))
+        )
+        previous_fingerprint = prepared_fingerprints.get(str(file_id))
+        if previous_fingerprint and previous_fingerprint != prepared_fingerprint:
+            raise RuntimeError(
+                f"Prepared dataset changed for {root_file.name} while resuming. "
+                "Use --restart so CV results are not mixed across datasets."
+            )
+        prepared_fingerprints[str(file_id)] = prepared_fingerprint
+        persist_progress("in_progress")
+        if file_id in completed_files:
+            logger.info("File already complete; skipping | %s", root_file.name)
+            continue
         plot_prepared_signal_examples(dataset, signal_plot_root / f"{root_file.stem}.png", dpi=dpi)
         development, blind = _random_dev_blind(
             int(dataset.event_id.size),
@@ -988,7 +1298,7 @@ def run_study(
                         "variant": variant, "subsampling": int(subsampling), "overrides": overrides,
                     }
                     key = canonical_hash(descriptor)
-                    candidate_id = candidate_ids.setdefault(key, len(candidate_ids))
+                    candidate_id = _candidate_id_for_key(candidate_ids, key)
                     candidate_manifest[str(candidate_id)] = descriptor
                     candidate_work = work_root / f"f{file_id}_m{mode_id}_model{model_id}_c{candidate_id}"
                     logger.info(
@@ -997,30 +1307,42 @@ def run_study(
                         -float(window["before_ns"]), float(window["after_ns"]),
                         CHANNEL_MODES[mode][0], variant, int(subsampling),
                     )
-                    try:
-                        _values, _fit, metrics = _waveform_oof_candidate(
-                            config, dataset, development, folds,
-                            file_id=file_id, mode=mode, window=window, variant=variant,
-                            subsampling=int(subsampling), space=space, overrides=overrides,
-                            candidate_id=candidate_id, work_root=candidate_work, logger=logger,
-                            normalization_cache=normalization_cache,
-                        )
-                    finally:
-                        shutil.rmtree(candidate_work, ignore_errors=True)
-                    rows.append({
-                        "stage": _STAGE_OOF, "file_id": file_id, "mode_id": mode_id,
-                        "model_id": model_id, "candidate_id": candidate_id,
-                        "window_id": codebooks["window"][window["id"]],
-                        "variant_id": codebooks["variant"][variant], "subsampling": int(subsampling),
-                        "selected": 0, "coverage": 1.0, "voltage_V": voltage, **metrics,
-                    })
-                    logger.info(
-                        "OOF result | mode=%s | model=%s | window=%s | CTR=%.3f ps | RMSE=%.3f ps | bias=%.3f ps",
-                        mode, space["id"], window["id"], metrics["ctr_ps"],
-                        metrics["rmse_ps"], metrics["bias_ps"],
+                    existing = _find_result_row(
+                        rows, stage=_STAGE_OOF, file_id=file_id, mode_id=mode_id,
+                        model_id=model_id, candidate_id=candidate_id,
                     )
-                    if selection is None or metrics["ctr_ps"] < selection[0]:
-                        selection = (metrics["ctr_ps"], {
+                    if existing is not None:
+                        metrics = existing
+                        logger.info(
+                            "CV resume | mode=%s | model=%s | window=%s | candidate=%d | CTR=%.3f ps",
+                            mode, space["id"], window["id"], candidate_id, float(metrics["ctr_ps"]),
+                        )
+                    else:
+                        try:
+                            metrics = _waveform_oof_candidate(
+                                config, dataset, development, folds,
+                                file_id=file_id, mode=mode, window=window, variant=variant,
+                                subsampling=int(subsampling), space=space, overrides=overrides,
+                                candidate_id=candidate_id, work_root=candidate_work, logger=logger,
+                                normalization_cache=normalization_cache,
+                            )
+                        finally:
+                            shutil.rmtree(candidate_work, ignore_errors=True)
+                        _upsert_result_row(rows, {
+                            "stage": _STAGE_OOF, "file_id": file_id, "mode_id": mode_id,
+                            "model_id": model_id, "candidate_id": candidate_id,
+                            "window_id": codebooks["window"][window["id"]],
+                            "variant_id": codebooks["variant"][variant], "subsampling": int(subsampling),
+                            "selected": 0, "coverage": 1.0, "voltage_V": voltage, **metrics,
+                        })
+                        persist_progress("in_progress")
+                        logger.info(
+                            "CV result | mode=%s | model=%s | window=%s | CTR=%.3f +/- %.3f ps | std=%.3f ps | RMSE=%.3f ps",
+                            mode, space["id"], window["id"], metrics["ctr_ps"],
+                            metrics["ctr_fold_std_ps"], metrics["std_ps"], metrics["rmse_ps"],
+                        )
+                    if selection is None or float(metrics["ctr_ps"]) < selection[0]:
+                        selection = (float(metrics["ctr_ps"]), {
                             "candidate_id": candidate_id, "window": window, "variant": variant,
                             "subsampling": int(subsampling), "overrides": overrides,
                         })
@@ -1030,17 +1352,19 @@ def run_study(
                     )
                 chosen = selection[1]
                 logger.info(
-                    "CV selected | mode=%s | model=%s | window=%s | input=%s | subsampling=%d | OOF CTR=%.3f ps",
+                    "CV selected | mode=%s | model=%s | window=%s | input=%s | subsampling=%d | mean fold CTR=%.3f ps",
                     mode, space["id"], chosen["window"]["id"], chosen["variant"],
                     int(chosen["subsampling"]), selection[0],
                 )
                 for row in rows:
                     if (
-                        row["stage"] == _STAGE_OOF and row["file_id"] == file_id
-                        and row["mode_id"] == mode_id and row["model_id"] == model_id
-                        and row["candidate_id"] == chosen["candidate_id"]
+                        int(row["stage"]) == _STAGE_OOF and int(row["file_id"]) == file_id
+                        and int(row["mode_id"]) == mode_id and int(row["model_id"]) == model_id
                     ):
-                        row["selected"] = 1
+                        row["selected"] = int(
+                            int(row["candidate_id"]) == int(chosen["candidate_id"])
+                        )
+                persist_progress("in_progress")
                 selected_waveform.append((space, model_id, chosen))
 
             selected_mt: dict[str, Any] | None = None
@@ -1059,6 +1383,7 @@ def run_study(
                     model_id=codebooks["model"][_MODEL_MULTITHRESHOLD],
                     candidate_ids=candidate_ids, candidate_manifest=candidate_manifest,
                     rows=rows, voltage=voltage, logger=logger,
+                    persist_progress=lambda: persist_progress("in_progress"),
                 )
 
             # --------------------------- BLIND PHASE ----------------------------
@@ -1068,21 +1393,20 @@ def run_study(
             led_residual = led_blind - float(dataset.true_tof_ps)
             cfd_residual = cfd_blind - float(dataset.true_tof_ps)
             for label, residual in ((_MODEL_LED, led_residual), (_MODEL_CFD, cfd_residual)):
-                _fit, metrics = _fit_row(
-                    residual, method=f"Blind {label} {mode}", fit_config=config["fit"]
-                )
-                rows.append({
+                metrics = _distribution_stats(residual, method=f"Blind {label} {mode}")
+                _upsert_result_row(rows, {
                     "stage": _STAGE_BLIND, "file_id": file_id, "mode_id": mode_id,
                     "model_id": codebooks["model"][label], "candidate_id": -1,
                     "window_id": -1, "variant_id": -1, "subsampling": 1,
                     "selected": 1, "coverage": 1.0, "voltage_V": voltage, **metrics,
                 })
+                persist_progress("in_progress")
                 file_panels[mode][label.upper()] = residual
 
             for space, model_id, chosen in selected_waveform:
                 final_dir = work_root / f"final_f{file_id}_m{mode_id}_model{model_id}"
                 checkpoint = checkpoint_root / f"f{file_id}_m{mode_id}_model{model_id}.pt"
-                residual, _fit, metrics, meta, xai_profile = _waveform_final(
+                residual, metrics, meta, xai_profile = _waveform_final(
                     config, dataset, development, blind,
                     file_id=file_id, mode=mode, window=chosen["window"], variant=chosen["variant"],
                     subsampling=chosen["subsampling"], space=space, overrides=chosen["overrides"],
@@ -1090,7 +1414,7 @@ def run_study(
                     checkpoint_path=checkpoint, logger=logger,
                     normalization_cache=normalization_cache,
                 )
-                rows.append({
+                _upsert_result_row(rows, {
                     "stage": _STAGE_BLIND, "file_id": file_id, "mode_id": mode_id,
                     "model_id": model_id, "candidate_id": chosen["candidate_id"],
                     "window_id": codebooks["window"][chosen["window"]["id"]],
@@ -1101,23 +1425,25 @@ def run_study(
                 final_metadata[f"{file_id}:{mode_id}:{model_id}"] = {
                     "checkpoint": str(checkpoint.relative_to(output)), **meta,
                 }
+                persist_progress("in_progress")
                 file_panels[mode][space["id"]] = residual
                 file_corrections[mode][space["id"]] = led_residual - residual
                 if xai_profile is not None:
                     file_xai[mode][space["id"]] = xai_profile
 
             if selected_mt is not None and mt_window is not None:
-                residual, _fit, metrics = _multithreshold_final(
+                residual, metrics = _multithreshold_final(
                     config, dataset, development, blind, selected_mt
                 )
                 mt_model_id = codebooks["model"][_MODEL_MULTITHRESHOLD]
-                rows.append({
+                _upsert_result_row(rows, {
                     "stage": _STAGE_BLIND, "file_id": file_id, "mode_id": mode_id,
                     "model_id": mt_model_id, "candidate_id": selected_mt["candidate_id"],
                     "window_id": selected_mt["window_id"], "variant_id": 0,
                     "subsampling": 1, "selected": 1, "coverage": 1.0,
                     "voltage_V": voltage, **metrics,
                 })
+                persist_progress("in_progress")
                 file_panels[mode][_MODEL_MULTITHRESHOLD] = residual
                 file_corrections[mode][_MODEL_MULTITHRESHOLD] = led_residual - residual
 
@@ -1126,34 +1452,11 @@ def run_study(
         if bool(config.get("reporting", {}).get("xai", {}).get("enabled", True)):
             _plot_xai_file(output / "xai" / f"{root_file.stem}.png", file_xai, file_corrections, dpi=dpi)
         normalization_cache.clear()
+        completed_files.add(file_id)
+        persist_progress("in_progress")
 
     shutil.rmtree(work_root, ignore_errors=True)
-    _write_csv(results_path, rows)
     _plot_ctr_vs_voltage(output / "ctr_vs_voltage.png", rows, codebooks, dpi=dpi)
-    manifest = {
-        "schema_version": 3,
-        "experiment": config["experiment"]["name"],
-        "config_hash": config["_config_hash"],
-        "config_path": config["_config_path"],
-        "prepared_dir": config["preprocessing"]["prepared_dir"],
-        "row_count": len(rows),
-        "codebooks": codebooks,
-        "candidate_parameters": candidate_manifest,
-        "final_models": final_metadata,
-        "fit": config["fit"],
-        "protocol": {
-            "split": "single deterministic random development/blind split per file",
-            "cv": "random K-fold on development; pooled OOF CTR selects candidates",
-            "early_stop": "neural fit set + disjoint early-stop subset carved only from K-1 training folds",
-            "final": "all candidate selections are frozen before blind is opened; selected configurations are retrained from scratch on development fit/early-stop splits and blind is evaluated once",
-            "evaluation_rejection": "none; every prepared event in the requested split is included",
-            "multithreshold_denoising": False,
-        },
-        "result_columns": {
-            "stage": {"0": "pooled_oof", "1": "blind"},
-            "candidate_id": "parameters stored once in candidate_parameters; -1 for fixed LED/CFD",
-        },
-    }
-    atomic_json(manifest_path, manifest)
+    persist_progress("complete")
     logger.info("Compact study complete | rows=%d | %s", len(rows), output)
     return {"output_dir": str(output), "row_count": len(rows), "results": str(results_path)}

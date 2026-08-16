@@ -19,10 +19,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Run the raw-waveform multithreshold SVR comparison using the same prepared "
-            "datasets, random CV protocol and global Gaussian fit as the main ML experiment."
+            "datasets, random CV protocol and classical CTR estimator as the main ML experiment."
         )
     )
     parser.add_argument("--config", type=Path, required=True, help="Main experiment JSON")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume a partial compatible multithreshold run")
     parser.add_argument("--restart", action="store_true")
     parser.add_argument("--rebuild-preprocessing", action="store_true")
     args = parser.parse_args()
@@ -43,7 +45,7 @@ def main() -> None:
     run_study(
         config,
         dry_run=False,
-        resume=False,
+        resume=args.resume,
         restart=False,
         rebuild_preprocessing=args.rebuild_preprocessing,
         logger=logger,

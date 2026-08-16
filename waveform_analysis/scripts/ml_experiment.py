@@ -18,7 +18,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Run the compact CTR study: permanent dataset preparation, random "
-            "development/blind split, pooled-OOF model selection, early stopping "
+            "development/blind split, fold-wise CV model selection, early stopping "
             "on a train-only subset, one blind evaluation, standards, XAI and "
             "raw-only multithreshold SVR."
         )
@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--dry-run", "--check", dest="dry_run", action="store_true",
                         help="Validate the config/model registry and list discovered input files without training")
     parser.add_argument("--resume", action="store_true",
-                        help="Reuse an already-complete result set only when its config hash matches")
+                        help="Resume a partial compatible run: completed CV candidates/files are skipped")
     parser.add_argument("--restart", action="store_true")
     parser.add_argument("--rebuild-preprocessing", action="store_true")
     args = parser.parse_args()

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .common import canonical_hash
-from .config import MLConfigError, resolve_fit_config
+from .config import MLConfigError
 from .models import model_registry
 
 CHANNEL_MODES: dict[str, tuple[str, str]] = {
@@ -16,7 +16,11 @@ CHANNEL_MODES: dict[str, tuple[str, str]] = {
     "energy_to_timing": ("energy", "timing_led"),
     "timing_to_timing": ("timing", "timing_led"),
 }
-RETAINED_MODELS = {"linear_svr", "constructive_mlp_encoder", "cnn_regressor"}
+RETAINED_MODELS = {
+    "linear_svr",
+    "constructive_mlp_encoder",
+    "cnn_regressor"
+}
 
 
 def _finite(value: Any, name: str, *, positive: bool = False, nonnegative: bool = False) -> float:
@@ -136,10 +140,6 @@ def _window(value: dict[str, Any], index: int) -> dict[str, Any]:
     if before <= 0 or after <= 0:
         raise MLConfigError("Window before_ns and after_ns must be positive")
     return {"id": str(value.get("id", f"w{index}")), "before_ns": before, "after_ns": after}
-
-
-def _default_fit(raw: dict[str, Any] | None) -> dict[str, Any]:
-    return resolve_fit_config(raw)
 
 
 def _validate_search(space: dict[str, Any]) -> None:
@@ -313,11 +313,10 @@ def load_study_config(path: str | Path, project_root: str | Path) -> dict[str, A
     if not 0.0 < float(cv["early_stop_fraction"]) < 0.5:
         raise MLConfigError("cross_validation.early_stop_fraction must be in (0, 0.5)")
 
-    cfg["fit"] = _default_fit(cfg.get("fit"))
-    if int(cfg["fit"]["min_events"]) > minimum_events:
+    if "fit" in cfg:
         raise MLConfigError(
-            "fit.min_events cannot exceed preprocessing.selection.minimum_events; "
-            "otherwise a successfully prepared dataset may be impossible to evaluate"
+            "Experiment-level 'fit' is obsolete: CTR is estimated from the ordinary "
+            "sample standard deviation independently on each CV score fold and on blind."
         )
     reporting = cfg.setdefault("reporting", {})
     reporting.setdefault("dpi", 180)

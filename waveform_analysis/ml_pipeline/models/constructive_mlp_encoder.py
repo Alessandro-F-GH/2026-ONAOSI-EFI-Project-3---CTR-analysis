@@ -313,11 +313,7 @@ def _target_scale_from_datasets(context: TrainingContext, minimum_scale: float) 
     values: list[np.ndarray] = []
     for dataset in context.datasets:
         indices = np.asarray(dataset.train, dtype=np.int64)
-        led_delta = (
-            np.asarray(dataset.led_time_fs[indices, 0], dtype=np.float64)
-            - np.asarray(dataset.led_time_fs[indices, 1], dtype=np.float64)
-        ) / 1000.0
-        values.append(led_delta - float(dataset.true_tof_ps))
+        values.append(factored_correction_target_ps(dataset, indices))
     target = np.concatenate(values)
     return max(float(np.std(target)), minimum_scale)
 
