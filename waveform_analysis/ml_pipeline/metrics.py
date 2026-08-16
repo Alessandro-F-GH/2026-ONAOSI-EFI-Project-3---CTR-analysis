@@ -42,3 +42,62 @@ def distribution_metrics(
         "fit_success": bool(fit.success),
         "fit_message": str(fit.message),
     }
+
+
+FWHM_PER_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))
+
+
+def residual_metrics(values_ps: np.ndarray) -> dict[str, Any]:
+    """All-event CTR metrics used by the study/reporting layer.
+
+    This deliberately does not fit or clip the distribution: CTR is
+    ``2*sqrt(2*ln(2))*sample_std`` over every finite event in the requested
+    evaluation split.  Model training itself is unchanged and continues to use
+    the model-specific losses/selection logic from the working pipeline.
+    """
+    values = np.asarray(values_ps, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    n = int(values.size)
+    if n == 0:
+        return {
+            "n": 0,
+            "mean_ps": float("nan"),
+            "std_ps": float("nan"),
+            "ctr_ps": float("nan"),
+            "rmse_ps": float("nan"),
+            "bias_ps": float("nan"),
+        }
+    mean = float(np.mean(values))
+    rmse = float(np.sqrt(np.mean(values * values)))
+    if n < 2:
+        std = float("nan")
+        ctr = float("nan")
+    else:
+        std = float(np.std(values, ddof=1))
+        ctr = float(FWHM_PER_SIGMA * std)
+    return {
+        "n": n,
+        "mean_ps": mean,
+        "std_ps": std,
+        "ctr_ps": ctr,
+        "rmse_ps": rmse,
+        "bias_ps": mean,
+    }
+
+
+def ctr_bootstrap_uncertainty(
+    values_ps: np.ndarray,
+    n_bootstrap: int = 1000,
+    seed: int = 12345,
+) -> float:
+    """Statistical uncertainty of fixed-model CTR from event resampling only."""
+    values = np.asarray(values_ps, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    if values.size < 3 or int(n_bootstrap) <= 1:
+        return float("nan")
+    rng = np.random.default_rng(int(seed))
+    draws = np.empty(int(n_bootstrap), dtype=np.float64)
+    for index in range(draws.size):
+        sample = rng.choice(values, size=values.size, replace=True)
+        draws[index] = FWHM_PER_SIGMA * np.std(sample, ddof=1)
+    return float(np.std(draws, ddof=1))

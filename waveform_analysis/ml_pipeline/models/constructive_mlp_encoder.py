@@ -22,6 +22,7 @@ from ..training_utils import (
     checkpoint_context,
     evaluate_model,
     evaluate_model_with_optional_fit,
+    ctr_log_text,
     fit_schedule_for_epoch,
     make_split_loader,
     randomly_swap_paired_batch,
@@ -313,7 +314,11 @@ def _target_scale_from_datasets(context: TrainingContext, minimum_scale: float) 
     values: list[np.ndarray] = []
     for dataset in context.datasets:
         indices = np.asarray(dataset.train, dtype=np.int64)
-        values.append(factored_correction_target_ps(dataset, indices))
+        led_delta = (
+            np.asarray(dataset.led_time_fs[indices, 0], dtype=np.float64)
+            - np.asarray(dataset.led_time_fs[indices, 1], dtype=np.float64)
+        ) / 1000.0
+        values.append(led_delta - float(dataset.true_tof_ps))
     target = np.concatenate(values)
     return max(float(np.std(target)), minimum_scale)
 
@@ -493,7 +498,7 @@ def train(context: TrainingContext) -> dict[str, Any]:
         and device.type == "cuda"
     )
 
-    context.logger.info(
+    context.logger.debug(
         "Constructive nonlinear encoder | max units %d | epochs/unit %d | "
         "minimum validation RMSE improvement %.6g ps",
         max_units,
@@ -647,14 +652,14 @@ def train(context: TrainingContext) -> dict[str, Any]:
             }
             history.append(row)
             context.logger.debug(
-                "Unit %d | epoch %d/%d | train RMSE %.3f ps | val RMSE %.3f ps | "
-                "val CTR %.3f ps | val bias %.3f ps",
+                "Unit %d | epoch %d/%d | train RMSE %.1f ps | val RMSE %.1f ps | "
+                "%s | val bias %.1f ps",
                 unit_index + 1,
                 unit_epoch,
                 epochs_per_unit,
                 row["train_rmse_ps"],
                 row["validation_rmse_ps"],
-                row["validation_ctr_ps"],
+                ctr_log_text(validation_metrics),
                 row["validation_bias_ps"],
             )
             if bad_epochs >= patience:

@@ -185,40 +185,6 @@ def _last_rising_crossing_before_peak_ns(
     return x0 + fraction * (x1 - x0)
 
 
-def raw_energy_selection_features(
-    raw_samples: np.ndarray,
-    *,
-    vertical_gain_v_per_count: float,
-    vertical_offset_v: float,
-    horizontal_interval_s: float,
-    horizontal_offset_s: float,
-    polarity: int,
-    waveform_config: dict[str, Any],
-) -> tuple[float, float, int]:
-    """Cheap raw-energy features used by the first-pass event selection.
-
-    This helper deliberately performs *no denoising, LED/CFD extraction, or
-    window materialization*. Photopeak selection therefore happens before the
-    expensive timing preprocessing, using only information from the acquired
-    energy channels.
-    """
-
-    voltage_mV = _decode_voltage_mV(
-        np.asarray(raw_samples, dtype=np.int16),
-        vertical_gain_v_per_count,
-        vertical_offset_v,
-    )
-    basic = baseline_and_basic_features(
-        voltage_mV,
-        baseline_samples=int(waveform_config["baseline_samples"]),
-        polarity=int(polarity),
-        trigger_threshold_mV=float(waveform_config["search_trigger_threshold_mV"]),
-        horizontal_interval_s=float(horizontal_interval_s),
-        horizontal_offset_s=float(horizontal_offset_s),
-    )
-    return float(basic.amplitude_mV), float(basic.noise_rms_mV), int(basic.trigger_index)
-
-
 def _basic_features(
     raw_samples: np.ndarray,
     *,

@@ -17,9 +17,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Materialize the permanent post-selection ML dataset for every ROOT file. "
-            "A cheap raw-energy/photopeak pass runs first; denoising, LED/CFD and "
-            "native-window extraction are performed only for retained events. "
-            "No train/CV/blind split is stored."
+            "The output contains raw native-grid waveforms and, when requested, a "
+            "separate denoised waveform representation; no train/CV/blind split is stored."
         )
     )
     parser.add_argument("--config", type=Path, required=True, help="Experiment JSON")

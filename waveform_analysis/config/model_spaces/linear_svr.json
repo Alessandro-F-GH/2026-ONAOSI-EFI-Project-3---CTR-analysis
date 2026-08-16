@@ -38,11 +38,11 @@
       "model.C": {
         "type": "categorical",
         "values": [
-          0.1,
+          
           1.0,
           10.0,
           100.0
-        ]
+                ]
       },
       "model.epsilon_values": {
         "type": "categorical",
@@ -58,12 +58,6 @@
           ],
           [
             60.0
-          ],
-          [
-            100
-          ],
-          [
-            120
           ]
         ]
       }

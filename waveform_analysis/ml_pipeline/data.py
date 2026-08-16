@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import errno
 import os
 import shutil
@@ -18,17 +17,15 @@ from utils.signal import INVALID_TIME_FS
 
 from .common import atomic_json, canonical_hash, read_json, source_signature
 from .energy_io import energy_event_count, energy_sampling_interval_s, iterate_energy_chunks
-from .event_selection import apply_energy_preselection
 from .signal import (
     TimingReference,
     extract_channel,
     extract_timing_channel,
     relative_window_grid_ps,
-    raw_energy_selection_features,
 )
 from .standard_methods.cfd import select_precomputed_cfd_times
 
-CACHE_FORMAT_VERSION = 11
+CACHE_FORMAT_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -58,16 +55,6 @@ class EnergyCache:
     timing_aligned_energy_windows_mV: np.ndarray | None = None
     timing_windows_mV: np.ndarray | None = None
     timing_relative_time_ps: np.ndarray | None = None
-    raw_energy_led_time_fs: np.ndarray | None = None
-    raw_timing_led_time_fs: np.ndarray | None = None
-    raw_energy_cfd_time_fs: np.ndarray | None = None
-    raw_timing_cfd_time_fs: np.ndarray | None = None
-    raw_energy_window_anchor_time_fs: np.ndarray | None = None
-    raw_timing_aligned_energy_window_anchor_time_fs: np.ndarray | None = None
-    raw_timing_window_anchor_time_fs: np.ndarray | None = None
-    raw_energy_windows_mV: np.ndarray | None = None
-    raw_timing_aligned_energy_windows_mV: np.ndarray | None = None
-    raw_timing_windows_mV: np.ndarray | None = None
 
 
 def _preprocessing_relevant(config: dict[str, Any]) -> dict[str, Any]:
@@ -82,10 +69,6 @@ def _preprocessing_relevant(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "channels": config["channels"],
         "waveform": waveform,
-        # Photopeak/cheap energy cuts are now part of the ROOT-cache contract:
-        # they decide which events ever reach denoising/timing/window extraction.
-        "selection": copy.deepcopy(config.get("selection", {})),
-        "photopeak": copy.deepcopy(config.get("photopeak", {"enabled": False})),
         "io": {
             "max_events": int(config.get("io", {}).get("max_events", 0)),
         },
@@ -127,16 +110,6 @@ def _array_paths(directory: Path) -> dict[str, Path]:
         "timing_aligned_energy_windows_mV",
         "timing_windows_mV",
         "timing_relative_time_ps",
-        "raw_energy_led_time_fs",
-        "raw_timing_led_time_fs",
-        "raw_energy_cfd_time_fs",
-        "raw_timing_cfd_time_fs",
-        "raw_energy_window_anchor_time_fs",
-        "raw_timing_aligned_energy_window_anchor_time_fs",
-        "raw_timing_window_anchor_time_fs",
-        "raw_energy_windows_mV",
-        "raw_timing_aligned_energy_windows_mV",
-        "raw_timing_windows_mV",
     )
     return {name: directory / f"{name}.npy" for name in names}
 
@@ -169,25 +142,6 @@ def load_energy_cache(directory: Path, input_path: Path, config: dict[str, Any])
             "timing_aligned_energy_windows_mV",
             "timing_windows_mV",
             "timing_relative_time_ps",
-        )
-    if bool(manifest.get("raw_multithreshold_energy_saved", False)):
-        required += (
-            "raw_energy_led_time_fs",
-            "raw_energy_cfd_time_fs",
-            "raw_energy_window_anchor_time_fs",
-            "raw_energy_windows_mV",
-        )
-    if bool(manifest.get("raw_multithreshold_timing_saved", False)):
-        required += (
-            "raw_timing_led_time_fs",
-            "raw_timing_cfd_time_fs",
-            "raw_timing_window_anchor_time_fs",
-            "raw_timing_windows_mV",
-        )
-    if bool(manifest.get("raw_multithreshold_timing_aligned_energy_saved", False)):
-        required += (
-            "raw_timing_aligned_energy_window_anchor_time_fs",
-            "raw_timing_aligned_energy_windows_mV",
         )
     missing = [str(paths[name]) for name in required if not paths[name].is_file()]
     if missing:
@@ -241,79 +195,7 @@ def load_energy_cache(directory: Path, input_path: Path, config: dict[str, Any])
             np.load(paths["timing_relative_time_ps"], mmap_mode="r")
             if paths["timing_relative_time_ps"].is_file() else None
         ),
-        raw_energy_led_time_fs=(
-            np.load(paths["raw_energy_led_time_fs"], mmap_mode="r")
-            if paths["raw_energy_led_time_fs"].is_file() else None
-        ),
-        raw_timing_led_time_fs=(
-            np.load(paths["raw_timing_led_time_fs"], mmap_mode="r")
-            if paths["raw_timing_led_time_fs"].is_file() else None
-        ),
-        raw_energy_cfd_time_fs=(
-            np.load(paths["raw_energy_cfd_time_fs"], mmap_mode="r")
-            if paths["raw_energy_cfd_time_fs"].is_file() else None
-        ),
-        raw_timing_cfd_time_fs=(
-            np.load(paths["raw_timing_cfd_time_fs"], mmap_mode="r")
-            if paths["raw_timing_cfd_time_fs"].is_file() else None
-        ),
-        raw_energy_window_anchor_time_fs=(
-            np.load(paths["raw_energy_window_anchor_time_fs"], mmap_mode="r")
-            if paths["raw_energy_window_anchor_time_fs"].is_file() else None
-        ),
-        raw_timing_aligned_energy_window_anchor_time_fs=(
-            np.load(paths["raw_timing_aligned_energy_window_anchor_time_fs"], mmap_mode="r")
-            if paths["raw_timing_aligned_energy_window_anchor_time_fs"].is_file() else None
-        ),
-        raw_timing_window_anchor_time_fs=(
-            np.load(paths["raw_timing_window_anchor_time_fs"], mmap_mode="r")
-            if paths["raw_timing_window_anchor_time_fs"].is_file() else None
-        ),
-        raw_energy_windows_mV=(
-            np.load(paths["raw_energy_windows_mV"], mmap_mode="r")
-            if paths["raw_energy_windows_mV"].is_file() else None
-        ),
-        raw_timing_aligned_energy_windows_mV=(
-            np.load(paths["raw_timing_aligned_energy_windows_mV"], mmap_mode="r")
-            if paths["raw_timing_aligned_energy_windows_mV"].is_file() else None
-        ),
-        raw_timing_windows_mV=(
-            np.load(paths["raw_timing_windows_mV"], mmap_mode="r")
-            if paths["raw_timing_windows_mV"].is_file() else None
-        ),
     )
-
-
-
-def _process_preselection_event(payload: tuple[Any, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract only cheap raw-energy quantities needed before photopeak selection."""
-    (
-        energy_raw_a,
-        energy_raw_b,
-        energy_gains,
-        energy_offsets,
-        energy_intervals,
-        energy_horizontal_offsets,
-        energy_polarities,
-        waveform_config,
-    ) = payload
-    amplitudes = np.empty(2, dtype=np.float32)
-    noise = np.empty(2, dtype=np.float32)
-    triggers = np.empty(2, dtype=np.int32)
-    for position, raw in enumerate((energy_raw_a, energy_raw_b)):
-        amplitude, noise_rms, trigger = raw_energy_selection_features(
-            np.asarray(raw, dtype=np.int16),
-            vertical_gain_v_per_count=float(energy_gains[position]),
-            vertical_offset_v=float(energy_offsets[position]),
-            horizontal_interval_s=float(energy_intervals[position]),
-            horizontal_offset_s=float(energy_horizontal_offsets[position]),
-            polarity=int(energy_polarities[position]),
-            waveform_config=waveform_config,
-        )
-        amplitudes[position] = amplitude
-        noise[position] = noise_rms
-        triggers[position] = trigger
-    return amplitudes, noise, triggers
 
 
 def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -354,8 +236,6 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
 
     timing_references: list[TimingReference | None] = [None, None]
     timing_outputs = []
-    raw_timing_outputs = []
-    raw_timing_references: list[TimingReference | None] = [None, None]
     if use_timing_channel_led:
         observed_timing_intervals = np.asarray(timing_intervals, dtype=np.float64)
         if not np.allclose(
@@ -391,41 +271,6 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
                 )
             )
 
-        # Multithreshold must always use the unfiltered acquisition waveform and
-        # an LED measured from that exact same raw signal.  When the configured
-        # timing preprocessing is already raw, reuse the canonical extraction;
-        # otherwise perform a second raw-only extraction once during permanent
-        # preprocessing.
-        timing_cfg = waveform_config.get("timing_channel_led", {})
-        timing_is_denoised = bool((timing_cfg.get("denoising", {}) or {}).get("enabled", False))
-        if timing_is_denoised:
-            raw_waveform_config = copy.deepcopy(waveform_config)
-            raw_waveform_config.setdefault("timing_channel_led", {})["denoising"] = {"enabled": False}
-            raw_timing_references = []
-            for channel_position, raw in enumerate((timing_raw_a, timing_raw_b)):
-                item = extract_timing_channel(
-                    np.asarray(raw, dtype=np.int16),
-                    vertical_gain_v_per_count=float(timing_gains[channel_position]),
-                    vertical_offset_v=float(timing_offsets[channel_position]),
-                    horizontal_interval_s=float(timing_intervals[channel_position]),
-                    horizontal_offset_s=float(timing_horizontal_offsets[channel_position]),
-                    polarity=int(timing_polarities[channel_position]),
-                    waveform_config=raw_waveform_config,
-                    relative_grid_ps=timing_relative_grid_ps,
-                )
-                raw_timing_outputs.append(item)
-                raw_timing_references.append(
-                    TimingReference(
-                        trigger_index=item.trigger_index,
-                        led_time_fs=item.led_time_fs,
-                        cfd_time_fs=item.cfd_time_fs,
-                        valid=item.valid,
-                    )
-                )
-        else:
-            raw_timing_outputs = timing_outputs
-            raw_timing_references = timing_references
-
     outputs = []
     for channel_position, raw in enumerate((energy_raw_a, energy_raw_b)):
         outputs.append(
@@ -441,36 +286,6 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
                 timing_reference=timing_references[channel_position],
             )
         )
-
-    # Raw-only energy extraction is retained solely for multithreshold.  The
-    # canonical ``outputs`` above follow the configured channel preprocessing,
-    # so their LED/CFD/anchor/window are guaranteed to come from the same signal
-    # representation later consumed by the waveform ML pipeline.
-    energy_is_denoised = bool((waveform_config.get("denoising", {}) or {}).get("enabled", False))
-    timing_cfg = waveform_config.get("timing_channel_led", {})
-    timing_is_denoised = bool((timing_cfg.get("denoising", {}) or {}).get("enabled", False))
-    need_separate_raw_energy = energy_is_denoised or timing_is_denoised
-    if need_separate_raw_energy:
-        raw_energy_cfg = copy.deepcopy(waveform_config)
-        raw_energy_cfg["denoising"] = {"enabled": False}
-        raw_energy_cfg.setdefault("timing_channel_led", {})["denoising"] = {"enabled": False}
-        raw_outputs = []
-        for channel_position, raw in enumerate((energy_raw_a, energy_raw_b)):
-            raw_outputs.append(
-                extract_channel(
-                    np.asarray(raw, dtype=np.int16),
-                    vertical_gain_v_per_count=float(energy_gains[channel_position]),
-                    vertical_offset_v=float(energy_offsets[channel_position]),
-                    horizontal_interval_s=float(energy_intervals[channel_position]),
-                    horizontal_offset_s=float(energy_horizontal_offsets[channel_position]),
-                    polarity=int(energy_polarities[channel_position]),
-                    waveform_config=raw_energy_cfg,
-                    relative_grid_ps=relative_grid_ps,
-                    timing_reference=raw_timing_references[channel_position],
-                )
-            )
-    else:
-        raw_outputs = outputs
     energy_led = np.asarray([item.led_time_fs for item in outputs], dtype=np.int64)
     energy_cfd = np.asarray([item.cfd_time_fs for item in outputs], dtype=np.int64)
     timing_led = (
@@ -482,16 +297,6 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
         np.asarray([item.cfd_time_fs for item in timing_outputs], dtype=np.int64)
         if use_timing_channel_led
         else None
-    )
-    raw_energy_led = np.asarray([item.led_time_fs for item in raw_outputs], dtype=np.int64)
-    raw_energy_cfd = np.asarray([item.cfd_time_fs for item in raw_outputs], dtype=np.int64)
-    raw_timing_led = (
-        np.asarray([item.led_time_fs for item in raw_timing_outputs], dtype=np.int64)
-        if use_timing_channel_led else None
-    )
-    raw_timing_cfd = (
-        np.asarray([item.cfd_time_fs for item in raw_timing_outputs], dtype=np.int64)
-        if use_timing_channel_led else None
     )
     energy_window_anchor = np.asarray(
         [item.window_anchor_time_fs for item in outputs], dtype=np.int64
@@ -508,20 +313,6 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
         )
         if use_timing_channel_led
         else None
-    )
-    raw_energy_window_anchor = np.asarray(
-        [item.window_anchor_time_fs for item in raw_outputs], dtype=np.int64
-    )
-    raw_timing_window_anchor = (
-        np.asarray([item.window_anchor_time_fs for item in raw_timing_outputs], dtype=np.int64)
-        if use_timing_channel_led else None
-    )
-    raw_timing_aligned_energy_anchor = (
-        np.asarray(
-            [item.reference_aligned_window_anchor_time_fs for item in raw_outputs],
-            dtype=np.int64,
-        )
-        if use_timing_channel_led else None
     )
     # ``led_time_fs`` and ``cfd_time_fs`` are the prepared standard-method
     # timestamps consumed by ml_evaluate.  Select both from the same waveform
@@ -551,24 +342,6 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
             else None
         )
     )
-    raw_timing_windows = (
-        np.stack([item.window_mV for item in raw_timing_outputs]).astype(np.float32)
-        if use_timing_channel_led else None
-    )
-    raw_timing_aligned_available = bool(
-        use_timing_channel_led
-        and all(item.reference_aligned_window_mV is not None for item in raw_outputs)
-    )
-    raw_timing_aligned_energy_windows = (
-        np.stack(
-            [np.asarray(item.reference_aligned_window_mV, dtype=np.float32) for item in raw_outputs]
-        ).astype(np.float32)
-        if raw_timing_aligned_available
-        else (
-            np.full((2, relative_grid_ps.size), np.nan, dtype=np.float32)
-            if use_timing_channel_led else None
-        )
-    )
     return (
         int(event_index),
         int(event_id),
@@ -590,16 +363,6 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
         np.stack([item.window_mV for item in outputs]).astype(np.float32),
         timing_aligned_energy_windows,
         timing_windows,
-        raw_energy_led,
-        raw_timing_led,
-        raw_energy_cfd,
-        raw_timing_cfd,
-        raw_energy_window_anchor,
-        raw_timing_aligned_energy_anchor,
-        raw_timing_window_anchor,
-        np.stack([item.window_mV for item in raw_outputs]).astype(np.float32),
-        raw_timing_aligned_energy_windows,
-        raw_timing_windows,
         bool(
             all(item.valid for item in outputs)
             and (not use_timing_channel_led or all(item.valid for item in timing_outputs))
@@ -612,99 +375,22 @@ def _process_event(payload: tuple[Any, ...]) -> tuple[Any, ...]:
 
 
 def _executor_map(
-    worker: Any,
-    payloads: list[tuple[Any, ...]],
-    parallel: dict[str, Any],
+    payloads: list[tuple[Any, ...]], parallel: dict[str, Any]
 ) -> Iterable[tuple[Any, ...]]:
-    """Map the requested top-level preprocessing worker over one payload batch.
-
-    The photopeak-first pass and the expensive timing/window pass intentionally use
-    different payload schemas, so the worker must be supplied explicitly rather
-    than being hard-coded here.  Keeping the worker top-level also preserves
-    ProcessPoolExecutor compatibility with Windows' spawn start method.
-    """
     workers = int(parallel.get("preprocessing_workers", 0))
     backend = str(parallel.get("preprocessing_backend", "process"))
     chunksize = max(1, int(parallel.get("preprocessing_chunksize", 8)))
     if workers <= 0 or backend == "serial":
-        return map(worker, payloads)
+        return map(_process_event, payloads)
     executor_class = ProcessPoolExecutor if backend == "process" else ThreadPoolExecutor
     executor = executor_class(max_workers=workers)
     # The generator owns the executor and shuts it down once consumed.
     def generate() -> Iterable[tuple[Any, ...]]:
         try:
-            yield from executor.map(worker, payloads, chunksize=chunksize)
+            yield from executor.map(_process_event, payloads, chunksize=chunksize)
         finally:
             executor.shutdown(wait=True, cancel_futures=False)
     return generate()
-
-
-
-def _scan_energy_preselection(
-    input_path: Path,
-    *,
-    n_events: int,
-    energy_channels: tuple[int, int],
-    energy_polarities: tuple[int, int],
-    config: dict[str, Any],
-    logger: Any,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """First ROOT pass: raw energy channels only, no denoising/timing/windows."""
-    amplitudes = np.full((n_events, 2), np.nan, dtype=np.float32)
-    noise = np.full((n_events, 2), np.nan, dtype=np.float32)
-    triggers = np.full((n_events, 2), -1, dtype=np.int32)
-    io_config = config.get("io", {})
-    parallel = config["parallelization"]
-    progress_every = max(1, int(io_config.get("progress_every", 1000)))
-    written = 0
-    logger.info(
-        "Photopeak first pass | raw energy channels only | events=%d | no denoising/LED/CFD/windowing",
-        n_events,
-    )
-    for chunk in iterate_energy_chunks(
-        input_path,
-        energy_channels_one_based=energy_channels,
-        timing_channels_one_based=None,
-        step_size=io_config.get("step_size", "128 MB"),
-        entry_stop=n_events,
-    ):
-        payloads: list[tuple[Any, ...]] = []
-        for row in range(chunk.event_id.size):
-            payloads.append((
-                np.asarray(ak.to_numpy(chunk.samples[0][row]), dtype=np.int16),
-                np.asarray(ak.to_numpy(chunk.samples[1][row]), dtype=np.int16),
-                chunk.vertical_gain_v_per_count[row],
-                chunk.vertical_offset_v[row],
-                chunk.horizontal_interval_s[row],
-                chunk.horizontal_offset_s[row],
-                energy_polarities,
-                config["waveform"],
-            ))
-        for amp, rms, trig in _executor_map(_process_preselection_event, payloads, parallel):
-            if written >= n_events:
-                break
-            amplitudes[written] = amp
-            noise[written] = rms
-            triggers[written] = trig
-            written += 1
-            if written % progress_every == 0 or written == n_events:
-                logger.info("Photopeak scan %d/%d events", written, n_events)
-    if written != n_events:
-        raise RuntimeError(f"Photopeak first pass expected {n_events} events but scanned {written}")
-    mask, summary = apply_energy_preselection(
-        amplitudes,
-        noise,
-        triggers,
-        energy_channels=energy_channels,
-        selection=copy.deepcopy(config.get("selection", {})),
-        photopeak=copy.deepcopy(config.get("photopeak", {"enabled": False})),
-        logger=logger,
-    )
-    selected = np.flatnonzero(mask).astype(np.int64)
-    # Keep only a compact hash/count in persistent metadata; the O(N) temporary
-    # feature arrays die here and are never copied into ml_prepared.
-    summary["selected_root_entry_hash"] = hashlib.sha256(np.ascontiguousarray(selected).tobytes()).hexdigest()
-    return selected, summary
 
 
 def prepare_energy_cache(
@@ -731,22 +417,6 @@ def prepare_energy_cache(
     if n_events <= 0:
         raise RuntimeError("Input ROOT file contains no events")
     energy_channels = tuple(int(item) for item in config["channels"]["energy"])
-    energy_polarities = tuple(int(item) for item in config["channels"]["polarities"])
-
-    # First pass: select the photopeak population from raw energy information
-    # before allocating waveform caches or performing any denoising/timing work.
-    selected_entries, preselection_summary = _scan_energy_preselection(
-        input_path,
-        n_events=n_events,
-        energy_channels=energy_channels,
-        energy_polarities=energy_polarities,
-        config=config,
-        logger=logger,
-    )
-    selected_count = int(selected_entries.size)
-    selected_entry_mask = np.zeros(n_events, dtype=bool)
-    selected_entry_mask[selected_entries] = True
-
     native_interval_s = energy_sampling_interval_s(input_path, energy_channels)
     relative_grid = relative_window_grid_ps(config["waveform"], native_interval_s)
     timing_led_config = config["waveform"].get("timing_channel_led", {})
@@ -774,19 +444,6 @@ def prepare_energy_cache(
         if use_timing_channel_led else None
     )
 
-    energy_preprocessing_denoised = bool(
-        (config["waveform"].get("denoising", {}) or {}).get("enabled", False)
-    )
-    timing_preprocessing_denoised = bool(
-        (timing_led_config.get("denoising", {}) or {}).get("enabled", False)
-    )
-    save_raw_energy = energy_preprocessing_denoised
-    save_raw_timing = bool(use_timing_channel_led and timing_preprocessing_denoised)
-    save_raw_timing_aligned_energy = bool(
-        use_timing_channel_led
-        and (energy_preprocessing_denoised or timing_preprocessing_denoised)
-    )
-
     temporary = directory.with_name(directory.name + ".building")
     if temporary.exists():
         shutil.rmtree(temporary)
@@ -796,51 +453,31 @@ def prepare_energy_cache(
     # contain energy-aligned energy, timing-aligned energy, and timing waveforms.
     # Their combined size is substantial, especially for long windows.
     array_specs: list[tuple[tuple[int, ...], np.dtype]] = [
-        ((selected_count,), np.dtype(np.int64)),
-        ((selected_count,), np.dtype(np.int64)),
-        ((selected_count, 2), np.dtype(np.int64)),
-        ((selected_count,), np.dtype(np.int32)),
-        ((selected_count,), np.dtype(np.float64)),
-        ((selected_count, 2), np.dtype(np.float32)),
-        ((selected_count, 2), np.dtype(np.float32)),
-        ((selected_count, 2), np.dtype(np.int32)),
-        ((selected_count, 2), np.dtype(np.int64)),
-        ((selected_count, 2), np.dtype(np.int64)),
-        ((selected_count, 2, int(relative_grid.size)), np.dtype(np.float32)),
-        ((selected_count, 2), np.dtype(np.int64)),
-        ((selected_count, 2), np.dtype(np.int64)),
-        ((selected_count, 2), np.dtype(np.int64)),
-        ((selected_count,), np.dtype(np.bool_)),
+        ((n_events,), np.dtype(np.int64)),
+        ((n_events,), np.dtype(np.int64)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events,), np.dtype(np.int32)),
+        ((n_events,), np.dtype(np.float64)),
+        ((n_events, 2), np.dtype(np.float32)),
+        ((n_events, 2), np.dtype(np.float32)),
+        ((n_events, 2), np.dtype(np.int32)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events, 2, int(relative_grid.size)), np.dtype(np.float32)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events, 2), np.dtype(np.int64)),
+        ((n_events,), np.dtype(np.bool_)),
     ]
     if use_timing_channel_led:
         assert timing_relative_grid is not None
         array_specs.extend([
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2, int(relative_grid.size)), np.dtype(np.float32)),
-            ((selected_count, 2, int(timing_relative_grid.size)), np.dtype(np.float32)),
-        ])
-    if save_raw_energy:
-        array_specs.extend([
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2, int(relative_grid.size)), np.dtype(np.float32)),
-        ])
-    if save_raw_timing:
-        assert timing_relative_grid is not None
-        array_specs.extend([
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2, int(timing_relative_grid.size)), np.dtype(np.float32)),
-        ])
-    if save_raw_timing_aligned_energy:
-        array_specs.extend([
-            ((selected_count, 2), np.dtype(np.int64)),
-            ((selected_count, 2, int(relative_grid.size)), np.dtype(np.float32)),
+            ((n_events, 2), np.dtype(np.int64)),
+            ((n_events, 2), np.dtype(np.int64)),
+            ((n_events, 2), np.dtype(np.int64)),
+            ((n_events, 2), np.dtype(np.int64)),
+            ((n_events, 2, int(relative_grid.size)), np.dtype(np.float32)),
+            ((n_events, 2, int(timing_relative_grid.size)), np.dtype(np.float32)),
         ])
     required_bytes = sum(
         int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
@@ -865,95 +502,58 @@ def prepare_energy_cache(
 
     paths = _array_paths(temporary)
     arrays = {
-        "event_id": open_memmap(paths["event_id"], mode="w+", dtype=np.int64, shape=(selected_count,)),
-        "event_index": open_memmap(paths["event_index"], mode="w+", dtype=np.int64, shape=(selected_count,)),
-        "source_file_id": open_memmap(paths["source_file_id"], mode="w+", dtype=np.int64, shape=(selected_count, 2)),
-        "source_run_index": open_memmap(paths["source_run_index"], mode="w+", dtype=np.int32, shape=(selected_count,)),
-        "bias_voltage_V": open_memmap(paths["bias_voltage_V"], mode="w+", dtype=np.float64, shape=(selected_count,)),
-        "amplitude_mV": open_memmap(paths["amplitude_mV"], mode="w+", dtype=np.float32, shape=(selected_count, 2)),
-        "noise_rms_mV": open_memmap(paths["noise_rms_mV"], mode="w+", dtype=np.float32, shape=(selected_count, 2)),
-        "trigger_index": open_memmap(paths["trigger_index"], mode="w+", dtype=np.int32, shape=(selected_count, 2)),
-        "led_time_fs": open_memmap(paths["led_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)),
-        "cfd_time_fs": open_memmap(paths["cfd_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)),
-        "windows_mV": open_memmap(paths["windows_mV"], mode="w+", dtype=np.float32, shape=(selected_count, 2, relative_grid.size)),
-        "energy_led_time_fs": open_memmap(paths["energy_led_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)),
-        "energy_cfd_time_fs": open_memmap(paths["energy_cfd_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)),
+        "event_id": open_memmap(paths["event_id"], mode="w+", dtype=np.int64, shape=(n_events,)),
+        "event_index": open_memmap(paths["event_index"], mode="w+", dtype=np.int64, shape=(n_events,)),
+        "source_file_id": open_memmap(paths["source_file_id"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
+        "source_run_index": open_memmap(paths["source_run_index"], mode="w+", dtype=np.int32, shape=(n_events,)),
+        "bias_voltage_V": open_memmap(paths["bias_voltage_V"], mode="w+", dtype=np.float64, shape=(n_events,)),
+        "amplitude_mV": open_memmap(paths["amplitude_mV"], mode="w+", dtype=np.float32, shape=(n_events, 2)),
+        "noise_rms_mV": open_memmap(paths["noise_rms_mV"], mode="w+", dtype=np.float32, shape=(n_events, 2)),
+        "trigger_index": open_memmap(paths["trigger_index"], mode="w+", dtype=np.int32, shape=(n_events, 2)),
+        "led_time_fs": open_memmap(paths["led_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
+        "cfd_time_fs": open_memmap(paths["cfd_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
+        "windows_mV": open_memmap(paths["windows_mV"], mode="w+", dtype=np.float32, shape=(n_events, 2, relative_grid.size)),
+        "energy_led_time_fs": open_memmap(paths["energy_led_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
+        "energy_cfd_time_fs": open_memmap(paths["energy_cfd_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)),
         "energy_window_anchor_time_fs": open_memmap(
             paths["energy_window_anchor_time_fs"], mode="w+", dtype=np.int64,
-            shape=(selected_count, 2),
+            shape=(n_events, 2),
         ),
-        "valid": open_memmap(paths["valid"], mode="w+", dtype=np.bool_, shape=(selected_count,)),
+        "valid": open_memmap(paths["valid"], mode="w+", dtype=np.bool_, shape=(n_events,)),
     }
     np.save(paths["relative_time_ps"], relative_grid.astype(np.float32))
     if use_timing_channel_led:
         assert timing_relative_grid is not None
         arrays["timing_led_time_fs"] = open_memmap(
-            paths["timing_led_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)
+            paths["timing_led_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)
         )
         arrays["timing_cfd_time_fs"] = open_memmap(
-            paths["timing_cfd_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)
+            paths["timing_cfd_time_fs"], mode="w+", dtype=np.int64, shape=(n_events, 2)
         )
         arrays["timing_aligned_energy_window_anchor_time_fs"] = open_memmap(
             paths["timing_aligned_energy_window_anchor_time_fs"],
-            mode="w+", dtype=np.int64, shape=(selected_count, 2),
+            mode="w+", dtype=np.int64, shape=(n_events, 2),
         )
         arrays["timing_window_anchor_time_fs"] = open_memmap(
             paths["timing_window_anchor_time_fs"],
-            mode="w+", dtype=np.int64, shape=(selected_count, 2),
+            mode="w+", dtype=np.int64, shape=(n_events, 2),
         )
         arrays["timing_aligned_energy_windows_mV"] = open_memmap(
             paths["timing_aligned_energy_windows_mV"],
             mode="w+",
             dtype=np.float32,
-            shape=(selected_count, 2, relative_grid.size),
+            shape=(n_events, 2, relative_grid.size),
         )
         arrays["timing_windows_mV"] = open_memmap(
             paths["timing_windows_mV"], mode="w+", dtype=np.float32,
-            shape=(selected_count, 2, timing_relative_grid.size),
+            shape=(n_events, 2, timing_relative_grid.size),
         )
         np.save(
             paths["timing_relative_time_ps"],
             timing_relative_grid.astype(np.float32),
         )
-    if save_raw_energy:
-        arrays["raw_energy_led_time_fs"] = open_memmap(
-            paths["raw_energy_led_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)
-        )
-        arrays["raw_energy_cfd_time_fs"] = open_memmap(
-            paths["raw_energy_cfd_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)
-        )
-        arrays["raw_energy_window_anchor_time_fs"] = open_memmap(
-            paths["raw_energy_window_anchor_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)
-        )
-        arrays["raw_energy_windows_mV"] = open_memmap(
-            paths["raw_energy_windows_mV"], mode="w+", dtype=np.float32,
-            shape=(selected_count, 2, relative_grid.size),
-        )
-    if save_raw_timing:
-        assert timing_relative_grid is not None
-        arrays["raw_timing_led_time_fs"] = open_memmap(
-            paths["raw_timing_led_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)
-        )
-        arrays["raw_timing_cfd_time_fs"] = open_memmap(
-            paths["raw_timing_cfd_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)
-        )
-        arrays["raw_timing_window_anchor_time_fs"] = open_memmap(
-            paths["raw_timing_window_anchor_time_fs"], mode="w+", dtype=np.int64, shape=(selected_count, 2)
-        )
-        arrays["raw_timing_windows_mV"] = open_memmap(
-            paths["raw_timing_windows_mV"], mode="w+", dtype=np.float32,
-            shape=(selected_count, 2, timing_relative_grid.size),
-        )
-    if save_raw_timing_aligned_energy:
-        arrays["raw_timing_aligned_energy_window_anchor_time_fs"] = open_memmap(
-            paths["raw_timing_aligned_energy_window_anchor_time_fs"],
-            mode="w+", dtype=np.int64, shape=(selected_count, 2),
-        )
-        arrays["raw_timing_aligned_energy_windows_mV"] = open_memmap(
-            paths["raw_timing_aligned_energy_windows_mV"],
-            mode="w+", dtype=np.float32, shape=(selected_count, 2, relative_grid.size),
-        )
 
+    energy_polarities = tuple(int(item) for item in config["channels"]["polarities"])
     timing_polarities = (
         tuple(int(item) for item in config["channels"]["timing_polarities"])
         if use_timing_channel_led
@@ -963,14 +563,10 @@ def prepare_energy_cache(
     parallel = config["parallelization"]
     progress_every = max(1, int(io_config.get("progress_every", 1000)))
     written = 0
-    root_entry_offset = 0
 
     logger.info(
-        "Building preprocessing cache | selected photopeak events=%d/%d | "
-        "ML waveform branches samples_ch%d/samples_ch%d | "
+        "Building preprocessing cache | ML waveform branches samples_ch%d/samples_ch%d | "
         "native sampling interval %.6g ps",
-        selected_count,
-        n_events,
         energy_channels[0],
         energy_channels[1],
         native_interval_s * 1.0e12,
@@ -1018,9 +614,6 @@ def prepare_energy_cache(
         ):
             payloads: list[tuple[Any, ...]] = []
             for row in range(chunk.event_id.size):
-                root_entry = root_entry_offset + row
-                if root_entry >= n_events or not selected_entry_mask[root_entry]:
-                    continue
                 energy_raw_a = np.asarray(
                     ak.to_numpy(chunk.samples[0][row]), dtype=np.int16
                 )
@@ -1079,9 +672,8 @@ def prepare_energy_cache(
                         timing_native_interval_s,
                     )
                 )
-            root_entry_offset += int(chunk.event_id.size)
-            for result in _executor_map(_process_event, payloads, parallel):
-                if written >= selected_count:
+            for result in _executor_map(payloads, parallel):
+                if written >= n_events:
                     break
                 (
                     event_index,
@@ -1104,16 +696,6 @@ def prepare_energy_cache(
                     windows,
                     timing_aligned_energy_windows,
                     timing_windows,
-                    raw_energy_led,
-                    raw_timing_led,
-                    raw_energy_cfd,
-                    raw_timing_cfd,
-                    raw_energy_window_anchor,
-                    raw_timing_aligned_energy_anchor,
-                    raw_timing_window_anchor,
-                    raw_energy_windows,
-                    raw_timing_aligned_energy_windows,
-                    raw_timing_windows,
                     valid,
                 ) = result
                 arrays["event_index"][written] = event_index
@@ -1141,33 +723,12 @@ def prepare_energy_cache(
                         timing_aligned_energy_windows
                     )
                     arrays["timing_windows_mV"][written] = timing_windows
-                if save_raw_energy:
-                    arrays["raw_energy_led_time_fs"][written] = raw_energy_led
-                    arrays["raw_energy_cfd_time_fs"][written] = raw_energy_cfd
-                    arrays["raw_energy_window_anchor_time_fs"][written] = raw_energy_window_anchor
-                    arrays["raw_energy_windows_mV"][written] = raw_energy_windows
-                if save_raw_timing:
-                    arrays["raw_timing_led_time_fs"][written] = raw_timing_led
-                    arrays["raw_timing_cfd_time_fs"][written] = raw_timing_cfd
-                    arrays["raw_timing_window_anchor_time_fs"][written] = raw_timing_window_anchor
-                    arrays["raw_timing_windows_mV"][written] = raw_timing_windows
-                if save_raw_timing_aligned_energy:
-                    arrays["raw_timing_aligned_energy_window_anchor_time_fs"][written] = (
-                        raw_timing_aligned_energy_anchor
-                    )
-                    arrays["raw_timing_aligned_energy_windows_mV"][written] = (
-                        raw_timing_aligned_energy_windows
-                    )
                 arrays["valid"][written] = valid
                 written += 1
-                if written % progress_every == 0 or written == selected_count:
-                    logger.info("Timing preprocessing %d/%d selected events", written, selected_count)
-        if root_entry_offset != n_events:
-            raise RuntimeError(
-                f"Second ROOT pass expected {n_events} source events but scanned {root_entry_offset}"
-            )
-        if written != selected_count:
-            raise RuntimeError(f"Expected {selected_count} photopeak-selected events but wrote {written}")
+                if written % progress_every == 0 or written == n_events:
+                    logger.info("Preprocessed %d/%d events", written, n_events)
+        if written != n_events:
+            raise RuntimeError(f"Expected {n_events} events but wrote {written}")
         for array in arrays.values():
             array.flush()
         valid_events = int(np.count_nonzero(arrays["valid"]))
@@ -1175,23 +736,11 @@ def prepare_energy_cache(
             "format_version": CACHE_FORMAT_VERSION,
             "fingerprint": expected_fingerprint,
             "source": source_signature(input_path),
-            "event_count": selected_count,
-            "source_event_count": n_events,
-            "photopeak_preselection": preselection_summary,
-            "preselection_before_denoising_timing_windowing": True,
+            "event_count": n_events,
             "energy_channels_one_based": list(energy_channels),
             "timing_channels_one_based": (
                 list(timing_channels) if timing_channels is not None else []
             ),
-            "first_pass_branches_read": [
-                *[f"samples_ch{channel}" for channel in energy_channels],
-            ],
-            "first_pass_operations": [
-                "baseline", "raw_energy_amplitude", "raw_energy_noise",
-                "raw_energy_trigger", "photopeak_selection",
-            ],
-            "first_pass_excludes": ["denoising", "LED", "CFD", "windowing", "timing_channels"],
-            "expensive_preprocessing_events": selected_count,
             "branches_read": [
                 *[f"samples_ch{channel}" for channel in energy_channels],
                 *(
@@ -1251,18 +800,6 @@ def prepare_energy_cache(
             "correction_target_reference": "interpolated_led",
             "window_anchor_shift_factorization_supported": True,
             "timing_crossing_interpolation": "linear_between_bracketing_native_samples",
-            "channel_preprocessing_before_timing_extraction": True,
-            "energy_signal_variant": (
-                "denoised" if energy_preprocessing_denoised else "raw"
-            ),
-            "timing_signal_variant": (
-                "denoised" if timing_preprocessing_denoised else "raw"
-            ),
-            "raw_multithreshold_energy_saved": bool(save_raw_energy),
-            "raw_multithreshold_timing_saved": bool(save_raw_timing),
-            "raw_multithreshold_timing_aligned_energy_saved": bool(
-                save_raw_timing_aligned_energy
-            ),
             "deprecated_preprocessing_options_ignored": deprecated,
             "valid_events": valid_events,
             "preprocessing": _preprocessing_relevant(config),

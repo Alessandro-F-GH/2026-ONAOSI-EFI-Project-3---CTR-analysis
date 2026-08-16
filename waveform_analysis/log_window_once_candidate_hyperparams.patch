@@ -1,0 +1,68 @@
+--- a/ml_pipeline/study.py
++++ b/ml_pipeline/study.py
+@@ -1088,6 +1088,32 @@
+     }
+ 
+ 
++def _compact_candidate_params(overrides: dict[str, Any]) -> str:
++    """Short hyperparameter string for INFO logs only."""
++    aliases = {
++        "epsilon_values": "eps",
++        "hidden_units": "hidden",
++        "latent_units": "latent",
++        "learning_rate": "lr",
++        "weight_decay": "wd",
++        "batch_size": "batch",
++        "epochs_per_unit": "ep/unit",
++        "early_stopping_patience": "patience",
++    }
++    parts: list[str] = []
++    for key, value in overrides.items():
++        short_key = key.rsplit(".", 1)[-1]
++        short_key = aliases.get(short_key, short_key)
++        if isinstance(value, (list, tuple)) and len(value) == 1:
++            value = value[0]
++        if isinstance(value, float):
++            value_text = f"{value:g}"
++        else:
++            value_text = str(value)
++        parts.append(f"{short_key}={value_text}")
++    return " | ".join(parts) if parts else "default params"
++
++
+ def _select_waveform_space(
+     study: dict[str, Any], dataset: PreparedDataset, selection_indices: np.ndarray,
+     splits: list[tuple[np.ndarray, np.ndarray]], *, file_id: int, mode: str,
+@@ -1102,7 +1128,21 @@
+     )
+     best: dict[str, Any] | None = None
+     total = len(combinations)
++    last_scope: tuple[str, str, int] | None = None
+     for sequence, (window, variant, subsampling, overrides) in enumerate(combinations, start=1):
++        scope = (str(window["id"]), str(variant), int(subsampling))
++        if scope != last_scope:
++            start_ns = float(window.get("start_ns", float("nan")))
++            end_ns = float(window.get("end_ns", float("nan")))
++            if np.isfinite(start_ns) and np.isfinite(end_ns):
++                window_text = f"[{start_ns:g},{end_ns:+g}] ns"
++            else:
++                window_text = str(window["id"])
++            logger.info(
++                "%s search | window=%s | input=%s | subsampling=%d | candidates=%d",
++                space["id"], window_text, variant, int(subsampling), total,
++            )
++            last_scope = scope
+         descriptor = _candidate_descriptor(space, mode, window, variant, subsampling, overrides)
+         key = canonical_hash(descriptor)
+         candidate_id = candidate_ids.setdefault(key, len(candidate_ids))
+@@ -1118,8 +1158,8 @@
+         finally:
+             shutil.rmtree(candidate_work, ignore_errors=True)
+         logger.info(
+-            "Candidate %d/%d | %s | %s | s-CTR %.1f ps",
+-            sequence, total, space["id"], window["id"], float(metrics["ctr_ps"]),
++            "Candidate %d/%d | %s | s-CTR %.1f ps",
++            sequence, total, _compact_candidate_params(overrides), float(metrics["ctr_ps"]),
+         )
+         if result_rows is not None:
+             result_rows.append({

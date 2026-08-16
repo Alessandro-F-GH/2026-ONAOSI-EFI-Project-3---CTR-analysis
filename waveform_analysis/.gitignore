@@ -1,9 +1,7 @@
 __pycache__/
 *.py[cod]
-.ipynb_checkpoints/
-.cache/
-datasets/
-old/
+processed_data/
 results/
-processed_data/*
-*.log
+old/
+.venv/
+venv/

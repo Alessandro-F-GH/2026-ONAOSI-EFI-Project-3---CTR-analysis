@@ -169,51 +169,26 @@ def _fit_histogram_all_events(
                 (np.log(minimum_sigma), np.log(maximum_sigma))],
         options={"maxiter": 2000, "ftol": 1e-12},
     )
-
-    # L-BFGS-B can report an abnormal line-search termination for very broad or
-    # strongly non-Gaussian candidates even when its final parameters are finite
-    # and useful.  Evaluation must not crash simply because a candidate is poor.
-    # Use the optimizer result whenever it is numerically valid; otherwise fall
-    # back to the all-event Gaussian MLE (arithmetic mean/std).  No event is
-    # removed in either path.
-    optimizer_usable = (
-        np.asarray(getattr(result, "x", []), dtype=np.float64).shape == (2,)
-        and np.all(np.isfinite(result.x))
-        and np.isfinite(objective(np.asarray(result.x, dtype=np.float64)))
-    )
-    if optimizer_usable:
-        mean_fs = float(result.x[0])
-        sigma_fs = float(np.exp(result.x[1]))
-        used_fallback = False
-    else:
-        mean_fs = float(np.mean(values, dtype=np.float64))
-        sigma_fs = float(np.std(values, dtype=np.float64, ddof=0))
-        sigma_fs = float(np.clip(sigma_fs, minimum_sigma, maximum_sigma))
-        used_fallback = True
-
-    probabilities = _bin_probabilities(edges, mean_fs, sigma_fs)
-    if np.any(~np.isfinite(probabilities)):
+    if not result.success or np.any(~np.isfinite(result.x)):
         return None
+    mean_fs = float(result.x[0])
+    sigma_fs = float(np.exp(result.x[1]))
+    probabilities = _bin_probabilities(edges, mean_fs, sigma_fs)
     expected = values.size * probabilities
     deviance = _poisson_deviance(counts, expected)
     ndof = max(0, int(counts.size) - 2)
 
     mean_error_fs = np.nan
     sigma_error_fs = np.nan
-    if not used_fallback:
-        try:
-            inverse = result.hess_inv.todense() if hasattr(result.hess_inv, "todense") else np.asarray(result.hess_inv)
-            inverse = np.asarray(inverse, dtype=np.float64)
-            if inverse.shape == (2, 2):
-                mean_error_fs = float(np.sqrt(max(inverse[0, 0], 0.0)))
-                log_sigma_error = float(np.sqrt(max(inverse[1, 1], 0.0)))
-                sigma_error_fs = sigma_fs * log_sigma_error
-        except Exception:
-            pass
-    else:
-        # Standard large-sample errors for the direct all-event Gaussian MLE.
-        mean_error_fs = sigma_fs / np.sqrt(max(values.size, 1))
-        sigma_error_fs = sigma_fs / np.sqrt(max(2 * values.size, 1))
+    try:
+        inverse = result.hess_inv.todense() if hasattr(result.hess_inv, "todense") else np.asarray(result.hess_inv)
+        inverse = np.asarray(inverse, dtype=np.float64)
+        if inverse.shape == (2, 2):
+            mean_error_fs = float(np.sqrt(max(inverse[0, 0], 0.0)))
+            log_sigma_error = float(np.sqrt(max(inverse[1, 1], 0.0)))
+            sigma_error_fs = sigma_fs * log_sigma_error
+    except Exception:
+        pass
 
     return {
         "mean_fs": mean_fs,
@@ -227,7 +202,6 @@ def _fit_histogram_all_events(
         "expected": expected,
         "phase_fs": phase_fs,
         "iterations": int(getattr(result, "nit", 0)),
-        "optimizer_fallback": bool(used_fallback),
     }
 
 
@@ -242,11 +216,11 @@ def fit_delta_times_integer_fs(
 ) -> FitResult:
     """Fit one Gaussian timing distribution using every prepared event.
 
-    A single fixed histogram bin width is used for every evaluation. Several
-    bin-origin alignments are tried over exactly one bin width; the alignment
-    with the smallest reduced Poisson deviance is retained. Thus LED, CFD, ML
-    and multithreshold results differ only because of their data, not because
-    the fitter changes its bin size.
+    The histogram bin width is derived from a robust preliminary FWHM. Several
+    bin-origin phases are tried with the same width; the phase with the smallest
+    reduced Poisson deviance is retained. This makes the reported CTR much less
+    sensitive to arbitrary bin placement while preserving one identical fitting
+    protocol for LED, CFD, ML and multithreshold evaluation.
 
     No event is rejected by this function. Dataset-level selection must happen
     before evaluation.
@@ -265,11 +239,20 @@ def fit_delta_times_integer_fs(
                         message=f"Only {n_valid} valid events; need {min_events}")
 
     center_fs, sigma0_fs = _robust_location_scale(values)
-    width_ps = float(config.get("histogram_bin_ps", 10.0))
-    if not np.isfinite(width_ps) or width_ps <= 0.0:
-        raise ValueError("fit.histogram_bin_ps must be positive")
+    adaptive = config.get("adaptive_binning", {}) or {}
+    enabled = bool(adaptive.get("enabled", True))
+    if enabled:
+        bins_per_fwhm = float(adaptive.get("bins_per_fwhm", 10.0))
+        if not np.isfinite(bins_per_fwhm) or bins_per_fwhm <= 0.0:
+            raise ValueError("fit.adaptive_binning.bins_per_fwhm must be positive")
+        width_ps = (FWHM_FACTOR * sigma0_fs / FS_PER_PS) / bins_per_fwhm
+        min_width = float(adaptive.get("min_bin_ps", 1.0))
+        max_width = float(adaptive.get("max_bin_ps", 25.0))
+        width_ps = float(np.clip(width_ps, min_width, max_width))
+    else:
+        width_ps = float(config.get("histogram_bin_ps", 10.0))
     bin_width_fs = max(1, int(np.rint(width_ps * FS_PER_PS)))
-    phase_count = max(1, int(config.get("bin_phase_count", 10)))
+    phase_count = max(1, int(adaptive.get("phase_count", 8 if enabled else 1)))
 
     fits: list[dict[str, Any]] = []
     for phase_index in range(phase_count):
@@ -286,7 +269,7 @@ def fit_delta_times_integer_fs(
     if not fits:
         return _failure(method=method, parameter=parameter, n_total=n_total,
                         n_selected=n_selected, n_valid=n_valid,
-                        message="Gaussian fit failed for every bin alignment")
+                        message="Adaptive Gaussian fit failed for every bin phase")
 
     def quality(item: dict[str, Any]) -> tuple[float, float]:
         reduced = item["deviance"] / item["ndof"] if item["ndof"] > 0 else float("inf")

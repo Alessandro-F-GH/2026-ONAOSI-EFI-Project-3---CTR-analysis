@@ -1,0 +1,283 @@
+--- a/ml_pipeline/study_config.py
++++ b/ml_pipeline/study_config.py
+@@ -250,20 +250,46 @@
+ 
+ 
+ def _window(value: dict[str, Any], index: int) -> dict[str, Any]:
++    """Normalize one physical LED-relative window.
++
++    ``before_ns``/``after_ns`` keeps the legacy zero-straddling convention.
++    ``start_ns``/``end_ns`` additionally supports disjoint windows such as
++    [3,10] ns or [20,40] ns.  Internally the existing slicing API is preserved:
++    before_ns = -start_ns and after_ns = end_ns.
++    """
++
+     if not isinstance(value, dict):
+         raise MLConfigError("Every windows_ns entry must be an object")
++
+     if "before_ns" in value or "after_ns" in value:
+         before = float(value["before_ns"])
+         after = float(value["after_ns"])
++        if before <= 0 or after <= 0:
++            raise MLConfigError(
++                "Legacy before_ns/after_ns windows must use positive margins"
++            )
++        start = -before
++        end = after
+     else:
+         start = float(value["start_ns"])
+         end = float(value["end_ns"])
+-        if start > 0 or end <= 0 or end <= start:
+-            raise MLConfigError("Window start_ns/end_ns must straddle zero (e.g. -4, 20)")
+-        before, after = -start, end
+-    if before <= 0 or after <= 0:
+-        raise MLConfigError("Window before_ns and after_ns must be positive")
+-    return {"id": str(value.get("id", f"w{index}")), "before_ns": before, "after_ns": after}
++        if not np.isfinite(start) or not np.isfinite(end) or end <= start:
++            raise MLConfigError(
++                "Window start_ns/end_ns must be finite with end_ns > start_ns"
++            )
++        # Existing prediction slicing uses [-before_ns, +after_ns].
++        # Allowing signed margins preserves that implementation while supporting
++        # intervals that do not contain the LED anchor.
++        before = -start
++        after = end
++
++    return {
++        "id": str(value.get("id", f"w{index}")),
++        "start_ns": float(start),
++        "end_ns": float(end),
++        "before_ns": float(before),
++        "after_ns": float(after),
++    }
+ 
+ 
+ def _default_fit(raw: dict[str, Any] | None) -> dict[str, Any]:
+@@ -356,9 +382,14 @@
+     materialized["before"] = _finite(materialized["before"], "preprocessing.materialized_window_ns.before", positive=True)
+     materialized["after"] = _finite(materialized["after"], "preprocessing.materialized_window_ns.after", positive=True)
+     for window in cfg["windows_ns"]:
+-        if float(window["before_ns"]) > float(materialized["before"]) + 1e-12 or float(window["after_ns"]) > float(materialized["after"]) + 1e-12:
++        if (
++            float(window["start_ns"]) < -float(materialized["before"]) - 1e-12
++            or float(window["end_ns"]) > float(materialized["after"]) + 1e-12
++        ):
+             raise MLConfigError(
+-                f"Experiment window {window['id']!r} exceeds preprocessing.materialized_window_ns"
++                f"Experiment window {window['id']!r} "
++                f"[{window['start_ns']:g},{window['end_ns']:g}] ns exceeds "
++                "preprocessing.materialized_window_ns"
+             )
+     preprocessing.setdefault("materialization_chunk_size", 2048)
+     if int(preprocessing["materialization_chunk_size"]) <= 0:
+@@ -500,6 +531,7 @@
+     reporting.setdefault("max_ctr_to_led_ratio", 2.0)
+     reporting.setdefault("top_corrections_k", 3)
+     reporting.setdefault("ctr_uncertainty_bootstrap_samples", 1000)
++    reporting.setdefault("window_scan_bars", False)
+     if float(reporting["max_ctr_to_led_ratio"]) <= 0.0:
+         raise MLConfigError("reporting.max_ctr_to_led_ratio must be positive")
+     if int(reporting["top_corrections_k"]) < 0:
+--- a/ml_pipeline/reporting.py
++++ b/ml_pipeline/reporting.py
+@@ -84,6 +84,173 @@
+         ax.set_title(short_mode_label(mode)); ax.set_xlabel('Bias voltage [V]'); ax.set_ylabel('CTR [ps]'); ax.grid(alpha=.22); ax.legend(frameon=False,ncol=min(4,max(1,len(set(r['model'] for r in subset)))),fontsize=8)
+     if title:fig.suptitle(title,y=1.01)
+     _save(fig,path,dpi)
++
++
++
++def plot_window_scan_bars(
++    output_dir: Path,
++    *,
++    candidate_rows: list[dict[str, Any]],
++    report_rows: list[dict[str, Any]],
++    codebooks: dict[str, dict[str, int]],
++    windows: list[dict[str, Any]],
++    dpi: int,
++    ratio_limit: float,
++) -> None:
++    """One per-file validation bar plot for a physical window-ablation study.
++
++    For each model/window pair, only the best development-selection candidate
++    (hyperparameters, fixed input variant and subsampling) is shown.  LED/CFD
++    are window-independent validation baselines.  Blind results are deliberately
++    not used here, so this figure can be used to choose/localize an informative
++    time region without opening the blind set multiple times.
++    """
++
++    if not candidate_rows or not windows:
++        return
++
++    reverse_file = {int(v): str(k) for k, v in codebooks["file"].items()}
++    reverse_mode = {int(v): str(k) for k, v in codebooks["mode"].items()}
++    reverse_model = {int(v): str(k) for k, v in codebooks["model"].items()}
++    window_id_to_index = {str(w["id"]): int(codebooks["window"][str(w["id"])]) for w in windows}
++
++    def window_label(window: dict[str, Any]) -> str:
++        start = float(window.get("start_ns", -float(window["before_ns"])))
++        end = float(window.get("end_ns", float(window["after_ns"])))
++        return f"[{start:g},{end:+g}]"
++
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    for file_id, file_name in sorted(reverse_file.items()):
++        file_candidates = [
++            row for row in candidate_rows
++            if int(row.get("stage", -1)) == 0
++            and int(row.get("file_id", -1)) == file_id
++        ]
++        if not file_candidates:
++            continue
++
++        mode_ids = sorted({
++            int(row["mode_id"]) for row in file_candidates
++            if int(row.get("mode_id", -1)) in reverse_mode
++        })
++        if not mode_ids:
++            continue
++
++        fig, axes = plt.subplots(
++            len(mode_ids), 1,
++            figsize=(10.5, 4.4 * len(mode_ids)),
++            squeeze=False,
++            constrained_layout=True,
++        )
++
++        for ax, mode_id in zip(axes[:, 0], mode_ids):
++            mode = reverse_mode[mode_id]
++            validation_rows = [
++                row for row in report_rows
++                if int(row.get("file_id", -1)) == file_id
++                and str(row.get("mode", "")) == mode
++                and str(row.get("stage_name", "")) == "validation"
++            ]
++            led_row = next((r for r in validation_rows if str(r.get("model")) == "led"), None)
++            cfd_row = next((r for r in validation_rows if str(r.get("model")) == "cfd"), None)
++            led_ctr = float(led_row["ctr_ps"]) if led_row is not None else float("nan")
++            cfd_ctr = float(cfd_row["ctr_ps"]) if cfd_row is not None else float("nan")
++
++            model_ids = sorted({
++                int(row["model_id"]) for row in file_candidates
++                if int(row.get("mode_id", -1)) == mode_id
++                and reverse_model.get(int(row["model_id"]), "") not in {"led", "cfd"}
++            })
++            if not model_ids:
++                continue
++
++            x = np.arange(len(windows), dtype=np.float64)
++            width = 0.78 / max(1, len(model_ids))
++
++            for model_pos, model_id in enumerate(model_ids):
++                model = reverse_model[model_id]
++                values: list[float] = []
++                excluded: list[bool] = []
++
++                for window in windows:
++                    window_index = window_id_to_index[str(window["id"])]
++                    matches = [
++                        row for row in file_candidates
++                        if int(row.get("mode_id", -1)) == mode_id
++                        and int(row.get("model_id", -1)) == model_id
++                        and int(row.get("window_id", -999)) == window_index
++                        and np.isfinite(float(row.get("ctr_ps", np.nan)))
++                    ]
++                    if not matches:
++                        values.append(float("nan"))
++                        excluded.append(False)
++                        continue
++
++                    best = min(matches, key=lambda r: float(r["ctr_ps"]))
++                    ctr = float(best["ctr_ps"])
++                    bad = (
++                        np.isfinite(led_ctr)
++                        and led_ctr > 0.0
++                        and ctr > float(ratio_limit) * led_ctr
++                    )
++                    values.append(float("nan") if bad else ctr)
++                    excluded.append(bad)
++
++                offsets = (
++                    x - 0.39 + width / 2.0 + model_pos * width
++                    if len(model_ids) > 1 else x
++                )
++                bars = ax.bar(
++                    offsets,
++                    values,
++                    width=(width if len(model_ids) > 1 else 0.62),
++                    label=short_model_label(model),
++                )
++                for bar, ctr in zip(bars, values):
++                    if np.isfinite(ctr):
++                        ax.text(
++                            bar.get_x() + bar.get_width() / 2.0,
++                            ctr,
++                            f"{ctr:.0f}",
++                            ha="center",
++                            va="bottom",
++                            fontsize=8,
++                        )
++
++                for xpos, is_excluded in zip(offsets, excluded):
++                    if is_excluded:
++                        ax.text(
++                            xpos, 0.02,
++                            ">2× LED",
++                            transform=ax.get_xaxis_transform(),
++                            ha="center", va="bottom",
++                            rotation=90, fontsize=7,
++                        )
++
++            if np.isfinite(led_ctr):
++                ax.axhline(
++                    led_ctr, linestyle="--", linewidth=1.2,
++                    label=f"LED {led_ctr:.0f} ps",
++                )
++            if np.isfinite(cfd_ctr):
++                ax.axhline(
++                    cfd_ctr, linestyle=":", linewidth=1.2,
++                    label=f"CFD {cfd_ctr:.0f} ps",
++                )
++
++            ax.set_xticks(x, [window_label(w) for w in windows])
++            ax.set_xlabel("Disjoint LED-relative window [ns]")
++            ax.set_ylabel("Validation s-CTR [ps]")
++            ax.set_title(short_mode_label(mode))
++            ax.grid(axis="y", alpha=0.22)
++            ax.legend(frameon=False, fontsize=8, ncol=min(4, len(model_ids) + 2))
++
++        fig.suptitle(
++            f"{Path(file_name).stem} · disjoint-window validation scan",
++            fontsize=13,
++        )
++        _save(fig, output_dir / f"{Path(file_name).stem}.png", dpi)
+ 
+ 
+ def plot_final_bars(path:Path, *, rows:list[dict[str,Any]], dpi:int):
+--- a/ml_pipeline/study.py
++++ b/ml_pipeline/study.py
+@@ -40,6 +40,7 @@
+ from .reporting import (
+     plot_blind_distribution, plot_correction_matrix, plot_ctr_vs_voltage,
+     plot_final_bars, plot_selection_vs_blind, plot_top_corrections,
++    plot_window_scan_bars,
+     write_csv as write_report_csv, write_summary_results,
+ )
+ 
+@@ -1846,6 +1847,16 @@
+         title="Blind CTR vs voltage",
+     )
+     plot_final_bars(plots_root / "blind_ctr_bar_by_voltage.png", rows=report_rows, dpi=dpi)
++    if bool(config["reporting"].get("window_scan_bars", False)):
++        plot_window_scan_bars(
++            plots_root / "window_scan",
++            candidate_rows=rows,
++            report_rows=report_rows,
++            codebooks=codebooks,
++            windows=config["windows_ns"],
++            dpi=dpi,
++            ratio_limit=ratio_limit,
++        )
+     plot_selection_vs_blind(
+         plots_root / "validation_vs_blind_ctr.png", rows=report_rows,
+         selection_stage="validation", dpi=dpi,

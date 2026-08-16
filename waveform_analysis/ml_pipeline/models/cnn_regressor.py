@@ -21,6 +21,7 @@ from ..training_utils import (
     checkpoint_context,
     evaluate_model,
     evaluate_model_with_optional_fit,
+    ctr_log_text,
     fit_schedule_for_epoch,
     make_split_loader,
     predict_loader,
@@ -282,7 +283,7 @@ def build(config: dict[str, Any], input_length: int) -> nn.Module:
 
 
 class _ZeroCorrectionModel(nn.Module):
-    apply_window_anchor_shift = True
+    apply_window_anchor_shift = False
 
     def forward(self, waveform_pair: torch.Tensor) -> torch.Tensor:
         return torch.zeros(
@@ -349,12 +350,11 @@ def train(context: TrainingContext) -> dict[str, Any]:
         perform_fit=perform_internal_fit,
     )
     context.logger.debug(
-        "Uncorrected LED baseline | train RMSE %.3f ps CTR %.3f ps | "
-        "validation RMSE %.3f ps CTR %.3f ps bias %.3f ps",
+        "LED baseline | train RMSE %.1f ps %s | val RMSE %.1f ps %s bias %.1f ps",
         baseline_train_metrics["rmse_ps"],
-        baseline_train_metrics["ctr_ps"],
+        ctr_log_text(baseline_train_metrics),
         baseline_validation_metrics["rmse_ps"],
-        baseline_validation_metrics["ctr_ps"],
+        ctr_log_text(baseline_validation_metrics),
         baseline_validation_metrics["bias_ps"],
     )
 
@@ -582,16 +582,16 @@ def train(context: TrainingContext) -> dict[str, Any]:
                 last_path,
             )
         context.logger.debug(
-            "Epoch %d/%d | train RMSE %.3f ps | val RMSE %.3f ps | val CTR %s | val bias %.3f ps",
+            "Epoch %d/%d | train RMSE %.1f ps | val RMSE %.1f ps | %s | val bias %.1f ps",
             epoch,
             epochs,
             row["train_rmse_ps"],
             row["validation_rmse_ps"],
-            (f"{row['validation_ctr_ps']:.3f} ps" if math.isfinite(row["validation_ctr_ps"]) else "not fitted"),
+            ctr_log_text(validation_metrics),
             row["validation_bias_ps"],
         )
         if bad_epochs >= patience:
-            context.logger.debug("Early stopping after %d epochs without improvement", bad_epochs)
+            context.logger.info("Early stopping after %d epochs without improvement", bad_epochs)
             break
 
     if best_state is None:

@@ -6,9 +6,10 @@ import json
 import math
 from pathlib import Path
 from typing import Any
+import numpy as np
 
 from .common import canonical_hash
-from .config import MLConfigError
+from .config import MLConfigError, resolve_fit_config
 from .models import model_registry
 
 CHANNEL_MODES: dict[str, tuple[str, str]] = {
@@ -16,11 +17,135 @@ CHANNEL_MODES: dict[str, tuple[str, str]] = {
     "energy_to_timing": ("energy", "timing_led"),
     "timing_to_timing": ("timing", "timing_led"),
 }
-RETAINED_MODELS = {
-    "linear_svr",
-    "constructive_mlp_encoder",
-    "cnn_regressor"
-}
+RETAINED_MODELS = {"linear_svr", "constructive_mlp_encoder", "cnn_regressor"}
+
+# Exact retained search spaces from the working repository. External JSON files
+# still override these when present; this fallback keeps the code-only bundle
+# runnable when config/model_spaces is intentionally not shipped.
+BUILTIN_MODEL_SPACES: dict[str, dict[str, Any]] = {'constructive_mlp': {'id': 'constructive_mlp',
+                      'model_type': 'constructive_mlp_encoder',
+                      'base_train_config': {'model': {'type': 'constructive_mlp_encoder',
+                                                      'name': 'constructive_mlp',
+                                                      'activation': 'silu',
+                                                      'max_units': 12,
+                                                      'unit_bias': True,
+                                                      'max_abs_single_channel_output_ps': None,
+                                                      'loss': {'type': 'mse'}},
+                                            'optimizer': {'learning_rate': 0.001, 'weight_decay': 1e-06},
+                                            'training': {'device': 'auto',
+                                                         'seed': 20260813,
+                                                         'epochs_per_unit': 150,
+                                                         'batch_size': 128,
+                                                         'mixed_precision': True,
+                                                         'gradient_clip_norm': 10.0,
+                                                         'unit_early_stopping_patience': 15,
+                                                         'unit_early_stopping_min_delta_ps': 0.01,
+                                                         'min_unit_improvement_ps': 0.05,
+                                                         'min_relative_unit_improvement': 0.0,
+                                                         'normalization_chunk_size': 4096,
+                                                         'num_workers': 0,
+                                                         'pin_memory': False,
+                                                         'fit_interval_epochs': 0,
+                                                         'fit_train_during_training': False,
+                                                         'fit_validation_during_training': False,
+                                                         'selection_metric': 'validation_rmse',
+                                                         'random_pair_swap': True,
+                                                         'baseline_guard_metric': None},
+                                            'output': {'train_dir': 'resolved_by_study'}},
+                      'search': {'method': 'random',
+                                 'parameters': {'model.activation': {'type': 'categorical', 'values': ['silu', 'tanh']},
+                                                'model.max_units': {'type': 'categorical', 'values': [6, 12, 20]},
+                                                'optimizer.learning_rate': {'type': 'categorical',
+                                                                            'values': [0.0003, 0.001, 0.003]},
+                                                'optimizer.weight_decay': {'type': 'categorical',
+                                                                           'values': [0.0, 1e-06, 0.0001]},
+                                                'training.early_stop_fraction': {'type': 'categorical',
+                                                                                 'values': [0.1, 0.15, 0.2]}},
+                                 'n_trials': 20}},
+ 'linear_svr': {'id': 'linear_svr',
+                'model_type': 'linear_svr',
+                'base_train_config': {'model': {'type': 'linear_svr',
+                                                'name': 'linear_svr',
+                                                'C': 10.0,
+                                                'epsilon_values': [20.0],
+                                                'svm_loss': 'epsilon_insensitive',
+                                                'loss': {'type': 'rmse'},
+                                                'tolerance': 0.001,
+                                                'max_iterations': 10000,
+                                                'dual': 'auto'},
+                                      'training': {'device': 'cpu',
+                                                   'seed': 20260813,
+                                                   'batch_size': 1024,
+                                                   'normalization_chunk_size': 4096,
+                                                   'svr_materialization_chunk_size': 4096,
+                                                   'num_workers': 0,
+                                                   'pin_memory': False,
+                                                   'random_pair_swap': False,
+                                                   'baseline_guard_metric': None},
+                                      'output': {'train_dir': 'resolved_by_study'}},
+                'search': {'method': 'grid',
+                           'parameters': {'model.C': {'type': 'categorical', 'values': [0.1, 1.0, 10.0, 100.0]},
+                                          'model.epsilon_values': {'type': 'categorical',
+                                                                   'values': [[0.0],
+                                                                              [10.0],
+                                                                              [20.0],
+                                                                              [40.0],
+                                                                              [80.0]]}}}},
+ 'cnn': {'id': 'cnn',
+         'model_type': 'cnn_regressor',
+         'base_train_config': {'model': {'type': 'cnn_regressor',
+                                         'name': 'cnn',
+                                         'channels': [16, 32, 64],
+                                         'kernel_sizes': [11, 7, 5],
+                                         'strides': [4, 2, 2],
+                                         'dilations': [1, 1, 1],
+                                         'activation': 'silu',
+                                         'normalization': 'batch',
+                                         'group_norm_groups': 4,
+                                         'conv_dropout': 0.0,
+                                         'adaptive_pool_length': 8,
+                                         'dense_units': [64, 16],
+                                         'dense_dropout': 0.0,
+                                         'max_abs_single_channel_output_ps': None,
+                                         'loss': {'type': 'mse'}},
+                               'optimizer': {'learning_rate': 0.001, 'weight_decay': 1e-06},
+                               'training': {'device': 'auto',
+                                            'seed': 20260813,
+                                            'epochs': 250,
+                                            'batch_size': 128,
+                                            'mixed_precision': True,
+                                            'gradient_clip_norm': 10.0,
+                                            'early_stopping_patience': 20,
+                                            'early_stopping_min_delta_ps': 0.01,
+                                            'normalization_chunk_size': 4096,
+                                            'num_workers': 0,
+                                            'pin_memory': False,
+                                            'fit_interval_epochs': 0,
+                                            'fit_train_during_training': False,
+                                            'fit_validation_during_training': False,
+                                            'selection_metric': 'validation_rmse',
+                                            'random_pair_swap': True,
+                                            'baseline_guard_metric': None},
+                               'output': {'train_dir': 'resolved_by_study'}},
+         'search': {'method': 'random',
+                    'n_trials': 16,
+                    'parameters': {'model.channels': {'type': 'categorical',
+                                                      'values': [[8, 16, 32], [16, 32, 64], [24, 48, 96]]},
+                                   'model.kernel_sizes': {'type': 'categorical',
+                                                          'values': [[11, 7, 5], [17, 9, 5], [9, 5, 3]]},
+                                   'model.strides': {'type': 'categorical',
+                                                     'values': [[4, 2, 2], [4, 4, 2], [2, 2, 2]]},
+                                   'model.dilations': {'type': 'categorical',
+                                                       'values': [[1, 1, 1], [1, 2, 4], [1, 1, 2]]},
+                                   'model.normalization': {'type': 'categorical', 'values': ['batch', 'group', 'none']},
+                                   'model.conv_dropout': {'type': 'categorical', 'values': [0.0, 0.05, 0.1]},
+                                   'model.dense_units': {'type': 'categorical', 'values': [[32], [64, 16], [128, 32]]},
+                                   'model.dense_dropout': {'type': 'categorical', 'values': [0.0, 0.1]},
+                                   'optimizer.learning_rate': {'type': 'loguniform', 'low': 0.0001, 'high': 0.003},
+                                   'optimizer.weight_decay': {'type': 'loguniform', 'low': 1e-08, 'high': 0.001},
+                                   'training.batch_size': {'type': 'categorical', 'values': [64, 128, 256]},
+                                   'training.early_stop_fraction': {'type': 'categorical',
+                                                                    'values': [0.1, 0.15, 0.2]}}}}}
 
 
 def _finite(value: Any, name: str, *, positive: bool = False, nonnegative: bool = False) -> float:
@@ -126,20 +251,58 @@ def load_model_space(path: Path) -> dict[str, Any]:
 
 
 def _window(value: dict[str, Any], index: int) -> dict[str, Any]:
+    """Normalize one physical LED-relative window.
+
+    ``before_ns``/``after_ns`` keeps the legacy zero-straddling convention.
+    ``start_ns``/``end_ns`` additionally supports disjoint windows such as
+    [3,10] ns or [20,40] ns.  Internally the existing slicing API is preserved:
+    before_ns = -start_ns and after_ns = end_ns.
+    """
+
     if not isinstance(value, dict):
         raise MLConfigError("Every windows_ns entry must be an object")
+
     if "before_ns" in value or "after_ns" in value:
         before = float(value["before_ns"])
         after = float(value["after_ns"])
+        if before <= 0 or after <= 0:
+            raise MLConfigError(
+                "Legacy before_ns/after_ns windows must use positive margins"
+            )
+        start = -before
+        end = after
     else:
         start = float(value["start_ns"])
         end = float(value["end_ns"])
-        if start > 0 or end <= 0 or end <= start:
-            raise MLConfigError("Window start_ns/end_ns must straddle zero (e.g. -4, 20)")
-        before, after = -start, end
-    if before <= 0 or after <= 0:
-        raise MLConfigError("Window before_ns and after_ns must be positive")
-    return {"id": str(value.get("id", f"w{index}")), "before_ns": before, "after_ns": after}
+        if not np.isfinite(start) or not np.isfinite(end) or end <= start:
+            raise MLConfigError(
+                "Window start_ns/end_ns must be finite with end_ns > start_ns"
+            )
+        # Existing prediction slicing uses [-before_ns, +after_ns].
+        # Allowing signed margins preserves that implementation while supporting
+        # intervals that do not contain the LED anchor.
+        before = -start
+        after = end
+
+    return {
+        "id": str(value.get("id", f"w{index}")),
+        "start_ns": float(start),
+        "end_ns": float(end),
+        "before_ns": float(before),
+        "after_ns": float(after),
+    }
+
+
+def _default_fit(raw: dict[str, Any] | None) -> dict[str, Any]:
+    fit = resolve_fit_config(raw)
+    adaptive = copy.deepcopy(fit.get("adaptive_binning", {}))
+    adaptive.setdefault("enabled", True)
+    adaptive.setdefault("bins_per_fwhm", 10.0)
+    adaptive.setdefault("min_bin_ps", 1.0)
+    adaptive.setdefault("max_bin_ps", 25.0)
+    adaptive.setdefault("phase_count", 8)
+    fit["adaptive_binning"] = adaptive
+    return fit
 
 
 def _validate_search(space: dict[str, Any]) -> None:
@@ -209,6 +372,26 @@ def load_study_config(path: str | Path, project_root: str | Path) -> dict[str, A
 
     preprocessing = cfg.setdefault("preprocessing", {})
     preprocessing["prepared_dir"] = str(_resolve(root, preprocessing.get("prepared_dir", "processed_data/ml_prepared")))
+    preprocessing["selection_store_dir"] = str(
+        _resolve(root, preprocessing.get("selection_store_dir", "processed_data/selected_events"))
+    )
+    materialized = preprocessing.setdefault("materialized_window_ns", {})
+    if not isinstance(materialized, dict):
+        raise MLConfigError("preprocessing.materialized_window_ns must be an object")
+    materialized.setdefault("before", max(float(w["before_ns"]) for w in cfg["windows_ns"]))
+    materialized.setdefault("after", max(float(w["after_ns"]) for w in cfg["windows_ns"]))
+    materialized["before"] = _finite(materialized["before"], "preprocessing.materialized_window_ns.before", positive=True)
+    materialized["after"] = _finite(materialized["after"], "preprocessing.materialized_window_ns.after", positive=True)
+    for window in cfg["windows_ns"]:
+        if (
+            float(window["start_ns"]) < -float(materialized["before"]) - 1e-12
+            or float(window["end_ns"]) > float(materialized["after"]) + 1e-12
+        ):
+            raise MLConfigError(
+                f"Experiment window {window['id']!r} "
+                f"[{window['start_ns']:g},{window['end_ns']:g}] ns exceeds "
+                "preprocessing.materialized_window_ns"
+            )
     preprocessing.setdefault("materialization_chunk_size", 2048)
     if int(preprocessing["materialization_chunk_size"]) <= 0:
         raise MLConfigError("preprocessing.materialization_chunk_size must be positive")
@@ -231,16 +414,10 @@ def load_study_config(path: str | Path, project_root: str | Path) -> dict[str, A
     if not isinstance(led_outlier, dict):
         raise MLConfigError("preprocessing.selection.led_outlier_rejection must be an object")
     if bool(led_outlier.get("enabled", False)):
-        if "max_distance_ps" in led_outlier:
-            raise MLConfigError(
-                "preprocessing.selection.led_outlier_rejection.max_distance_ps is obsolete; "
-                "use zscore_limit for robust dataset-level LED mismatch rejection"
-            )
-        _finite(
-            led_outlier.get("zscore_limit", 6.0),
-            "preprocessing.selection.led_outlier_rejection.zscore_limit",
-            positive=True,
-        )
+        if "zscore_limit" in led_outlier:
+            _finite(led_outlier.get("zscore_limit"), "led_outlier_rejection.zscore_limit", positive=True)
+        else:
+            _finite(led_outlier.get("max_distance_ps", 300.0), "led_outlier_rejection.max_distance_ps", positive=True)
 
     photopeak = preprocessing.setdefault("photopeak", {"enabled": False})
     if not isinstance(photopeak, dict):
@@ -258,36 +435,9 @@ def load_study_config(path: str | Path, project_root: str | Path) -> dict[str, A
         if float(photopeak.get("selection_sigma_low", -2.0)) >= float(photopeak.get("selection_sigma_high", 4.0)):
             raise MLConfigError("photopeak selection_sigma_low must be below selection_sigma_high")
 
-    if "input_variants" in preprocessing:
-        raise MLConfigError(
-            "preprocessing.input_variants is obsolete because it duplicates the ML search. "
-            "Use preprocessing.input_variant_by_channel with explicit energy/timing choices."
-        )
-    variants = preprocessing.setdefault(
-        "input_variant_by_channel", {"energy": "raw", "timing": "raw"}
-    )
-    if not isinstance(variants, dict):
-        raise MLConfigError("preprocessing.input_variant_by_channel must be an object")
-    unknown_variant_channels = sorted(set(variants) - {"energy", "timing"})
-    if unknown_variant_channels:
-        raise MLConfigError(
-            "preprocessing.input_variant_by_channel has unsupported keys: "
-            + ", ".join(unknown_variant_channels)
-        )
-    for channel_type in ("energy", "timing"):
-        value = str(variants.get(channel_type, "raw")).strip().lower()
-        if value not in {"raw", "denoised"}:
-            raise MLConfigError(
-                f"preprocessing.input_variant_by_channel.{channel_type} must be raw or denoised"
-            )
-        variants[channel_type] = value
-    preprocessing["input_variant_by_channel"] = variants
-
-    denoising = preprocessing.setdefault("denoising", {})
-    needs_denoising = any(value == "denoised" for value in variants.values())
-    # ``enabled`` is derived from the channel policy, not a second independent knob.
-    denoising["enabled"] = needs_denoising
-    if needs_denoising:
+    denoising = preprocessing.setdefault("denoising", {"enabled": False})
+    denoising.setdefault("enabled", False)
+    if denoising["enabled"]:
         denoising.setdefault("method", "butterworth_lowpass")
         denoising.setdefault("cutoff_GHz", 1.0)
         denoising.setdefault("order", 4)
@@ -296,27 +446,82 @@ def load_study_config(path: str | Path, project_root: str | Path) -> dict[str, A
         _finite(denoising["cutoff_GHz"], "preprocessing.denoising.cutoff_GHz", positive=True)
         if int(denoising["order"]) < 1:
             raise MLConfigError("preprocessing.denoising.order must be >= 1")
+    variant_by_channel = preprocessing.get("input_variant_by_channel")
+    if variant_by_channel is not None:
+        if not isinstance(variant_by_channel, dict):
+            raise MLConfigError("preprocessing.input_variant_by_channel must be an object")
+        resolved_variant_by_channel = {
+            "energy": str(variant_by_channel.get("energy", "raw")).lower(),
+            "timing": str(variant_by_channel.get("timing", "raw")).lower(),
+        }
+        if any(v not in {"raw", "denoised"} for v in resolved_variant_by_channel.values()):
+            raise MLConfigError("input_variant_by_channel supports only raw/denoised")
+        if resolved_variant_by_channel["energy"] == "denoised" and not bool(denoising.get("enabled", False)):
+            raise MLConfigError("energy denoising requested but preprocessing.denoising.enabled is false")
+        if resolved_variant_by_channel["timing"] == "denoised":
+            raise MLConfigError(
+                "Timing-channel denoising is intentionally disabled in the canonical pipeline; use raw timing"
+            )
+        preprocessing["input_variant_by_channel"] = resolved_variant_by_channel
+        variants = list(dict.fromkeys(resolved_variant_by_channel.values()))
+    else:
+        variants = [str(v).lower() for v in preprocessing.get("input_variants", ["raw"])]
+        if any(v not in {"raw", "denoised"} for v in variants):
+            raise MLConfigError("preprocessing.input_variants supports only raw/denoised")
+        if "denoised" in variants and not bool(denoising.get("enabled", False)):
+            raise MLConfigError("input_variants includes denoised but preprocessing.denoising.enabled is false")
+    preprocessing["input_variants"] = variants
     factors = [int(v) for v in preprocessing.get("subsampling_factors", [1])]
     if any(v <= 0 for v in factors):
         raise MLConfigError("preprocessing.subsampling_factors must be positive")
     preprocessing["subsampling_factors"] = factors
 
-    cv = cfg.setdefault("cross_validation", {})
-    cv.setdefault("n_splits", 5)
-    cv.setdefault("seed", 20260813)
-    cv.setdefault("blind_fraction", 0.2)
-    cv.setdefault("early_stop_fraction", 0.15)
-    if int(cv["n_splits"]) < 2:
-        raise MLConfigError("cross_validation.n_splits must be >= 2")
-    if not 0.0 < float(cv["blind_fraction"]) < 0.5:
-        raise MLConfigError("cross_validation.blind_fraction must be in (0, 0.5)")
-    if not 0.0 < float(cv["early_stop_fraction"]) < 0.5:
-        raise MLConfigError("cross_validation.early_stop_fraction must be in (0, 0.5)")
+    legacy_cv = cfg.setdefault("cross_validation", {})
+    validation = cfg.setdefault("validation", {})
+    strategy = str(validation.get("strategy", "cv")).strip().lower()
+    if strategy not in {"holdout", "cv", "nested"}:
+        raise MLConfigError("validation.strategy must be holdout, cv, or nested")
+    validation["strategy"] = strategy
+    validation.setdefault("seed", legacy_cv.get("seed", 20260813))
+    validation.setdefault("blind_fraction", legacy_cv.get("blind_fraction", 0.2))
+    validation.setdefault("holdout_fraction", 0.2)
+    validation.setdefault("n_splits", legacy_cv.get("n_splits", 5))
+    validation.setdefault("early_stop_fraction", legacy_cv.get("early_stop_fraction", 0.15))
+    if not 0.0 < float(validation["blind_fraction"]) < 0.5:
+        raise MLConfigError("validation.blind_fraction must be in (0, 0.5)")
+    if not 0.0 < float(validation["holdout_fraction"]) < 0.5:
+        raise MLConfigError("validation.holdout_fraction must be in (0, 0.5)")
+    if int(validation["n_splits"]) < 2:
+        raise MLConfigError("validation.n_splits must be >= 2")
+    if not 0.0 < float(validation["early_stop_fraction"]) < 0.5:
+        raise MLConfigError("validation.early_stop_fraction must be in (0, 0.5)")
+    nested = validation.setdefault("nested", {})
+    nested.setdefault("outer_folds", 5)
+    nested.setdefault("inner_strategy", "holdout")
+    nested.setdefault("inner_holdout_fraction", float(validation["holdout_fraction"]))
+    nested.setdefault("inner_folds", int(validation["n_splits"]))
+    if int(nested["outer_folds"]) < 2:
+        raise MLConfigError("validation.nested.outer_folds must be >= 2")
+    inner_strategy = str(nested["inner_strategy"]).strip().lower()
+    if inner_strategy not in {"holdout", "cv"}:
+        raise MLConfigError("validation.nested.inner_strategy must be holdout or cv")
+    nested["inner_strategy"] = inner_strategy
+    if not 0.0 < float(nested["inner_holdout_fraction"]) < 0.5:
+        raise MLConfigError("validation.nested.inner_holdout_fraction must be in (0, 0.5)")
+    if int(nested["inner_folds"]) < 2:
+        raise MLConfigError("validation.nested.inner_folds must be >= 2")
 
-    if "fit" in cfg:
+    # Compatibility mirror for the unchanged working model/training code.
+    legacy_cv["seed"] = int(validation["seed"])
+    legacy_cv["blind_fraction"] = float(validation["blind_fraction"])
+    legacy_cv["n_splits"] = int(validation["n_splits"])
+    legacy_cv["early_stop_fraction"] = float(validation["early_stop_fraction"])
+
+    cfg["fit"] = _default_fit(cfg.get("fit"))
+    if int(cfg["fit"]["min_events"]) > minimum_events:
         raise MLConfigError(
-            "Experiment-level 'fit' is obsolete: CTR is estimated from the ordinary "
-            "sample standard deviation independently on each CV score fold and on blind."
+            "fit.min_events cannot exceed preprocessing.selection.minimum_events; "
+            "otherwise a successfully prepared dataset may be impossible to evaluate"
         )
     reporting = cfg.setdefault("reporting", {})
     reporting.setdefault("dpi", 180)
@@ -324,6 +529,16 @@ def load_study_config(path: str | Path, project_root: str | Path) -> dict[str, A
         raise MLConfigError("reporting.dpi must be positive")
     reporting.setdefault("voltage_pattern", r"(?P<voltage>\d+(?:\.\d+)?)V")
     reporting.setdefault("save_final_fit_plots", True)
+    reporting.setdefault("max_ctr_to_led_ratio", 2.0)
+    reporting.setdefault("top_corrections_k", 3)
+    reporting.setdefault("ctr_uncertainty_bootstrap_samples", 1000)
+    reporting.setdefault("window_scan_bars", False)
+    if float(reporting["max_ctr_to_led_ratio"]) <= 0.0:
+        raise MLConfigError("reporting.max_ctr_to_led_ratio must be positive")
+    if int(reporting["top_corrections_k"]) < 0:
+        raise MLConfigError("reporting.top_corrections_k must be non-negative")
+    if int(reporting["ctr_uncertainty_bootstrap_samples"]) < 0:
+        raise MLConfigError("reporting.ctr_uncertainty_bootstrap_samples must be non-negative")
     xai = reporting.setdefault("xai", {"enabled": True, "max_events": 512})
     if bool(xai.get("enabled", True)):
         if int(xai.get("max_events", 512)) <= 0 or int(xai.get("integrated_gradient_steps", 16)) <= 0:
@@ -337,9 +552,14 @@ def load_study_config(path: str | Path, project_root: str | Path) -> dict[str, A
     model_spaces: list[dict[str, Any]] = []
     for name in requested:
         candidate = model_dir / f"{name}.json"
-        if not candidate.is_file():
-            raise MLConfigError(f"Model-space config not found: {candidate}")
-        space = load_model_space(candidate)
+        if candidate.is_file():
+            space = load_model_space(candidate)
+        elif name in BUILTIN_MODEL_SPACES:
+            space = copy.deepcopy(BUILTIN_MODEL_SPACES[name])
+        else:
+            raise MLConfigError(
+                f"Model-space config not found: {candidate}; no built-in retained space named {name!r}"
+            )
         _validate_search(space)
         model_spaces.append(space)
     if len({str(space["id"]) for space in model_spaces}) != len(model_spaces):

@@ -7,8 +7,8 @@ from typing import Any
 import numpy as np
 
 from .common import read_json
-DATASET_FORMAT_VERSION = 7
-_SUPPORTED_DATASET_FORMAT_VERSIONS = {1, 2, 3, 4, 5, 6, 7}
+DATASET_FORMAT_VERSION = 6
+_SUPPORTED_DATASET_FORMAT_VERSIONS = {1, 2, 3, 4, 5, 6}
 _ARRAY_NAMES = (
     "event_id", "event_index", "source_file_id", "source_run_index",
     "bias_voltage_V", "amplitude_mV", "noise_rms_mV", "trigger_index",
@@ -27,16 +27,6 @@ _OPTIONAL_ARRAY_NAMES = (
     "denoised_windows_mV",
     "denoised_timing_aligned_energy_windows_mV",
     "denoised_timing_windows_mV",
-    "raw_energy_led_time_fs",
-    "raw_timing_led_time_fs",
-    "raw_energy_cfd_time_fs",
-    "raw_timing_cfd_time_fs",
-    "raw_energy_window_anchor_time_fs",
-    "raw_timing_aligned_energy_window_anchor_time_fs",
-    "raw_timing_window_anchor_time_fs",
-    "raw_energy_windows_mV",
-    "raw_timing_aligned_energy_windows_mV",
-    "raw_timing_windows_mV",
 )
 
 
@@ -69,16 +59,6 @@ class PreparedDataset:
     denoised_windows_mV: np.ndarray | None = None
     denoised_timing_aligned_energy_windows_mV: np.ndarray | None = None
     denoised_timing_windows_mV: np.ndarray | None = None
-    raw_energy_led_time_fs: np.ndarray | None = None
-    raw_timing_led_time_fs: np.ndarray | None = None
-    raw_energy_cfd_time_fs: np.ndarray | None = None
-    raw_timing_cfd_time_fs: np.ndarray | None = None
-    raw_energy_window_anchor_time_fs: np.ndarray | None = None
-    raw_timing_aligned_energy_window_anchor_time_fs: np.ndarray | None = None
-    raw_timing_window_anchor_time_fs: np.ndarray | None = None
-    raw_energy_windows_mV: np.ndarray | None = None
-    raw_timing_aligned_energy_windows_mV: np.ndarray | None = None
-    raw_timing_windows_mV: np.ndarray | None = None
     timing_relative_time_ps: np.ndarray | None = None
     train: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
     validation: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
@@ -181,20 +161,6 @@ def load_prepared_dataset(directory: str | Path) -> PreparedDataset:
         denoised_windows_mV=_load_optional_array(directory, "denoised_windows_mV"),
         denoised_timing_aligned_energy_windows_mV=_load_optional_array(directory, "denoised_timing_aligned_energy_windows_mV"),
         denoised_timing_windows_mV=_load_optional_array(directory, "denoised_timing_windows_mV"),
-        raw_energy_led_time_fs=_load_optional_array(directory, "raw_energy_led_time_fs"),
-        raw_timing_led_time_fs=_load_optional_array(directory, "raw_timing_led_time_fs"),
-        raw_energy_cfd_time_fs=_load_optional_array(directory, "raw_energy_cfd_time_fs"),
-        raw_timing_cfd_time_fs=_load_optional_array(directory, "raw_timing_cfd_time_fs"),
-        raw_energy_window_anchor_time_fs=_load_optional_array(directory, "raw_energy_window_anchor_time_fs"),
-        raw_timing_aligned_energy_window_anchor_time_fs=_load_optional_array(
-            directory, "raw_timing_aligned_energy_window_anchor_time_fs"
-        ),
-        raw_timing_window_anchor_time_fs=_load_optional_array(directory, "raw_timing_window_anchor_time_fs"),
-        raw_energy_windows_mV=_load_optional_array(directory, "raw_energy_windows_mV"),
-        raw_timing_aligned_energy_windows_mV=_load_optional_array(
-            directory, "raw_timing_aligned_energy_windows_mV"
-        ),
-        raw_timing_windows_mV=_load_optional_array(directory, "raw_timing_windows_mV"),
         timing_relative_time_ps=_load_optional_array(directory, "timing_relative_time_ps"),
         train=split_values["train"],
         validation=split_values["validation"],

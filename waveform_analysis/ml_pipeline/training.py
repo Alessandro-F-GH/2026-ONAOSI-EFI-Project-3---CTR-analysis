@@ -49,7 +49,7 @@ def _validate_dataset_contract(
         )
 
     resolved = {field: next(iter(values)) for field, values in observed.items()}
-    logger.info(
+    logger.debug(
         "Prepared-data contract | LED %s | CFD %s | ML alignment %s | "
         "timing waveforms saved=%s | waveform grid=%s",
         resolved["led_timestamp_source"],
@@ -148,7 +148,7 @@ def train_model(
         )
         for dataset in datasets
     ]
-    logger.info(
+    logger.debug(
         "Prediction task | input waveforms=%s | target=%s",
         prediction["input_waveforms"],
         prediction["target"],
@@ -181,7 +181,7 @@ def train_model(
         if cache_dir is not None:
             input_cache_dirs.append(cache_dir)
     datasets = transformed_datasets
-    logger.info(
+    logger.debug(
         "Model input preprocessing | transform=%s | subsampling_factor=%d",
         input_transform,
         subsampling_factor,

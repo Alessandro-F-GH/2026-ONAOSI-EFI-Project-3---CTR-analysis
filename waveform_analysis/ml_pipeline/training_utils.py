@@ -9,7 +9,7 @@ from torch.utils.data import ConcatDataset, DataLoader
 from utils.fit import FitResult
 
 from .dataset import PreparedDataset
-from .metrics import distribution_metrics, fit_times_ps
+from .metrics import FWHM_PER_SIGMA, distribution_metrics, fit_times_ps
 from .torch_data import CorrectionDataset, Normalization
 from .training_context import TrainingContext
 
@@ -163,9 +163,8 @@ def predict_loader(
     cfd_delta = np.concatenate(cfd)
     true = np.concatenate(true_tof)
     alignment_residual = np.concatenate(anchor_shifts)
-    # The target already removes the continuous-vs-discrete alignment residual.
-    # Never add an LED-derived anchor term analytically at inference: the model
-    # output itself is the complete learned correction applied to Delta t_LED.
+    # The target already removes the continuous-vs-discrete LED alignment
+    # residual. Do not add that LED-derived term back at inference.
     total_led_correction = prediction
     corrected = led_delta - total_led_correction
     residual = corrected - true
@@ -195,6 +194,23 @@ def evaluate_model(
     )
 
 
+def ctr_log_text(metrics: dict[str, Any], *, decimals: int = 1) -> str:
+    """Return an explicit CTR provenance label for human-readable logs only.
+
+    ``fit CTR`` is used only for a finite Gaussian-fit CTR. Otherwise a quick
+    all-event ``s-CTR = 2*sqrt(2*ln(2))*sample_std`` is shown. ``CTR nan`` is
+    reserved for cases where neither quantity can be computed.
+    """
+
+    fit_ctr = float(metrics.get("ctr_ps", float("nan")))
+    if bool(metrics.get("fit_performed", False)) and np.isfinite(fit_ctr):
+        return f"fit CTR {fit_ctr:.{int(decimals)}f} ps"
+    s_ctr = float(metrics.get("s_ctr_ps", float("nan")))
+    if np.isfinite(s_ctr):
+        return f"s-CTR {s_ctr:.{int(decimals)}f} ps"
+    return "CTR nan"
+
+
 def evaluate_model_with_optional_fit(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -206,7 +222,13 @@ def evaluate_model_with_optional_fit(
 ) -> tuple[dict[str, Any], FitResult | None, dict[str, np.ndarray | float]]:
     prediction = predict_loader(model, loader, device)
     residuals = np.asarray(prediction["residual_ps"], dtype=np.float64)
+    finite_residuals = residuals[np.isfinite(residuals)]
     arithmetic_bias = float(np.mean(residuals))
+    s_ctr_ps = (
+        float(FWHM_PER_SIGMA * np.std(finite_residuals, ddof=1))
+        if finite_residuals.size >= 2
+        else float("nan")
+    )
     fit: FitResult | None = None
     ctr_ps = float("nan")
     gaussian_bias_ps = float("nan")
@@ -218,6 +240,7 @@ def evaluate_model_with_optional_fit(
     row = {
         "rmse_ps": float(prediction["rmse_ps"]),
         "ctr_ps": ctr_ps,
+        "s_ctr_ps": s_ctr_ps,
         "bias_ps": arithmetic_bias,
         "arithmetic_bias_ps": arithmetic_bias,
         "gaussian_bias_ps": gaussian_bias_ps,
@@ -270,7 +293,6 @@ def checkpoint_context(
         "window_anchor_timestamps_saved",
         "correction_target_reference",
         "window_anchor_shift_factored",
-        "alignment_residual_removed_from_target",
         "factorization_anchor_source",
         "factorization_anchor_component",
     )

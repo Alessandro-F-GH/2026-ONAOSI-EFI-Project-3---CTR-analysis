@@ -4,21 +4,25 @@ import copy
 import hashlib
 import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.lib.format import open_memmap
+from scipy.signal import butter, sosfiltfilt
 
+from utils.photopeak import fit_photopeak, photopeak_mask
 from utils.signal import INVALID_TIME_FS
 
 from .common import atomic_json, canonical_hash, read_json, source_signature
 if TYPE_CHECKING:
     from .data import EnergyCache
 from .dataset import DATASET_FORMAT_VERSION, PreparedDataset, load_prepared_dataset
+from .selection_store import load_or_compute_selection, selection_request_fingerprint
 
-PREPARED_SELECTION_VERSION = 5
+PREPARED_SELECTION_VERSION = 2
 
 _COPY_ARRAYS = (
     "event_id",
@@ -39,30 +43,24 @@ _COPY_ARRAYS = (
     "timing_window_anchor_time_fs",
     "timing_aligned_energy_windows_mV",
     "timing_windows_mV",
-    "raw_energy_led_time_fs",
-    "raw_timing_led_time_fs",
-    "raw_energy_cfd_time_fs",
-    "raw_timing_cfd_time_fs",
-    "raw_energy_window_anchor_time_fs",
-    "raw_timing_aligned_energy_window_anchor_time_fs",
-    "raw_timing_window_anchor_time_fs",
-    "raw_energy_windows_mV",
-    "raw_timing_aligned_energy_windows_mV",
-    "raw_timing_windows_mV",
 )
 
 
 
 def _preparation_request_fingerprint(study: dict[str, Any], root_file: Path) -> str:
-    """Hash only inputs that can change the permanent prepared dataset.
+    """Hash only inputs that change the canonical prepared signal representation.
 
-    This can be computed without opening the ROOT file, so a valid permanent
-    dataset is reusable even when the transient raw conversion cache was deleted.
+    Experiment windows, models, validation settings and true TOF are intentionally
+    excluded.  They are runtime views/evaluation metadata and must not trigger
+    another ROOT/photopeak pass.
     """
     preprocessing = copy.deepcopy(study["preprocessing"])
-    for key in ("prepared_dir", "cleanup_raw_cache", "materialization_chunk_size", "parallelization"):
+    for key in (
+        "prepared_dir", "selection_store_dir", "cleanup_raw_cache",
+        "materialization_chunk_size", "parallelization", "input_variants",
+        "input_variant_by_channel", "subsampling_factors",
+    ):
         preprocessing.pop(key, None)
-    # I/O chunk size/progress do not change data, while max_events does.
     io = preprocessing.get("io")
     if isinstance(io, dict):
         preprocessing["io"] = {"max_events": int(io.get("max_events", 0))}
@@ -71,8 +69,7 @@ def _preparation_request_fingerprint(study: dict[str, Any], root_file: Path) -> 
         "selection_version": PREPARED_SELECTION_VERSION,
         "source": source_signature(root_file),
         "channels": study["data"]["channels"],
-        "true_tof_ps": float(study["data"].get("true_tof_ps", 0.0)),
-        "windows_ns": study["windows_ns"],
+        "materialized_window_ns": preprocessing.get("materialized_window_ns"),
         "preprocessing": preprocessing,
     })
 
@@ -97,57 +94,83 @@ def _timing_pair_ps(times_fs: np.ndarray) -> np.ndarray:
     return (values[:, 0].astype(np.float64) - values[:, 1].astype(np.float64)) / 1000.0
 
 
-def robust_led_zscore_mask(
-    delta_ps: np.ndarray,
+def _physical_photopeak_selection(
+    cache: "EnergyCache", config: dict[str, Any], logger: Any
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Cuts that define the reusable physical/photopeak cohort only.
+
+    Timing validity and LED mismatch rejection are deliberately excluded so LED/CFD
+    threshold changes never force another photopeak fit.
+    """
+    amplitudes_all = np.asarray(cache.amplitude_mV, dtype=np.float64)
+    noise_all = np.asarray(cache.noise_rms_mV, dtype=np.float64)
+    trigger_all = np.asarray(cache.trigger_index, dtype=np.int64)
+    valid = (
+        np.all(np.isfinite(amplitudes_all), axis=1)
+        & np.all(np.isfinite(noise_all), axis=1)
+        & np.all(trigger_all >= 0, axis=1)
+    )
+    selection = copy.deepcopy(config.get("selection", {}))
+    trigger_range = selection.get("energy_trigger_index_range")
+    if trigger_range is not None:
+        low, high = int(trigger_range[0]), int(trigger_range[1])
+        triggers = np.asarray(cache.trigger_index)
+        valid &= np.all((triggers > low) & (triggers < high), axis=1)
+
+    noise_limit = selection.get("energy_noise_max_mV")
+    if noise_limit is not None:
+        if isinstance(noise_limit, (list, tuple)):
+            limits = np.asarray(noise_limit, dtype=np.float64).reshape(-1)
+            if limits.size != 2:
+                raise ValueError("preprocessing.selection.energy_noise_max_mV must be scalar or length 2")
+        else:
+            limits = np.asarray([float(noise_limit), float(noise_limit)], dtype=np.float64)
+        noise = np.asarray(cache.noise_rms_mV, dtype=np.float64)
+        valid &= (noise[:, 0] < limits[0]) & (noise[:, 1] < limits[1])
+
+    summary: dict[str, Any] = {
+        "scope": "physical_photopeak_before_timing_and_ml",
+        "valid_before_photopeak": int(np.count_nonzero(valid)),
+    }
+    photopeak_cfg = copy.deepcopy(config.get("photopeak", {"enabled": False}))
+    photopeak_rows: list[dict[str, Any]] = []
+    if bool(photopeak_cfg.get("enabled", False)):
+        amplitudes = np.asarray(cache.amplitude_mV, dtype=np.float64)
+        for channel_position, channel_number in enumerate(cache.manifest["energy_channels_one_based"]):
+            fit_indices = np.flatnonzero(valid)
+            result = fit_photopeak(
+                amplitudes[fit_indices, channel_position],
+                channel=int(channel_number),
+                config=photopeak_cfg,
+            )
+            if not result.success:
+                raise RuntimeError(f"Photopeak fit failed for energy channel {channel_number}: {result.message}")
+            valid &= photopeak_mask(amplitudes[:, channel_position], result)
+            photopeak_rows.append(result.as_dict())
+        logger.info("Physical photopeak selection | retained=%d", int(np.count_nonzero(valid)))
+    summary["photopeak"] = photopeak_rows
+    selected = np.flatnonzero(valid).astype(np.int64)
+    summary["selected_events"] = int(selected.size)
+    return selected, summary
+
+
+def _dataset_level_selection(
+    cache: "EnergyCache",
+    config: dict[str, Any],
+    logger: Any,
     *,
-    zscore_limit: float,
-    base_mask: np.ndarray | None = None,
-) -> tuple[np.ndarray, float, float, str]:
-    """Return a robust LED-pair outlier mask and its fitted location/scale.
+    physical_selected: np.ndarray | None = None,
+    physical_summary: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    valid = np.zeros(int(cache.event_id.size), dtype=bool)
+    if physical_selected is None:
+        physical_selected, physical_summary = _physical_photopeak_selection(cache, config, logger)
+    valid[np.asarray(physical_selected, dtype=np.int64)] = True
 
-    The z-score is |delta - median| / (1.4826 * MAD).  Standard deviation is
-    used only when MAD is degenerate.  ``base_mask`` defines the population used
-    to fit median/scale, while the returned mask is defined for every element.
-    """
-    values = np.asarray(delta_ps, dtype=np.float64).reshape(-1)
-    if not np.isfinite(zscore_limit) or zscore_limit <= 0.0:
-        raise ValueError("zscore_limit must be finite and > 0")
-    base = np.isfinite(values)
-    if base_mask is not None:
-        supplied = np.asarray(base_mask, dtype=bool).reshape(-1)
-        if supplied.shape != values.shape:
-            raise ValueError("base_mask shape does not match LED differences")
-        base &= supplied
-    if np.count_nonzero(base) < 3:
-        raise RuntimeError("Too few valid LED pairs for robust z-score estimation")
-    sample = values[base]
-    center = float(np.median(sample))
-    mad = float(np.median(np.abs(sample - center)))
-    scale = 1.482602218505602 * mad
-    source = "mad"
-    if not np.isfinite(scale) or scale <= 0.0:
-        scale = float(np.std(sample, ddof=0))
-        source = "std_fallback"
-    if not np.isfinite(scale) or scale <= 0.0:
-        z = np.zeros(values.shape, dtype=np.float64)
-        z[~np.isfinite(values)] = np.inf
-        scale = 0.0
-        source = "degenerate"
-    else:
-        z = np.abs(values - center) / scale
-    return np.isfinite(values) & (z <= float(zscore_limit)), center, scale, source
-
-
-def _dataset_level_selection(cache: "EnergyCache", config: dict[str, Any], logger: Any) -> tuple[np.ndarray, dict[str, Any]]:
-    """Apply only timing-validity/mismatch cuts after photopeak preselection.
-
-    Raw-energy trigger/noise/photopeak selection has already happened before any
-    denoising, LED/CFD extraction, or window materialization.  Repeating it here
-    would both waste work and risk selecting a different population from the
-    canonical preprocessed amplitudes.
-    """
-    valid = np.asarray(cache.valid, dtype=bool).copy()
-    # Standard LED/CFD and all requested ML modes use one frozen event population.
+    # One frozen population for all standard and ML modes. Timing validity is
+    # applied after the reusable photopeak cohort because it depends on LED/CFD
+    # configuration rather than the physical energy population.
+    valid &= np.asarray(cache.valid, dtype=bool)
     for name in ("energy_led_time_fs", "energy_cfd_time_fs"):
         array = getattr(cache, name, None)
         if array is not None:
@@ -158,24 +181,18 @@ def _dataset_level_selection(cache: "EnergyCache", config: dict[str, Any], logge
         valid &= np.all(np.asarray(cache.timing_cfd_time_fs) != INVALID_TIME_FS, axis=1)
 
     selection = copy.deepcopy(config.get("selection", {}))
-    preselection = copy.deepcopy(cache.manifest.get("photopeak_preselection", {}))
-    selection_summary: dict[str, Any] = {
-        "scope": "photopeak_first_then_timing_cleanup_before_any_ml_split",
-        "photopeak_preselection": preselection,
-        "photopeak": copy.deepcopy(preselection.get("photopeak", [])),
-        "photopeak_selected_events": int(cache.manifest.get("event_count", valid.size)),
-        "valid_after_timing_extraction": int(np.count_nonzero(valid)),
+    summary: dict[str, Any] = {
+        "scope": "complete_file_before_any_ml_split",
+        "physical_selection": physical_summary or {},
+        "valid_after_timing": int(np.count_nonzero(valid)),
     }
 
-    # Optional gross LED mismatch rejection remains a dataset-preparation
-    # operation. It is deliberately later than photopeak because LED timestamps
-    # do not exist during the cheap first scan.
     led_cfg = selection.get("led_outlier_rejection", {}) or {}
     led_summary: dict[str, Any] = {"enabled": bool(led_cfg.get("enabled", False))}
     if led_summary["enabled"]:
-        z_limit = float(led_cfg.get("zscore_limit", 6.0))
-        if not np.isfinite(z_limit) or z_limit <= 0.0:
-            raise ValueError("led_outlier_rejection.zscore_limit must be finite and > 0")
+        use_robust_z = "zscore_limit" in led_cfg
+        zscore_limit = float(led_cfg.get("zscore_limit", 4.0))
+        max_distance_ps = float(led_cfg.get("max_distance_ps", 300.0))
         families: list[tuple[str, np.ndarray]] = [("energy", np.asarray(cache.energy_led_time_fs))]
         if cache.timing_led_time_fs is not None:
             families.append(("timing", np.asarray(cache.timing_led_time_fs)))
@@ -185,43 +202,80 @@ def _dataset_level_selection(cache: "EnergyCache", config: dict[str, Any], logge
             base = valid & np.isfinite(delta)
             if np.count_nonzero(base) < 3:
                 raise RuntimeError(f"Too few valid {name} LED pairs for dataset-level outlier rejection")
-            accepted, center, scale, scale_source = robust_led_zscore_mask(
-                delta, zscore_limit=z_limit, base_mask=valid
-            )
-            rejected = int(np.count_nonzero(valid & ~accepted))
-            if scale > 0.0:
-                z_score = np.abs(delta - center) / scale
-                max_kept_z = float(np.max(z_score[valid & accepted])) if np.any(valid & accepted) else float("nan")
+            center = float(np.median(delta[base]))
+            if use_robust_z:
+                mad = float(np.median(np.abs(delta[base] - center)))
+                sigma = 1.4826 * mad
+                if not np.isfinite(sigma) or sigma <= 0.0:
+                    sigma = float(np.std(delta[base], ddof=1))
+                if not np.isfinite(sigma) or sigma <= 0.0:
+                    sigma = 1.0
+                distance = zscore_limit * sigma
+                accepted = np.isfinite(delta) & (np.abs(delta - center) <= distance)
             else:
-                max_kept_z = 0.0
+                sigma = float("nan")
+                distance = max_distance_ps
+                accepted = np.isfinite(delta) & (np.abs(delta - center) <= distance)
+            rejected = int(np.count_nonzero(valid & ~accepted))
             valid &= accepted
-            family_rows.append({
-                "family": name,
-                "median_ps": center,
-                "robust_sigma_ps": scale,
-                "scale_source": scale_source,
-                "zscore_limit": z_limit,
-                "max_kept_zscore": max_kept_z,
-                "rejected": rejected,
-            })
-        led_summary["estimator"] = "abs(delta_led - median) / (1.4826 * MAD)"
+            row = {
+                "family": name, "median_ps": center, "rejected": rejected,
+                "effective_max_distance_ps": float(distance),
+            }
+            if use_robust_z:
+                row.update({"zscore_limit": zscore_limit, "robust_sigma_ps": sigma})
+            else:
+                row["max_distance_ps"] = max_distance_ps
+            family_rows.append(row)
         led_summary["families"] = family_rows
         logger.info(
-            "Dataset LED robust-z mismatch rejection | %s",
-            ", ".join(
-                f"{row['family']} sigma={row['robust_sigma_ps']:.3f} ps "
-                f"z<={row['zscore_limit']:.2f} rejected={row['rejected']}"
-                for row in family_rows
-            ),
+            "Dataset LED mismatch rejection | %s",
+            ", ".join(f"{row['family']} rejected={row['rejected']}" for row in family_rows),
         )
-    selection_summary["led_outlier_rejection"] = led_summary
-    selection_summary["selected_events"] = int(np.count_nonzero(valid))
+    summary["led_outlier_rejection"] = led_summary
 
     minimum = int(selection.get("minimum_events", selection.get("minimum_events_per_split", 100)))
     selected = np.flatnonzero(valid).astype(np.int64)
+    summary["selected_events"] = int(selected.size)
     if selected.size < minimum:
         raise RuntimeError(f"Only {selected.size} events remain after dataset preparation; need {minimum}")
-    return selected, selection_summary
+    return selected, summary
+
+
+def _denoise_windows(
+    source: np.ndarray,
+    destination: Path,
+    *,
+    relative_time_ps: np.ndarray,
+    config: dict[str, Any],
+    chunk_size: int,
+) -> None:
+    values = source
+    if values.ndim != 3:
+        raise ValueError("Waveform array must have shape [event, detector, sample]")
+    times = np.asarray(relative_time_ps, dtype=np.float64)
+    if times.size < 2:
+        raise ValueError("Need at least two time samples for denoising")
+    interval_s = float(np.median(np.diff(times))) * 1e-12
+    fs = 1.0 / interval_s
+    cutoff_hz = float(config["cutoff_GHz"]) * 1e9
+    if not 0.0 < cutoff_hz < 0.5 * fs:
+        raise ValueError("Denoising cutoff must be below Nyquist")
+    order = int(config.get("order", 4))
+    sos = butter(order, cutoff_hz, btype="lowpass", fs=fs, output="sos")
+    target = open_memmap(destination, mode="w+", dtype=np.float32, shape=values.shape)
+    for start in range(0, values.shape[0], chunk_size):
+        stop = min(start + chunk_size, values.shape[0])
+        block = np.asarray(values[start:stop], dtype=np.float64)
+        zero_count = min(int(np.count_nonzero(sos[:, 2] == 0.0)), int(np.count_nonzero(sos[:, 5] == 0.0)))
+        default_padlen = 3 * (2 * int(sos.shape[0]) + 1 - zero_count)
+        padlen = min(default_padlen, max(0, block.shape[-1] - 1))
+        filtered = sosfiltfilt(sos, block, axis=-1, padlen=padlen)
+        target[start:stop] = np.asarray(filtered, dtype=np.float32)
+    target.flush()
+    mmap = getattr(target, "_mmap", None)
+    if mmap is not None:
+        mmap.close()
 
 
 def _prepared_fingerprint(cache: "EnergyCache", selected: np.ndarray, config: dict[str, Any]) -> str:
@@ -230,11 +284,8 @@ def _prepared_fingerprint(cache: "EnergyCache", selected: np.ndarray, config: di
         "selection_version": PREPARED_SELECTION_VERSION,
         "raw_cache": cache.manifest["fingerprint"],
         "selected_hash": _hash_indices(selected),
-        "true_tof_ps": float(config["true_tof_ps"]),
         "selection": config.get("selection", {}),
-        "photopeak": config.get("photopeak", {}),
         "denoising": config.get("denoising", {}),
-        "input_variant_by_channel": config.get("input_variant_by_channel", {}),
     })
 
 
@@ -246,7 +297,27 @@ def materialize_selected_dataset(
     rebuild: bool,
     logger: Any,
 ) -> PreparedDataset:
-    selected, selection_summary = _dataset_level_selection(cache, config, logger)
+    selection_store_root = Path(config.get("selection_store_dir", output.parent / "selected_events"))
+    source_root = Path(config["source_root"])
+    selection_fp = str(config.get("selection_request_fingerprint", ""))
+    if not selection_fp:
+        selection_fp = canonical_hash({
+            "source": source_signature(source_root),
+            "energy_channels": cache.manifest.get("energy_channels_one_based", []),
+            "selection": {k: v for k, v in dict(config.get("selection", {})).items() if k != "led_outlier_rejection"},
+            "photopeak": config.get("photopeak", {"enabled": False}),
+        })
+    physical_selected, physical_summary, physical_store = load_or_compute_selection(
+        root=selection_store_root, root_file=source_root, fingerprint=selection_fp,
+        rebuild=bool(config.get("rebuild_selection", False)),
+        compute=lambda: _physical_photopeak_selection(cache, config, logger),
+        logger=logger,
+    )
+    selected, selection_summary = _dataset_level_selection(
+        cache, config, logger, physical_selected=physical_selected,
+        physical_summary=physical_summary,
+    )
+    selection_summary["physical_selection_store"] = str(physical_store)
     fingerprint = _prepared_fingerprint(cache, selected, config)
     manifest_path = output / "manifest.json"
     if output.is_dir() and not rebuild and manifest_path.is_file():
@@ -272,21 +343,25 @@ def materialize_selected_dataset(
     if cache.timing_relative_time_ps is not None:
         np.save(temporary / "timing_relative_time_ps.npy", np.asarray(cache.timing_relative_time_ps, dtype=np.float64))
 
-    variant_by_channel = {
-        "energy": "raw",
-        "timing": "raw",
-        **copy.deepcopy(config.get("input_variant_by_channel", {})),
-    }
     denoise_cfg = copy.deepcopy(config.get("denoising", {}))
-    # Denoising is part of channel preprocessing, not a post-materialization ML
-    # transform. ``windows_mV``/``timing_windows_mV`` and their LED/CFD labels
-    # already come from the configured signal representation in the raw-cache
-    # extraction pass.  Keeping a second denoised copy here would both duplicate
-    # storage and, more importantly, decouple the target LED from the waveform
-    # seen by the model.
-    denoise_energy = variant_by_channel["energy"] == "denoised"
-    denoise_timing = variant_by_channel["timing"] == "denoised"
-    denoise_enabled = denoise_energy or denoise_timing
+    denoise_enabled = bool(denoise_cfg.get("enabled", False))
+    if denoise_enabled:
+        _denoise_windows(
+            np.load(temporary / "windows_mV.npy", mmap_mode="r"),
+            temporary / "denoised_windows_mV.npy",
+            relative_time_ps=np.asarray(cache.relative_time_ps),
+            config=denoise_cfg,
+            chunk_size=chunk_size,
+        )
+        aligned = temporary / "timing_aligned_energy_windows_mV.npy"
+        if aligned.is_file():
+            _denoise_windows(
+                np.load(aligned, mmap_mode="r"),
+                temporary / "denoised_timing_aligned_energy_windows_mV.npy",
+                relative_time_ps=np.asarray(cache.relative_time_ps),
+                config=denoise_cfg,
+                chunk_size=chunk_size,
+            )
 
     manifest = {
         "format_version": DATASET_FORMAT_VERSION,
@@ -294,8 +369,7 @@ def materialize_selected_dataset(
         "request_fingerprint": str(config.get("request_fingerprint", "")),
         "name": str(config.get("name", output.name)),
         "role": "prepared_full_file",
-        "subset_kind": "photopeak_preselected_then_timing_cleaned",
-        "photopeak_selection_before_expensive_preprocessing": True,
+        "subset_kind": "dataset_level_selected",
         "source_root": str(config["source_root"]),
         "true_tof_ps": float(config["true_tof_ps"]),
         "event_count": int(selected.size),
@@ -306,19 +380,15 @@ def materialize_selected_dataset(
         "timing_channel_waveforms_saved": cache.timing_windows_mV is not None,
         "timing_aligned_energy_waveforms_saved": cache.timing_aligned_energy_windows_mV is not None,
         "denoised_waveforms_saved": denoise_enabled,
-        "denoised_energy_waveforms_saved": denoise_energy,
-        "denoised_timing_waveforms_saved": denoise_timing,
-        "alternate_posthoc_denoised_arrays_saved": False,
-        "input_variant_by_channel": variant_by_channel,
+        "denoised_energy_waveforms_saved": denoise_enabled,
+        "denoised_timing_waveforms_saved": False,
+        "denoising_scope": "energy_channels_only",
         "denoising": denoise_cfg if denoise_enabled else {"enabled": False},
         "waveform_grid": cache.manifest.get("waveform_grid", "native_samples"),
         "native_sample_interval_ps": cache.manifest.get("native_sample_interval_ps"),
         "timing_native_sample_interval_ps": cache.manifest.get("timing_native_sample_interval_ps"),
         "led_timestamp_source": "energy_channels",
         "cfd_timestamp_source": "energy_channels",
-        "denoising_stage": "before_led_cfd_and_window_extraction",
-        "energy_led_signal_variant": variant_by_channel["energy"],
-        "timing_led_signal_variant": variant_by_channel["timing"],
         "ml_window_alignment_source": "target_specific_led",
         "window_anchor_timestamps_saved": True,
         "correction_target_reference": "interpolated_led_direct",
@@ -344,38 +414,26 @@ def _raw_preprocess_config(study: dict[str, Any], root_file: Path, cache_dir: Pa
     energy.update(copy.deepcopy(preprocessing.get("energy", {})))
     timing = copy.deepcopy(common)
     timing.update(copy.deepcopy(preprocessing.get("timing", {})))
-    variants = {
-        "energy": "raw",
-        "timing": "raw",
-        **copy.deepcopy(preprocessing.get("input_variant_by_channel", {})),
+    # Denoising is intentionally excluded from ROOT conversion. LED/CFD and the
+    # canonical raw windows therefore never depend on an ML denoising candidate.
+    energy["denoising"] = {"enabled": False}
+    timing["denoising"] = {"enabled": False}
+    materialized = preprocessing.get("materialized_window_ns") or {
+        "before": max(float(window["before_ns"]) for window in study["windows_ns"]),
+        "after": max(float(window["after_ns"]) for window in study["windows_ns"]),
     }
-    denoising = copy.deepcopy(preprocessing.get("denoising", {}))
-
-    # Channel preprocessing is frozen before any LED/CFD extraction.  Therefore
-    # the timestamp used as a target and the waveform later consumed by ML are
-    # derived from the same signal representation.
-    energy["denoising"] = (
-        {**denoising, "enabled": True}
-        if variants["energy"] == "denoised"
-        else {"enabled": False}
-    )
-    timing["denoising"] = (
-        {**denoising, "enabled": True}
-        if variants["timing"] == "denoised"
-        else {"enabled": False}
-    )
-    max_before = max(float(window["before_ns"]) for window in study["windows_ns"])
-    max_after = max(float(window["after_ns"]) for window in study["windows_ns"])
-    energy["ml_window_ns"] = {"before": max_before, "after": max_after}
-    timing["ml_window_ns"] = {"before": max_before, "after": max_after}
+    energy["ml_window_ns"] = {
+        "before": float(materialized["before"]), "after": float(materialized["after"])
+    }
+    timing["ml_window_ns"] = {
+        "before": float(materialized["before"]), "after": float(materialized["after"])
+    }
     timing["enabled"] = True
     energy["timing_channel_led"] = timing
     return {
         "data": {"input_root": str(root_file), "true_tof_ps": float(study["data"].get("true_tof_ps", 0.0))},
         "channels": copy.deepcopy(study["data"]["channels"]),
         "waveform": energy,
-        "selection": copy.deepcopy(preprocessing.get("selection", {})),
-        "photopeak": copy.deepcopy(preprocessing.get("photopeak", {"enabled": False})),
         "io": copy.deepcopy(preprocessing.get("io", {"step_size": "128 MB", "max_events": 0, "progress_every": 1000})),
         "parallelization": copy.deepcopy(preprocessing.get("parallelization", {"preprocessing_backend": "process", "preprocessing_workers": 0, "preprocessing_chunksize": 8})),
         "cache": {"raw_cache_dir": str(cache_dir)},
@@ -400,7 +458,10 @@ def prepare_file_dataset(
                 manifest = read_json(manifest_path)
                 if manifest.get("request_fingerprint") == request_fingerprint:
                     logger.info("Reusing permanent prepared dataset without ROOT reconversion: %s", output)
-                    return load_prepared_dataset(output)
+                    loaded = load_prepared_dataset(output)
+                    manifest = dict(loaded.manifest)
+                    manifest["true_tof_ps"] = float(study["data"].get("true_tof_ps", 0.0))
+                    return replace(loaded, manifest=manifest)
             except Exception as exc:
                 logger.warning("Cannot reuse permanent prepared dataset %s: %s", output, exc)
 
@@ -409,8 +470,6 @@ def prepare_file_dataset(
     cache_cfg = {
         "channels": raw_cfg["channels"],
         "waveform": raw_cfg["waveform"],
-        "selection": raw_cfg["selection"],
-        "photopeak": raw_cfg["photopeak"],
         "io": raw_cfg["io"],
         "parallelization": raw_cfg["parallelization"],
     }
@@ -428,14 +487,15 @@ def prepare_file_dataset(
         "source_root": str(root_file),
         "request_fingerprint": request_fingerprint,
         "true_tof_ps": float(study["data"].get("true_tof_ps", 0.0)),
+        "selection_store_dir": str(study["preprocessing"].get("selection_store_dir", Path(study["preprocessing"]["prepared_dir"]).parent / "selected_events")),
+        "selection_request_fingerprint": selection_request_fingerprint(
+            root_file=root_file, channels=study["data"]["channels"],
+            preprocessing=study["preprocessing"],
+        ),
+        "rebuild_selection": bool(rebuild),
         "selection": copy.deepcopy(study["preprocessing"].get("selection", {})),
         "photopeak": copy.deepcopy(study["preprocessing"].get("photopeak", {"enabled": False})),
         "denoising": copy.deepcopy(study["preprocessing"].get("denoising", {"enabled": False})),
-        "input_variant_by_channel": copy.deepcopy(
-            study["preprocessing"].get(
-                "input_variant_by_channel", {"energy": "raw", "timing": "raw"}
-            )
-        ),
         "materialization_chunk_size": int(study["preprocessing"].get("materialization_chunk_size", 2048)),
     }
     dataset = materialize_selected_dataset(
@@ -445,7 +505,9 @@ def prepare_file_dataset(
         # Close source memmaps before deleting their directory (important on Windows).
         del cache
         shutil.rmtree(raw_cache_dir, ignore_errors=True)
-    return dataset
+    manifest = dict(dataset.manifest)
+    manifest["true_tof_ps"] = float(study["data"].get("true_tof_ps", 0.0))
+    return replace(dataset, manifest=manifest)
 
 
 def plot_prepared_signal_examples(
@@ -456,27 +518,25 @@ def plot_prepared_signal_examples(
 ) -> None:
     if dataset.event_id.size == 0:
         return
-    variants = dataset.manifest.get("input_variant_by_channel", {})
-    energy_variant = str(variants.get("energy", "raw"))
-    timing_variant = str(variants.get("timing", "raw"))
-    rows: list[tuple[str, np.ndarray, np.ndarray, str]] = [
-        ("Energy ch. 1", dataset.relative_time_ps, np.asarray(dataset.windows_mV[0, 0]), energy_variant),
-        ("Energy ch. 2", dataset.relative_time_ps, np.asarray(dataset.windows_mV[0, 1]), energy_variant),
+    rows: list[tuple[str, np.ndarray, np.ndarray, np.ndarray | None]] = [
+        ("Energy ch. 1", dataset.relative_time_ps, np.asarray(dataset.windows_mV[0, 0]),
+         None if dataset.denoised_windows_mV is None else np.asarray(dataset.denoised_windows_mV[0, 0])),
+        ("Energy ch. 2", dataset.relative_time_ps, np.asarray(dataset.windows_mV[0, 1]),
+         None if dataset.denoised_windows_mV is None else np.asarray(dataset.denoised_windows_mV[0, 1])),
     ]
     if dataset.timing_windows_mV is not None and dataset.timing_relative_time_ps is not None:
         rows.extend([
-            ("Timing ch. 1", dataset.timing_relative_time_ps, np.asarray(dataset.timing_windows_mV[0, 0]), timing_variant),
-            ("Timing ch. 2", dataset.timing_relative_time_ps, np.asarray(dataset.timing_windows_mV[0, 1]), timing_variant),
+            ("Timing ch. 1", dataset.timing_relative_time_ps, np.asarray(dataset.timing_windows_mV[0, 0]),
+             None if dataset.denoised_timing_windows_mV is None else np.asarray(dataset.denoised_timing_windows_mV[0, 0])),
+            ("Timing ch. 2", dataset.timing_relative_time_ps, np.asarray(dataset.timing_windows_mV[0, 1]),
+             None if dataset.denoised_timing_windows_mV is None else np.asarray(dataset.denoised_timing_windows_mV[0, 1])),
         ])
     fig, axes = plt.subplots(len(rows), 1, figsize=(10.5, 2.7 * len(rows)), squeeze=False)
-    for axis, (title, time_ps, waveform, variant) in zip(axes[:, 0], rows):
-        axis.plot(
-            np.asarray(time_ps, dtype=np.float64) / 1000.0,
-            waveform,
-            linewidth=1.0,
-            label=f"ML preprocessing: {variant}",
-        )
-        axis.legend(loc="best")
+    for axis, (title, time_ps, raw, denoised) in zip(axes[:, 0], rows):
+        axis.plot(np.asarray(time_ps, dtype=np.float64) / 1000.0, raw, linewidth=1.0, label="raw")
+        if denoised is not None:
+            axis.plot(np.asarray(time_ps, dtype=np.float64) / 1000.0, denoised, linewidth=1.0, label="denoised")
+            axis.legend(loc="best")
         axis.set_title(title)
         axis.set_xlabel("Time relative to native LED anchor [ns]")
         axis.set_ylabel("Voltage [mV]")
@@ -490,147 +550,35 @@ def plot_prepared_signal_examples(
     plt.close(fig)
 
 
-def input_channel_variant_dataset_view(
-    dataset: PreparedDataset, channel_type: str, variant: str
-) -> PreparedDataset:
-    """Validate and expose the already-preprocessed channel representation.
-
-    Denoising is no longer an ML-time alternate array.  It is applied before
-    LED/CFD extraction and windowing during permanent preprocessing, so each
-    channel family has exactly one canonical representation in the prepared
-    dataset.  This helper remains as a zero-copy compatibility layer for the
-    study runner.
-    """
+def input_variant_dataset_view(dataset: PreparedDataset, variant: str) -> PreparedDataset:
+    """Return a zero-copy raw/denoised waveform view of one prepared dataset."""
     from dataclasses import replace
 
-    channel = str(channel_type).strip().lower()
     key = str(variant).strip().lower()
-    if channel not in {"energy", "timing"}:
-        raise ValueError("ML input channel_type must be 'energy' or 'timing'")
-    if key not in {"raw", "denoised"}:
+    if key == "raw":
+        manifest = dict(dataset.manifest)
+        manifest["ml_input_variant"] = "raw"
+        return replace(dataset, manifest=manifest)
+    if key != "denoised":
         raise ValueError("ML input variant must be 'raw' or 'denoised'")
-
-    manifest = dict(dataset.manifest)
-    manifest["ml_input_channel"] = channel
-    manifest["ml_input_variant"] = key
-    configured = dataset.manifest.get("input_variant_by_channel", {})
-    if not configured:
-        # Read-only compatibility for old prepared datasets used by standalone
-        # tools/tests. New study datasets (format v7+) are always materialized
-        # with one canonical preprocessing variant per channel.
-        if key == "raw":
-            return replace(dataset, manifest=manifest)
-        if channel == "energy" and dataset.denoised_windows_mV is not None:
-            return replace(
-                dataset,
-                manifest=manifest,
-                windows_mV=dataset.denoised_windows_mV,
-                timing_aligned_energy_windows_mV=(
-                    dataset.denoised_timing_aligned_energy_windows_mV
-                    if dataset.denoised_timing_aligned_energy_windows_mV is not None
-                    else dataset.timing_aligned_energy_windows_mV
-                ),
-            )
-        if channel == "timing" and dataset.denoised_timing_windows_mV is not None:
-            return replace(
-                dataset,
-                manifest=manifest,
-                timing_windows_mV=dataset.denoised_timing_windows_mV,
-            )
-    configured_key = str(configured.get(channel, "raw")).strip().lower()
-    if key != configured_key:
+    if dataset.denoised_windows_mV is None:
         raise ValueError(
-            f"Prepared dataset {dataset.directory} contains {channel}={configured_key}, "
-            f"but the experiment requested {key}. Rebuild preprocessing with the "
-            "desired input_variant_by_channel policy."
+            f"Dataset {dataset.directory} has no materialized denoised waveforms"
         )
-    return replace(dataset, manifest=manifest)
-
-
-def raw_dataset_view(dataset: PreparedDataset) -> PreparedDataset:
-    """Return the canonical raw waveform view.
-
-    This intentionally has no variant argument: multithreshold must never be
-    able to request a denoised representation by configuration or accident.
-    """
-    from dataclasses import replace
-
     manifest = dict(dataset.manifest)
-    manifest["ml_input_variant"] = "raw"
-    manifest["ml_input_channel"] = "raw_multithreshold"
-    energy_windows = (
-        dataset.raw_energy_windows_mV
-        if dataset.raw_energy_windows_mV is not None
-        else dataset.windows_mV
-    )
-    energy_led = (
-        dataset.raw_energy_led_time_fs
-        if dataset.raw_energy_led_time_fs is not None
-        else dataset.energy_led_time_fs
-        if dataset.energy_led_time_fs is not None
-        else dataset.led_time_fs
-    )
-    energy_cfd = (
-        dataset.raw_energy_cfd_time_fs
-        if dataset.raw_energy_cfd_time_fs is not None
-        else dataset.energy_cfd_time_fs
-        if dataset.energy_cfd_time_fs is not None
-        else dataset.cfd_time_fs
-    )
-    energy_anchor = (
-        dataset.raw_energy_window_anchor_time_fs
-        if dataset.raw_energy_window_anchor_time_fs is not None
-        else dataset.energy_window_anchor_time_fs
-    )
-    timing_windows = (
-        dataset.raw_timing_windows_mV
-        if dataset.raw_timing_windows_mV is not None
-        else dataset.timing_windows_mV
-    )
-    timing_led = (
-        dataset.raw_timing_led_time_fs
-        if dataset.raw_timing_led_time_fs is not None
-        else dataset.timing_led_time_fs
-    )
-    timing_cfd = (
-        dataset.raw_timing_cfd_time_fs
-        if dataset.raw_timing_cfd_time_fs is not None
-        else dataset.timing_cfd_time_fs
-    )
-    timing_anchor = (
-        dataset.raw_timing_window_anchor_time_fs
-        if dataset.raw_timing_window_anchor_time_fs is not None
-        else dataset.timing_window_anchor_time_fs
-    )
-    timing_aligned_energy = (
-        dataset.raw_timing_aligned_energy_windows_mV
-        if dataset.raw_timing_aligned_energy_windows_mV is not None
-        else dataset.timing_aligned_energy_windows_mV
-    )
-    timing_aligned_energy_anchor = (
-        dataset.raw_timing_aligned_energy_window_anchor_time_fs
-        if dataset.raw_timing_aligned_energy_window_anchor_time_fs is not None
-        else dataset.timing_aligned_energy_window_anchor_time_fs
-    )
-    if energy_led is None or energy_cfd is None:
-        raise ValueError(f"Dataset {dataset.directory} lacks raw energy timing arrays")
-    manifest["input_variant_by_channel"] = {"energy": "raw", "timing": "raw"}
-    manifest["energy_led_signal_variant"] = "raw"
-    manifest["timing_led_signal_variant"] = "raw"
+    manifest["ml_input_variant"] = "denoised"
     return replace(
         dataset,
         manifest=manifest,
-        windows_mV=energy_windows,
-        led_time_fs=energy_led,
-        cfd_time_fs=energy_cfd,
-        energy_led_time_fs=energy_led,
-        timing_led_time_fs=timing_led,
-        energy_cfd_time_fs=energy_cfd,
-        timing_cfd_time_fs=timing_cfd,
-        energy_window_anchor_time_fs=energy_anchor,
-        timing_aligned_energy_window_anchor_time_fs=timing_aligned_energy_anchor,
-        timing_window_anchor_time_fs=timing_anchor,
-        window_anchor_time_fs=energy_anchor,
-        timing_aligned_energy_windows_mV=timing_aligned_energy,
-        timing_windows_mV=timing_windows,
+        windows_mV=dataset.denoised_windows_mV,
+        timing_aligned_energy_windows_mV=(
+            dataset.denoised_timing_aligned_energy_windows_mV
+            if dataset.denoised_timing_aligned_energy_windows_mV is not None
+            else dataset.timing_aligned_energy_windows_mV
+        ),
+        timing_windows_mV=(
+            dataset.denoised_timing_windows_mV
+            if dataset.denoised_timing_windows_mV is not None
+            else dataset.timing_windows_mV
+        ),
     )
