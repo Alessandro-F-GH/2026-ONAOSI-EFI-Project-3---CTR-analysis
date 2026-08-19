@@ -11,14 +11,18 @@ INVALID_INDEX = -1
 
 @dataclass(frozen=True)
 class BasicFeatures:
+    # Retained for API compatibility. The pipeline does not use the baseline
+    # mean for waveform translation or selection; it is only the center used
+    # when computing noise_rms_mV (baseline RMSE).
     baseline_mV: float
     noise_rms_mV: float
     amplitude_mV: float
     peak_index: int
     trigger_index: int
     trigger_time_fs: np.int64
+    # Historical field name retained for compatibility. The waveform is only
+    # polarity-oriented; no baseline subtraction is applied.
     corrected_signal_mV: np.ndarray
-
 
 @dataclass(frozen=True)
 class TimingFeatures:
@@ -27,7 +31,6 @@ class TimingFeatures:
     cropped_peak_mV: float
     crop_start_fs: np.int64
     crop_stop_fs: np.int64
-
 
 def baseline_and_basic_features(
     voltage_mV: np.ndarray,
@@ -38,6 +41,12 @@ def baseline_and_basic_features(
     horizontal_interval_s: float,
     horizontal_offset_s: float,
 ) -> BasicFeatures:
+    """Compute basic waveform features without translating the signal baseline.
+
+    The first ``baseline_samples`` values are used only to estimate the baseline
+    RMSE around their own mean. The returned waveform remains in the decoded
+    voltage coordinate apart from the configured polarity.
+    """
     values = np.asarray(voltage_mV, dtype=np.float64)
     if values.ndim != 1 or values.size < 2:
         raise ValueError("waveform must be one-dimensional with at least two samples")
@@ -47,15 +56,16 @@ def baseline_and_basic_features(
         raise ValueError("horizontal interval must be finite and positive")
     if not np.isfinite(horizontal_offset_s):
         raise ValueError("horizontal offset must be finite")
-
     count = min(values.size, max(1, int(baseline_samples)))
     baseline = float(np.mean(values[:count]))
     residual = values[:count] - baseline
     noise = float(np.sqrt(np.mean(residual * residual)))
-    corrected = polarity * (values - baseline)
+
+    # Baseline is diagnostic only. Do not translate the waveform by its event-wise
+    # baseline mean; only orient it according to the configured pulse polarity.
+    corrected = polarity * values
     peak_index = int(np.argmax(corrected))
     amplitude = float(corrected[peak_index])
-
     crossing = np.flatnonzero(corrected > float(trigger_threshold_mV))
     trigger_index = int(crossing[0]) if crossing.size else INVALID_INDEX
     if trigger_index >= 0:
@@ -63,7 +73,6 @@ def baseline_and_basic_features(
         trigger_time_fs = np.int64(np.rint(trigger_time_s * FEMTOSECONDS_PER_SECOND))
     else:
         trigger_time_fs = np.int64(INVALID_TIME_FS)
-
     return BasicFeatures(
         baseline_mV=baseline,
         noise_rms_mV=noise,
@@ -81,7 +90,6 @@ def _sequential_crossings_fs(
     thresholds_mV: np.ndarray,
 ) -> np.ndarray:
     """Match the original C LED search on one rising edge.
-
     Thresholds are processed in ascending order and the search index is retained,
     as in ``TWaveForm::LED``. Crossing timestamps are rounded to int64 fs only
     after linear interpolation between adjacent native acquisition samples.
@@ -92,7 +100,6 @@ def _sequential_crossings_fs(
     result = np.full(thresholds.shape, INVALID_TIME_FS, dtype=np.int64)
     if x.size < 2 or x.size != y.size:
         return result
-
     index = 0
     for out_index, threshold in enumerate(thresholds):
         if not np.isfinite(threshold) or threshold <= 0:
@@ -120,7 +127,6 @@ def _last_rising_crossing_before_peak_fs(
     thresholds_mV: np.ndarray,
 ) -> np.ndarray:
     """Return the final rising crossing before the crop maximum for each threshold."""
-
     x = np.asarray(time_ns, dtype=np.float64)
     y = np.asarray(signal_mV, dtype=np.float64)
     thresholds = np.asarray(thresholds_mV, dtype=np.float64)
@@ -130,13 +136,11 @@ def _last_rising_crossing_before_peak_fs(
     peak_index = int(np.argmax(y))
     if peak_index <= 0 or not np.isfinite(y[peak_index]):
         return result
-
     x0 = x[:peak_index]
     x1 = x[1 : peak_index + 1]
     y0 = y[:peak_index]
     y1 = y[1 : peak_index + 1]
     finite = np.isfinite(x0) & np.isfinite(x1) & np.isfinite(y0) & np.isfinite(y1)
-
     for out_index, threshold in enumerate(thresholds):
         if not np.isfinite(threshold) or threshold <= 0.0:
             continue
@@ -171,12 +175,10 @@ def prepare_timing_features(
     cfd_fractions: np.ndarray,
 ) -> TimingFeatures:
     """Extract LED/CFD times from the native samples.
-
     ``upsample_step_ps`` is retained as a deprecated compatibility argument and
     is ignored. Only the final threshold crossing time is interpolated, using the
     two original samples that bracket the crossing.
     """
-
     del upsample_step_ps
     invalid_led = np.full(np.asarray(led_thresholds_mV).shape, INVALID_TIME_FS, dtype=np.int64)
     invalid_cfd = np.full(np.asarray(cfd_fractions).shape, INVALID_TIME_FS, dtype=np.int64)
@@ -188,7 +190,6 @@ def prepare_timing_features(
             np.int64(INVALID_TIME_FS),
             np.int64(INVALID_TIME_FS),
         )
-
     signal = np.asarray(corrected_signal_mV, dtype=np.float64)
     sample_index = np.arange(signal.size, dtype=np.float64)
     time_ns = (
@@ -197,7 +198,6 @@ def prepare_timing_features(
     trigger_ns = float(time_ns[trigger_index])
     requested_start = trigger_ns - float(crop_before_ns)
     requested_stop = trigger_ns + float(crop_after_ns)
-
     # Keep one original sample outside each boundary so crossings at the crop
     # edge still have a valid bracketing pair.
     start_index = max(0, int(np.searchsorted(time_ns, requested_start, side="left")) - 1)
@@ -210,7 +210,6 @@ def prepare_timing_features(
             np.int64(INVALID_TIME_FS),
             np.int64(INVALID_TIME_FS),
         )
-
     crop_time_ns = time_ns[start_index:stop_index]
     crop_signal = signal[start_index:stop_index]
     if np.any(~np.isfinite(crop_time_ns)) or np.any(~np.isfinite(crop_signal)):
@@ -221,14 +220,12 @@ def prepare_timing_features(
             np.int64(INVALID_TIME_FS),
             np.int64(INVALID_TIME_FS),
         )
-
     cropped_peak = float(np.max(crop_signal))
     led_times = _sequential_crossings_fs(crop_time_ns, crop_signal, led_thresholds_mV)
     cfd_thresholds = cropped_peak * np.asarray(cfd_fractions, dtype=np.float64)
     cfd_times = _last_rising_crossing_before_peak_fs(
         crop_time_ns, crop_signal, cfd_thresholds
     )
-
     return TimingFeatures(
         led_times_fs=led_times,
         cfd_times_fs=cfd_times,

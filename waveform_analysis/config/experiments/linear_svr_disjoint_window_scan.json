@@ -1,40 +1,32 @@
 {
   "experiment": {
     "name": "linear_svr_disjoint_window_scan",
-    "output_dir": "results/studies/linear_svr_disjoint_window_scan"
+    "output_dir": "results/studies/linear_svr_disjoint_window_scan_2"
   },
+
   "data": {
     "root_folder": "processed_data/converted_runs_07-13",
     "root_glob": "*V-*.root",
     "recursive": false,
     "true_tof_ps": 0.0,
     "channels": {
-      "energy": [
-        1,
-        2
-      ],
-      "polarities": [
-        1,
-        1
-      ],
-      "timing": [
-        3,
-        4
-      ],
-      "timing_polarities": [
-        1,
-        1
-      ]
+      "energy": [1, 2],
+      "polarities": [1, 1],
+      "timing": [3, 4],
+      "timing_polarities": [1, 1]
     }
   },
+
   "models": [
     "linear_svr"
   ],
+
   "model_spaces_dir": "config/model_spaces",
+
   "channel_modes": [
-    "energy_to_energy",
     "timing_to_timing"
   ],
+
   "windows_ns": [
     {
       "id": "m2_p4",
@@ -62,22 +54,28 @@
       "end_ns": 60.0
     }
   ],
+
   "preprocessing": {
     "selection_store_dir": "processed_data/selected_events",
     "prepared_dir": "processed_data/ml_prepared",
+
     "materialized_window_ns": {
       "before": 5.0,
       "after": 60.0
     },
+
     "cleanup_raw_cache": true,
     "materialization_chunk_size": 4096,
+
     "input_variant_by_channel": {
       "energy": "denoised",
       "timing": "raw"
     },
+
     "subsampling_factors": [
       8
     ],
+
     "common": {
       "baseline_samples": 500,
       "search_trigger_threshold_mV": 50.0,
@@ -88,19 +86,24 @@
       "led_threshold_mV": 10.0,
       "cfd_fraction": 0.045
     },
+
     "energy": {},
+
     "timing": {
       "search_trigger_threshold_mV": 100.0
     },
+
     "selection": {
-      "energy_noise_max_mV": null,
+      "baseline_rmse_robust_z": 5.0,
       "energy_trigger_index_range": null,
       "minimum_events": 500,
+
       "led_outlier_rejection": {
         "enabled": true,
         "zscore_limit": 4.0
       }
     },
+
     "photopeak": {
       "enabled": true,
       "histogram_bin_mV": 1.0,
@@ -113,23 +116,27 @@
       "selection_sigma_low": -2.0,
       "selection_sigma_high": 4.0
     },
+
     "denoising": {
       "enabled": true,
       "method": "butterworth_lowpass",
       "cutoff_GHz": 1.0,
       "order": 4
     },
+
     "io": {
       "step_size": "128 MB",
       "max_events": 0,
       "progress_every": 1000
     },
+
     "parallelization": {
       "preprocessing_backend": "process",
       "preprocessing_workers": 8,
       "preprocessing_chunksize": 8
     }
   },
+
   "validation": {
     "strategy": "holdout",
     "seed": 20260813,
@@ -137,6 +144,7 @@
     "holdout_fraction": 0.2,
     "early_stop_fraction": 0.15,
     "n_splits": 5,
+
     "nested": {
       "outer_folds": 5,
       "inner_strategy": "holdout",
@@ -144,14 +152,17 @@
       "inner_folds": 5
     }
   },
+
   "cross_validation": {
     "blind_fraction": 0.2,
     "n_splits": 5,
     "early_stop_fraction": 0.15,
     "seed": 20260813
   },
+
   "fit": {
     "min_events": 100,
+
     "adaptive_binning": {
       "enabled": true,
       "bins_per_fwhm": 10.0,
@@ -160,9 +171,11 @@
       "phase_count": 8
     }
   },
+
   "multithreshold": {
     "enabled": false
   },
+
   "reporting": {
     "dpi": 180,
     "voltage_pattern": "(?P<voltage>\\d+(?:\\.\\d+)?)V",
@@ -171,12 +184,14 @@
     "top_corrections_k": 3,
     "ctr_uncertainty_bootstrap_samples": 1000,
     "window_scan_bars": true,
+
     "xai": {
-      "enabled": false,
+      "enabled": true,
       "max_events": 512,
       "integrated_gradient_steps": 16
     }
   },
+
   "logging": {
     "level": "INFO"
   }

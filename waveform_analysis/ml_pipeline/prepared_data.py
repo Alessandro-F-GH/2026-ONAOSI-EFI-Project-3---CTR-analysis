@@ -15,15 +15,13 @@ from scipy.signal import butter, sosfiltfilt
 
 from utils.photopeak import fit_photopeak, photopeak_mask
 from utils.signal import INVALID_TIME_FS
-
 from .common import atomic_json, canonical_hash, read_json, source_signature
 if TYPE_CHECKING:
     from .data import EnergyCache
 from .dataset import DATASET_FORMAT_VERSION, PreparedDataset, load_prepared_dataset
 from .selection_store import load_or_compute_selection, selection_request_fingerprint
 
-PREPARED_SELECTION_VERSION = 2
-
+PREPARED_SELECTION_VERSION = 3
 _COPY_ARRAYS = (
     "event_id",
     "event_index",
@@ -44,12 +42,8 @@ _COPY_ARRAYS = (
     "timing_aligned_energy_windows_mV",
     "timing_windows_mV",
 )
-
-
-
 def _preparation_request_fingerprint(study: dict[str, Any], root_file: Path) -> str:
     """Hash only inputs that change the canonical prepared signal representation.
-
     Experiment windows, models, validation settings and true TOF are intentionally
     excluded.  They are runtime views/evaluation metadata and must not trigger
     another ROOT/photopeak pass.
@@ -72,7 +66,6 @@ def _preparation_request_fingerprint(study: dict[str, Any], root_file: Path) -> 
         "materialized_window_ns": preprocessing.get("materialized_window_ns"),
         "preprocessing": preprocessing,
     })
-
 def _hash_indices(indices: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(indices, dtype=np.int64).tobytes()).hexdigest()
 
@@ -94,61 +87,136 @@ def _timing_pair_ps(times_fs: np.ndarray) -> np.ndarray:
     return (values[:, 0].astype(np.float64) - values[:, 1].astype(np.float64)) / 1000.0
 
 
+def _robust_location_scale(values: np.ndarray) -> tuple[float, float]:
+    """Return median and MAD-derived robust sigma for finite values only."""
+    data = np.asarray(values, dtype=np.float64).reshape(-1)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        return float("nan"), float("nan")
+    center = float(np.median(data))
+    mad = float(np.median(np.abs(data - center)))
+    sigma = 1.4826 * mad
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        sigma = float(np.std(data, ddof=1)) if data.size > 1 else 0.0
+    return center, sigma
+
+
 def _physical_photopeak_selection(
     cache: "EnergyCache", config: dict[str, Any], logger: Any
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Cuts that define the reusable physical/photopeak cohort only.
+    """Define the reusable physical cohort.
 
-    Timing validity and LED mismatch rejection are deliberately excluded so LED/CFD
-    threshold changes never force another photopeak fit.
+    Photopeak is the first event-selection cut. Baseline information is used only
+    afterwards as a quality metric: ``noise_rms_mV`` is the baseline RMSE about
+    the event's own baseline mean, and no baseline translation is applied to the
+    waveform. Timing validity and LED mismatch rejection remain downstream.
     """
     amplitudes_all = np.asarray(cache.amplitude_mV, dtype=np.float64)
-    noise_all = np.asarray(cache.noise_rms_mV, dtype=np.float64)
+    baseline_rmse_all = np.asarray(cache.noise_rms_mV, dtype=np.float64)
     trigger_all = np.asarray(cache.trigger_index, dtype=np.int64)
-    valid = (
-        np.all(np.isfinite(amplitudes_all), axis=1)
-        & np.all(np.isfinite(noise_all), axis=1)
-        & np.all(trigger_all >= 0, axis=1)
-    )
     selection = copy.deepcopy(config.get("selection", {}))
-    trigger_range = selection.get("energy_trigger_index_range")
-    if trigger_range is not None:
-        low, high = int(trigger_range[0]), int(trigger_range[1])
-        triggers = np.asarray(cache.trigger_index)
-        valid &= np.all((triggers > low) & (triggers < high), axis=1)
 
-    noise_limit = selection.get("energy_noise_max_mV")
-    if noise_limit is not None:
-        if isinstance(noise_limit, (list, tuple)):
-            limits = np.asarray(noise_limit, dtype=np.float64).reshape(-1)
-            if limits.size != 2:
-                raise ValueError("preprocessing.selection.energy_noise_max_mV must be scalar or length 2")
-        else:
-            limits = np.asarray([float(noise_limit), float(noise_limit)], dtype=np.float64)
-        noise = np.asarray(cache.noise_rms_mV, dtype=np.float64)
-        valid &= (noise[:, 0] < limits[0]) & (noise[:, 1] < limits[1])
+    if "energy_noise_max_mV" in selection:
+        logger.warning(
+            "preprocessing.selection.energy_noise_max_mV is obsolete and ignored; "
+            "baseline RMSE is now filtered from the post-photopeak population via "
+            "baseline_rmse_robust_z"
+        )
 
+    # Finite amplitudes are a computability guard, not a quality-selection cut.
+    finite_amplitude = np.all(np.isfinite(amplitudes_all), axis=1)
+    valid = finite_amplitude.copy()
     summary: dict[str, Any] = {
         "scope": "physical_photopeak_before_timing_and_ml",
-        "valid_before_photopeak": int(np.count_nonzero(valid)),
+        "finite_amplitude_before_photopeak": int(np.count_nonzero(finite_amplitude)),
     }
+
+    # Fit every energy-channel photopeak on the same initial population so the
+    # resulting cohort is independent of channel iteration order.
     photopeak_cfg = copy.deepcopy(config.get("photopeak", {"enabled": False}))
     photopeak_rows: list[dict[str, Any]] = []
     if bool(photopeak_cfg.get("enabled", False)):
-        amplitudes = np.asarray(cache.amplitude_mV, dtype=np.float64)
+        fit_indices = np.flatnonzero(finite_amplitude)
+        if fit_indices.size == 0:
+            raise RuntimeError("No finite energy amplitudes are available for photopeak selection")
+        photopeak_valid = finite_amplitude.copy()
         for channel_position, channel_number in enumerate(cache.manifest["energy_channels_one_based"]):
-            fit_indices = np.flatnonzero(valid)
             result = fit_photopeak(
-                amplitudes[fit_indices, channel_position],
+                amplitudes_all[fit_indices, channel_position],
                 channel=int(channel_number),
                 config=photopeak_cfg,
             )
             if not result.success:
                 raise RuntimeError(f"Photopeak fit failed for energy channel {channel_number}: {result.message}")
-            valid &= photopeak_mask(amplitudes[:, channel_position], result)
+            photopeak_valid &= photopeak_mask(amplitudes_all[:, channel_position], result)
             photopeak_rows.append(result.as_dict())
+        valid = photopeak_valid
         logger.info("Physical photopeak selection | retained=%d", int(np.count_nonzero(valid)))
     summary["photopeak"] = photopeak_rows
+    summary["events_after_photopeak"] = int(np.count_nonzero(valid))
+
+    # Derive one upper baseline-RMSE limit per energy channel from the same
+    # post-photopeak population. Channel-1 rejection cannot change channel-2's
+    # population statistics.
+    rmse_z_max = selection.get("baseline_rmse_robust_z", 5.0)
+    rmse_rows: list[dict[str, Any]] = []
+    if rmse_z_max is not None:
+        rmse_z_max = float(rmse_z_max)
+        if not np.isfinite(rmse_z_max) or rmse_z_max <= 0.0:
+            raise ValueError(
+                "preprocessing.selection.baseline_rmse_robust_z must be positive or null"
+            )
+        rmse_population = valid.copy()
+        rmse_accept = np.ones(valid.shape, dtype=bool)
+        for channel_position, channel_number in enumerate(cache.manifest["energy_channels_one_based"]):
+            center, sigma = _robust_location_scale(
+                baseline_rmse_all[rmse_population, channel_position]
+            )
+            if not np.isfinite(center):
+                raise RuntimeError(
+                    f"No finite baseline RMSE values in the photopeak population for energy channel {channel_number}"
+                )
+            upper = center + rmse_z_max * sigma if sigma > 0.0 else center
+            channel_accept = (
+                np.isfinite(baseline_rmse_all[:, channel_position])
+                & (baseline_rmse_all[:, channel_position] <= upper)
+            )
+            rmse_accept &= channel_accept
+            rmse_rows.append({
+                "channel": int(channel_number),
+                "population_events": int(np.count_nonzero(rmse_population)),
+                "median_rmse_mV": center,
+                "robust_sigma_mV": sigma,
+                "robust_z_max": rmse_z_max,
+                "upper_limit_mV": float(upper),
+                "rejected_from_photopeak": int(
+                    np.count_nonzero(rmse_population & ~channel_accept)
+                ),
+            })
+        valid &= rmse_accept
+        logger.info(
+            "Baseline RMSE filter | retained=%d | %s",
+            int(np.count_nonzero(valid)),
+            ", ".join(
+                f"ch{row['channel']}<={row['upper_limit_mV']:.3g} mV"
+                for row in rmse_rows
+            ),
+        )
+    summary["baseline_rmse_filter"] = {
+        "enabled": rmse_z_max is not None,
+        "robust_z_max": None if rmse_z_max is None else float(rmse_z_max),
+        "channels": rmse_rows,
+        "events_after_filter": int(np.count_nonzero(valid)),
+    }
+
+    # Trigger quality is intentionally downstream of photopeak and baseline RMSE.
+    valid &= np.all(trigger_all >= 0, axis=1)
+    trigger_range = selection.get("energy_trigger_index_range")
+    if trigger_range is not None:
+        low, high = int(trigger_range[0]), int(trigger_range[1])
+        valid &= np.all((trigger_all > low) & (trigger_all < high), axis=1)
+    summary["valid_after_trigger_quality"] = int(np.count_nonzero(valid))
+
     selected = np.flatnonzero(valid).astype(np.int64)
     summary["selected_events"] = int(selected.size)
     return selected, summary
@@ -166,7 +234,6 @@ def _dataset_level_selection(
     if physical_selected is None:
         physical_selected, physical_summary = _physical_photopeak_selection(cache, config, logger)
     valid[np.asarray(physical_selected, dtype=np.int64)] = True
-
     # One frozen population for all standard and ML modes. Timing validity is
     # applied after the reusable photopeak cohort because it depends on LED/CFD
     # configuration rather than the physical energy population.
@@ -179,14 +246,12 @@ def _dataset_level_selection(
         valid &= np.all(np.asarray(cache.timing_led_time_fs) != INVALID_TIME_FS, axis=1)
     if cache.timing_cfd_time_fs is not None:
         valid &= np.all(np.asarray(cache.timing_cfd_time_fs) != INVALID_TIME_FS, axis=1)
-
     selection = copy.deepcopy(config.get("selection", {}))
     summary: dict[str, Any] = {
         "scope": "complete_file_before_any_ml_split",
         "physical_selection": physical_summary or {},
         "valid_after_timing": int(np.count_nonzero(valid)),
     }
-
     led_cfg = selection.get("led_outlier_rejection", {}) or {}
     led_summary: dict[str, Any] = {"enabled": bool(led_cfg.get("enabled", False))}
     if led_summary["enabled"]:
@@ -202,12 +267,9 @@ def _dataset_level_selection(
             base = valid & np.isfinite(delta)
             if np.count_nonzero(base) < 3:
                 raise RuntimeError(f"Too few valid {name} LED pairs for dataset-level outlier rejection")
-            center = float(np.median(delta[base]))
+            center, robust_sigma = _robust_location_scale(delta[base])
             if use_robust_z:
-                mad = float(np.median(np.abs(delta[base] - center)))
-                sigma = 1.4826 * mad
-                if not np.isfinite(sigma) or sigma <= 0.0:
-                    sigma = float(np.std(delta[base], ddof=1))
+                sigma = robust_sigma
                 if not np.isfinite(sigma) or sigma <= 0.0:
                     sigma = 1.0
                 distance = zscore_limit * sigma
@@ -233,7 +295,6 @@ def _dataset_level_selection(
             ", ".join(f"{row['family']} rejected={row['rejected']}" for row in family_rows),
         )
     summary["led_outlier_rejection"] = led_summary
-
     minimum = int(selection.get("minimum_events", selection.get("minimum_events_per_split", 100)))
     selected = np.flatnonzero(valid).astype(np.int64)
     summary["selected_events"] = int(selected.size)
@@ -328,13 +389,11 @@ def materialize_selected_dataset(
                 return load_prepared_dataset(output)
         except Exception:
             pass
-
     temporary = output.with_name(output.name + ".building")
     if temporary.exists():
         shutil.rmtree(temporary)
     temporary.mkdir(parents=True, exist_ok=True)
     chunk_size = max(1, int(config.get("materialization_chunk_size", 2048)))
-
     for name in _COPY_ARRAYS:
         source = getattr(cache, name, None)
         if source is not None:
@@ -342,7 +401,6 @@ def materialize_selected_dataset(
     np.save(temporary / "relative_time_ps.npy", np.asarray(cache.relative_time_ps, dtype=np.float64))
     if cache.timing_relative_time_ps is not None:
         np.save(temporary / "timing_relative_time_ps.npy", np.asarray(cache.timing_relative_time_ps, dtype=np.float64))
-
     denoise_cfg = copy.deepcopy(config.get("denoising", {}))
     denoise_enabled = bool(denoise_cfg.get("enabled", False))
     if denoise_enabled:
@@ -362,7 +420,6 @@ def materialize_selected_dataset(
                 config=denoise_cfg,
                 chunk_size=chunk_size,
             )
-
     manifest = {
         "format_version": DATASET_FORMAT_VERSION,
         "fingerprint": fingerprint,
@@ -387,6 +444,8 @@ def materialize_selected_dataset(
         "waveform_grid": cache.manifest.get("waveform_grid", "native_samples"),
         "native_sample_interval_ps": cache.manifest.get("native_sample_interval_ps"),
         "timing_native_sample_interval_ps": cache.manifest.get("timing_native_sample_interval_ps"),
+        "baseline_handling": "quality_only_no_shift",
+        "baseline_quality_metric": "rmse_about_event_baseline_mean",
         "led_timestamp_source": "energy_channels",
         "cfd_timestamp_source": "energy_channels",
         "ml_window_alignment_source": "target_specific_led",
@@ -418,6 +477,12 @@ def _raw_preprocess_config(study: dict[str, Any], root_file: Path, cache_dir: Pa
     # canonical raw windows therefore never depend on an ML denoising candidate.
     energy["denoising"] = {"enabled": False}
     timing["denoising"] = {"enabled": False}
+
+    # This is part of the raw-cache fingerprint because baseline-subtracted raw
+    # caches from older code are not compatible with the no-shift representation.
+    energy["baseline_handling"] = "quality_only_no_shift_v1"
+    timing["baseline_handling"] = "quality_only_no_shift_v1"
+
     materialized = preprocessing.get("materialized_window_ns") or {
         "before": max(float(window["before_ns"]) for window in study["windows_ns"]),
         "after": max(float(window["after_ns"]) for window in study["windows_ns"]),
@@ -464,7 +529,6 @@ def prepare_file_dataset(
                     return replace(loaded, manifest=manifest)
             except Exception as exc:
                 logger.warning("Cannot reuse permanent prepared dataset %s: %s", output, exc)
-
     raw_cache_dir = prepared_root / ".raw_cache" / root_id
     raw_cfg = _raw_preprocess_config(study, root_file, raw_cache_dir)
     cache_cfg = {
@@ -474,7 +538,6 @@ def prepare_file_dataset(
         "parallelization": raw_cfg["parallelization"],
     }
     from .data import prepare_energy_cache
-
     cache = prepare_energy_cache(
         root_file,
         raw_cache_dir,
@@ -553,7 +616,6 @@ def plot_prepared_signal_examples(
 def input_variant_dataset_view(dataset: PreparedDataset, variant: str) -> PreparedDataset:
     """Return a zero-copy raw/denoised waveform view of one prepared dataset."""
     from dataclasses import replace
-
     key = str(variant).strip().lower()
     if key == "raw":
         manifest = dict(dataset.manifest)

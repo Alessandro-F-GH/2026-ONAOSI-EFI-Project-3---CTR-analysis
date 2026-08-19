@@ -48,7 +48,6 @@
       "model.activation": {
         "type": "categorical",
         "values": [
-          "silu",
           "tanh",
           "relu"
         ]

@@ -1,7 +1,7 @@
 {
   "experiment": {
     "name": "linear_svr_timing_window_scan",
-    "output_dir": "results/studies/linear_svr_timing_window_scan"
+    "output_dir": "results/studies/linear_svr_timing_window_scan_2"
   },
   "data": {
     "root_folder": "processed_data/converted_runs_07-13",

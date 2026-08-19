@@ -10,7 +10,9 @@ import numpy as np
 
 from .common import atomic_json, canonical_hash, read_json, source_signature
 
-SELECTION_STORE_VERSION = 1
+# Version 2 invalidates selections produced before baseline-RMSE filtering was
+# moved after photopeak selection and made population-derived.
+SELECTION_STORE_VERSION = 2
 
 
 def _hash_indices(indices: np.ndarray) -> str:
@@ -25,7 +27,6 @@ def selection_request_fingerprint(
     preprocessing: dict[str, Any],
 ) -> str:
     """Fingerprint only the physical/photopeak cohort definition.
-
     LED/CFD thresholds, ML windows, denoising, true TOF, validation and model
     settings are intentionally absent: changing any of them must not refit the
     photopeak population.
@@ -81,7 +82,6 @@ def load_or_compute_selection(
                 indices.size,
             )
             return indices, dict(manifest.get("selection_summary", {})), directory
-
     indices, summary = compute()
     indices = np.asarray(indices, dtype=np.int64).reshape(-1)
     temporary = directory.with_name(directory.name + ".building")
