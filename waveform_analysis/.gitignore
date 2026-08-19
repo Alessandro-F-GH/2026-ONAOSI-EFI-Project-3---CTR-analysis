@@ -5,3 +5,4 @@ results/
 old/
 .venv/
 venv/
+config/
