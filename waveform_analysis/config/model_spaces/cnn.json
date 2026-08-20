@@ -14,15 +14,15 @@
       ],
 
       "kernel_sizes": [
-        9,
-        7,
-        5
+        33,
+        15,
+        13
       ],
 
       "strides": [
-        1,
         2,
-        2
+        4,
+        4
       ],
 
       "dilations": [
@@ -40,7 +40,9 @@
 
       "adaptive_pool_length": null,
 
-      "dense_units": [32],
+      "dense_units": [
+        32
+      ],
 
       "dense_dropout": 0.0,
 
@@ -61,7 +63,7 @@
       "seed": 20260815,
 
       "epochs": 350,
-      "batch_size": 256,
+      "batch_size": 64,
 
       "mixed_precision": true,
       "gradient_clip_norm": 10.0,
@@ -91,8 +93,6 @@
 
   "search": {
     "method": "grid",
-    
     "parameters": {}
   }
-  
 }

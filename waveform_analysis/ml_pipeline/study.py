@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import csv
 import gc
+import hashlib
 import itertools
 import json
 import os
@@ -92,6 +93,347 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writeheader()
         writer.writerows(rows)
     os.replace(temporary, path)
+
+
+# Increment this if the on-disk resume artifact semantics change.
+_RESUME_CACHE_VERSION = 1
+_RESULT_KEY_FIELDS = ("stage", "file_id", "mode_id", "model_id", "candidate_id")
+
+
+def _row_int(value: Any, default: int = -10**9) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _result_row_key(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    return tuple(_row_int(row.get(name)) for name in _RESULT_KEY_FIELDS)  # type: ignore[return-value]
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file() or path.stat().st_size == 0:
+        return []
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        return [dict(row) for row in csv.DictReader(stream)]
+
+
+class _ProgressiveResultRows(list[dict[str, Any]]):
+    """Result rows that atomically refresh results.csv after every completed step.
+
+    ``append`` is intentionally an upsert keyed by stage/file/mode/model/candidate.
+    This makes an interrupted run idempotent: a resumed candidate replaces its
+    previous row instead of creating duplicates.
+    """
+
+    def __init__(self, path: Path, initial: list[dict[str, Any]] | None = None):
+        super().__init__(initial or [])
+        self.path = path
+
+    def append(self, row: dict[str, Any]) -> None:  # type: ignore[override]
+        key = _result_row_key(row)
+        for index, existing in enumerate(self):
+            if _result_row_key(existing) == key:
+                super().__setitem__(index, row)
+                self.flush()
+                return
+        super().append(row)
+        self.flush()
+
+    def flush(self) -> None:
+        _write_csv(self.path, list(self))
+
+
+def _flush_progress_rows(rows: list[dict[str, Any]] | None) -> None:
+    if isinstance(rows, _ProgressiveResultRows):
+        rows.flush()
+
+
+def _array_sha256(values: np.ndarray) -> str:
+    array = np.ascontiguousarray(values, dtype=np.int64)
+    return hashlib.sha256(array.tobytes()).hexdigest()
+
+
+def _splits_signature(
+    splits: list[tuple[np.ndarray, np.ndarray]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "train_n": int(len(train)),
+            "train_sha256": _array_sha256(np.asarray(train, dtype=np.int64)),
+            "score_n": int(len(score)),
+            "score_sha256": _array_sha256(np.asarray(score, dtype=np.int64)),
+        }
+        for train, score in splits
+    ]
+
+
+def _dataset_resume_token(dataset: PreparedDataset) -> dict[str, Any]:
+    manifest = dataset.manifest if isinstance(dataset.manifest, dict) else {}
+    return {
+        "fingerprint": manifest.get("fingerprint"),
+        "source_root": manifest.get("source_root"),
+        "event_count": int(dataset.event_id.size),
+        "event_id_sha256": hashlib.sha256(
+            np.ascontiguousarray(dataset.event_id, dtype=np.int64).tobytes()
+        ).hexdigest(),
+        "true_tof_ps": float(dataset.true_tof_ps),
+    }
+
+
+def _selection_cache_payload(
+    study: dict[str, Any],
+    dataset: PreparedDataset,
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    *,
+    mode: str,
+    descriptor: dict[str, Any],
+    space: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Candidate-specific scientific fingerprint.
+
+    Deliberately does not hash global reporting configuration or unrelated model
+    spaces. Consequently adding plots/XAI or another model cannot invalidate a
+    completed candidate from this model.
+    """
+    return {
+        "schema_version": _RESUME_CACHE_VERSION,
+        "dataset": _dataset_resume_token(dataset),
+        "mode": mode,
+        "descriptor": copy.deepcopy(descriptor),
+        "base_train_config": (
+            None if space is None else copy.deepcopy(space["base_train_config"])
+        ),
+        "validation_seed": int(study["validation"]["seed"]),
+        "splits": _splits_signature(splits),
+    }
+
+
+def _candidate_cache_paths(
+    study: dict[str, Any],
+    *,
+    file_id: int,
+    mode_id: int,
+    model_name: str,
+    cache_key: str,
+    kind: str = "selection",
+) -> tuple[Path, Path]:
+    root = (
+        Path(study["experiment"]["output_dir"])
+        / "artifacts"
+        / f"{kind}_cache_v{_RESUME_CACHE_VERSION}"
+        / f"f{file_id}_m{mode_id}"
+        / _artifact_model_key(model_name)
+    )
+    return root / f"{cache_key}.npz", root / f"{cache_key}.json"
+
+
+def _atomic_npz(path: Path, **arrays: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp.npz")
+    np.savez_compressed(temporary, **arrays)
+    os.replace(temporary, path)
+
+
+def _save_selection_cache(
+    npz_path: Path,
+    json_path: Path,
+    *,
+    cache_key: str,
+    metrics: dict[str, Any],
+    fold_ctrs: list[float],
+    score_indices: np.ndarray,
+    residual: np.ndarray,
+) -> None:
+    _atomic_npz(
+        npz_path,
+        score_indices=np.asarray(score_indices, dtype=np.int64),
+        residual=np.asarray(residual, dtype=np.float64),
+    )
+    atomic_json(
+        json_path,
+        {
+            "schema_version": _RESUME_CACHE_VERSION,
+            "cache_key": cache_key,
+            "metrics": copy.deepcopy(metrics),
+            "fold_ctrs": [float(value) for value in fold_ctrs],
+        },
+    )
+
+
+def _load_selection_cache(
+    npz_path: Path,
+    json_path: Path,
+    *,
+    cache_key: str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], list[float]] | None:
+    if not npz_path.is_file() or not json_path.is_file():
+        return None
+    try:
+        with json_path.open("r", encoding="utf-8") as stream:
+            meta = json.load(stream)
+        if (
+            int(meta.get("schema_version", -1)) != _RESUME_CACHE_VERSION
+            or str(meta.get("cache_key", "")) != cache_key
+        ):
+            return None
+        with np.load(npz_path) as arrays:
+            score_indices = np.asarray(arrays["score_indices"], dtype=np.int64)
+            residual = np.asarray(arrays["residual"], dtype=np.float64)
+        metrics = dict(meta["metrics"])
+        fold_ctrs = [float(value) for value in meta.get("fold_ctrs", [])]
+        if score_indices.size != residual.size:
+            return None
+        return score_indices, residual, metrics, fold_ctrs
+    except Exception:
+        return None
+
+
+def _final_cache_payload(
+    study: dict[str, Any],
+    dataset: PreparedDataset,
+    *,
+    mode: str,
+    space: dict[str, Any],
+    chosen: dict[str, Any],
+    development: np.ndarray,
+    blind: np.ndarray,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _RESUME_CACHE_VERSION,
+        "dataset": _dataset_resume_token(dataset),
+        "mode": mode,
+        "space_id": str(space["id"]),
+        "base_train_config": copy.deepcopy(space["base_train_config"]),
+        "window": copy.deepcopy(chosen["window"]),
+        "variant": str(chosen["variant"]),
+        "subsampling": int(chosen["subsampling"]),
+        "overrides": copy.deepcopy(chosen["overrides"]),
+        "candidate_id": int(chosen["candidate_id"]),
+        "development_sha256": _array_sha256(np.asarray(development, dtype=np.int64)),
+        "blind_sha256": _array_sha256(np.asarray(blind, dtype=np.int64)),
+        "validation_seed": int(study["validation"]["seed"]),
+    }
+
+
+def _save_final_cache(
+    npz_path: Path,
+    json_path: Path,
+    *,
+    cache_key: str,
+    residual: np.ndarray,
+    train_residual: np.ndarray,
+    metrics: dict[str, Any],
+    meta: dict[str, Any],
+    xai_profile: tuple[np.ndarray, np.ndarray] | None,
+) -> None:
+    arrays: dict[str, np.ndarray] = {
+        "blind_residual": np.asarray(residual, dtype=np.float64),
+        "train_residual": np.asarray(train_residual, dtype=np.float64),
+    }
+    if xai_profile is not None:
+        arrays["xai_time_ps"] = np.asarray(xai_profile[0], dtype=np.float64)
+        arrays["xai_importance"] = np.asarray(xai_profile[1], dtype=np.float64)
+    _atomic_npz(npz_path, **arrays)
+    atomic_json(
+        json_path,
+        {
+            "schema_version": _RESUME_CACHE_VERSION,
+            "cache_key": cache_key,
+            "metrics": copy.deepcopy(metrics),
+            "meta": copy.deepcopy(meta),
+        },
+    )
+
+
+def _load_final_cache(
+    npz_path: Path,
+    json_path: Path,
+    *,
+    cache_key: str,
+) -> tuple[
+    np.ndarray,
+    dict[str, Any],
+    dict[str, Any],
+    tuple[np.ndarray, np.ndarray] | None,
+    np.ndarray,
+] | None:
+    if not npz_path.is_file() or not json_path.is_file():
+        return None
+    try:
+        with json_path.open("r", encoding="utf-8") as stream:
+            meta_file = json.load(stream)
+        if (
+            int(meta_file.get("schema_version", -1)) != _RESUME_CACHE_VERSION
+            or str(meta_file.get("cache_key", "")) != cache_key
+        ):
+            return None
+        with np.load(npz_path) as arrays:
+            residual = np.asarray(arrays["blind_residual"], dtype=np.float64)
+            train_residual = np.asarray(arrays["train_residual"], dtype=np.float64)
+            xai_profile = None
+            if "xai_time_ps" in arrays and "xai_importance" in arrays:
+                xai_profile = (
+                    np.asarray(arrays["xai_time_ps"], dtype=np.float64),
+                    np.asarray(arrays["xai_importance"], dtype=np.float64),
+                )
+        return (
+            residual,
+            dict(meta_file["metrics"]),
+            dict(meta_file["meta"]),
+            xai_profile,
+            train_residual,
+        )
+    except Exception:
+        return None
+
+
+def _resume_state_hash(config: dict[str, Any]) -> str:
+    return str(config.get("_core_hash") or config.get("_config_hash") or "")
+
+
+def _check_or_create_run_state(
+    config: dict[str, Any],
+    output: Path,
+    *,
+    resume: bool,
+    logger: Any,
+) -> Path:
+    """Protect progressive results from being mixed across scientific configs."""
+    path = output / "run_state.json"
+    current = _resume_state_hash(config)
+    if resume and path.is_file():
+        with path.open("r", encoding="utf-8") as stream:
+            previous = json.load(stream)
+        old = str(previous.get("core_hash", ""))
+        if old and current and old != current:
+            raise RuntimeError(
+                "Partial results exist for a different training/core configuration. "
+                "Use a different experiment output directory or --restart."
+            )
+        logger.info(
+            "Partial resume state found | status=%s | progressive rows/candidate caches will be reused",
+            previous.get("status", "unknown"),
+        )
+    elif resume and (output / "results.csv").is_file() and not path.is_file():
+        raise RuntimeError(
+            "results.csv exists without run_state.json/manifest.json, so partial-result "
+            "compatibility cannot be proven. Preserve the directory and start a new "
+            "output, or use --restart if those partial rows may be discarded."
+        )
+    atomic_json(
+        path,
+        {
+            "schema_version": 1,
+            "experiment": config["experiment"]["name"],
+            "core_hash": current,
+            "artifact_hash": config.get("_artifact_hash"),
+            "config_hash": config.get("_config_hash"),
+            "status": "running",
+        },
+    )
+    return path
+
 
 def _fit_row(
     values_ps: np.ndarray, *, method: str, fit_config: dict[str, Any]
@@ -825,6 +1167,7 @@ def _compact_candidate_params(overrides: dict[str, Any]) -> str:
     return " | ".join(parts) if parts else "default params"
 
 
+
 def _select_waveform_space(
     study: dict[str, Any],
     dataset: PreparedDataset,
@@ -845,6 +1188,12 @@ def _select_waveform_space(
     voltage: float,
     result_rows: list[dict[str, Any]] | None,
 ) -> dict[str, Any]:
+    """Select one waveform model with candidate-level persistent resume.
+
+    Every completed candidate stores its score residual and metrics in a small
+    scientific cache. On a later --resume the candidate is reconstructed from
+    that cache and training is skipped entirely.
+    """
     combinations = _waveform_candidate_combinations(
         study,
         space,
@@ -860,6 +1209,7 @@ def _select_waveform_space(
     best: dict[str, Any] | None = None
     total = len(combinations)
     last_scope: tuple[str, str, int] | None = None
+
     for sequence, (window, variant, subsampling, overrides) in enumerate(
         combinations,
         start=1,
@@ -881,6 +1231,7 @@ def _select_waveform_space(
                 total,
             )
             last_scope = scope
+
         descriptor = _candidate_descriptor(
             space,
             mode,
@@ -889,39 +1240,86 @@ def _select_waveform_space(
             subsampling,
             overrides,
         )
-        key = canonical_hash(descriptor)
-        candidate_id = candidate_ids.setdefault(key, len(candidate_ids))
+        candidate_descriptor_hash = canonical_hash(descriptor)
+        candidate_id = candidate_ids.setdefault(
+            candidate_descriptor_hash,
+            len(candidate_ids),
+        )
         candidate_manifest[str(candidate_id)] = descriptor
-        candidate_work = (
-            work_root
-            / f"select_f{file_id}_m{mode_id}_model{model_id}_c{candidate_id}"
+
+        cache_payload = _selection_cache_payload(
+            study,
+            dataset,
+            splits,
+            mode=mode,
+            descriptor=descriptor,
+            space=space,
         )
-        try:
-            score_idx, residual, metrics, fold_ctrs = _waveform_selection_candidate(
-                study,
-                dataset,
-                splits,
-                file_id=file_id,
-                mode=mode,
-                window=window,
-                variant=variant,
-                subsampling=int(subsampling),
-                space=space,
-                overrides=overrides,
-                candidate_id=candidate_id,
-                work_root=candidate_work,
-                logger=logger,
-                normalization_cache=normalization_cache,
+        cache_key = canonical_hash(cache_payload)
+        cache_npz, cache_json = _candidate_cache_paths(
+            study,
+            file_id=file_id,
+            mode_id=mode_id,
+            model_name=space["id"],
+            cache_key=cache_key,
+            kind="selection",
+        )
+        cached = _load_selection_cache(
+            cache_npz,
+            cache_json,
+            cache_key=cache_key,
+        )
+
+        if cached is not None:
+            score_idx, residual, metrics, fold_ctrs = cached
+            logger.info(
+                "Candidate %d/%d | REUSED | %s | s-CTR %.1f ps",
+                sequence,
+                total,
+                _compact_candidate_params(overrides),
+                float(metrics["ctr_ps"]),
             )
-        finally:
-            shutil.rmtree(candidate_work, ignore_errors=True)
-        logger.info(
-            "Candidate %d/%d | %s | s-CTR %.1f ps",
-            sequence,
-            total,
-            _compact_candidate_params(overrides),
-            float(metrics["ctr_ps"]),
-        )
+        else:
+            candidate_work = (
+                work_root
+                / f"select_f{file_id}_m{mode_id}_model{model_id}_c{candidate_id}"
+            )
+            try:
+                score_idx, residual, metrics, fold_ctrs = _waveform_selection_candidate(
+                    study,
+                    dataset,
+                    splits,
+                    file_id=file_id,
+                    mode=mode,
+                    window=window,
+                    variant=variant,
+                    subsampling=int(subsampling),
+                    space=space,
+                    overrides=overrides,
+                    candidate_id=candidate_id,
+                    work_root=candidate_work,
+                    logger=logger,
+                    normalization_cache=normalization_cache,
+                )
+                _save_selection_cache(
+                    cache_npz,
+                    cache_json,
+                    cache_key=cache_key,
+                    metrics=metrics,
+                    fold_ctrs=fold_ctrs,
+                    score_indices=score_idx,
+                    residual=residual,
+                )
+            finally:
+                shutil.rmtree(candidate_work, ignore_errors=True)
+            logger.info(
+                "Candidate %d/%d | %s | s-CTR %.1f ps",
+                sequence,
+                total,
+                _compact_candidate_params(overrides),
+                float(metrics["ctr_ps"]),
+            )
+
         if result_rows is not None:
             result_rows.append(
                 {
@@ -939,6 +1337,7 @@ def _select_waveform_space(
                     **metrics,
                 }
             )
+
         item = {
             "candidate_id": candidate_id,
             "window": window,
@@ -949,22 +1348,30 @@ def _select_waveform_space(
             "score_residual": residual,
             "metrics": metrics,
             "fold_ctrs": fold_ctrs,
+            "resume_cache_key": cache_key,
         }
         if best is None or float(metrics["ctr_ps"]) < float(best["metrics"]["ctr_ps"]):
             best = item
+
     if best is None:
         raise RuntimeError(f"No successful candidate for {space['id']} | mode={mode}")
+
     if result_rows is not None:
         for row in result_rows:
             if (
-                int(row.get("stage", -1)) == _STAGE_OOF
-                and int(row.get("file_id", -1)) == file_id
-                and int(row.get("mode_id", -1)) == mode_id
-                and int(row.get("model_id", -1)) == model_id
-                and int(row.get("candidate_id", -2)) == int(best["candidate_id"])
+                int(float(row.get("stage", -1))) == _STAGE_OOF
+                and int(float(row.get("file_id", -1))) == file_id
+                and int(float(row.get("mode_id", -1))) == mode_id
+                and int(float(row.get("model_id", -1))) == model_id
             ):
-                row["selected"] = 1
+                row["selected"] = int(
+                    int(float(row.get("candidate_id", -2)))
+                    == int(best["candidate_id"])
+                )
+        _flush_progress_rows(result_rows)
+
     return best
+
 
 def _multithreshold_feature_cache(
     study: dict[str, Any],
@@ -1009,6 +1416,7 @@ def _multithreshold_feature_cache(
     return entry
 
 
+
 def _select_multithreshold(
     study: dict[str, Any],
     dataset: PreparedDataset,
@@ -1028,8 +1436,10 @@ def _select_multithreshold(
     result_rows: list[dict[str, Any]] | None,
     feature_cache: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
+    """Select multithreshold SVR with persistent candidate-level resume."""
     if not bool(study["multithreshold"].get("enabled", False)):
         return None
+
     cfg = study["multithreshold"]
     data = _multithreshold_feature_cache(
         study,
@@ -1044,12 +1454,13 @@ def _select_multithreshold(
     target = data["target_correction"]
     best: dict[str, Any] | None = None
     candidates = _multithreshold_candidates(cfg, thresholds.size)
+
     for sequence, params in enumerate(candidates, start=1):
         columns = params["threshold_indices"]
         valid = np.all(np.isfinite(features[:, columns]), axis=1)
-        # Same population for every candidate: never improve CTR by dropping hard events.
         if not np.all(valid[np.asarray(selection_indices, dtype=np.int64)]):
             continue
+
         descriptor = {
             "family": _MODEL_MULTITHRESHOLD,
             "mode": mode,
@@ -1061,35 +1472,87 @@ def _select_multithreshold(
                 if key != "threshold_indices"
             },
         }
-        key = canonical_hash(descriptor)
-        candidate_id = candidate_ids.setdefault(key, len(candidate_ids))
+        descriptor_hash = canonical_hash(descriptor)
+        candidate_id = candidate_ids.setdefault(
+            descriptor_hash,
+            len(candidate_ids),
+        )
         candidate_manifest[str(candidate_id)] = descriptor
-        residual_parts: list[np.ndarray] = []
-        score_parts: list[np.ndarray] = []
-        for train_pool, score_idx in splits:
-            estimator = make_pipeline(
-                StandardScaler(),
-                SVR(
-                    kernel=params["kernel"],
-                    C=params["C"],
-                    epsilon=params["epsilon_ps"],
-                    gamma=params["gamma"],
-                ),
+
+        cache_payload = _selection_cache_payload(
+            study,
+            dataset,
+            splits,
+            mode=mode,
+            descriptor={
+                **descriptor,
+                "multithreshold_config": copy.deepcopy(cfg),
+            },
+            space=None,
+        )
+        cache_key = canonical_hash(cache_payload)
+        cache_npz, cache_json = _candidate_cache_paths(
+            study,
+            file_id=file_id,
+            mode_id=mode_id,
+            model_name=_MODEL_MULTITHRESHOLD,
+            cache_key=cache_key,
+            kind="selection",
+        )
+        cached = _load_selection_cache(
+            cache_npz,
+            cache_json,
+            cache_key=cache_key,
+        )
+
+        if cached is not None:
+            score_indices, combined, metrics, fold_ctrs = cached
+            if sequence == 1 or sequence % max(1, len(candidates) // 10) == 0:
+                logger.info(
+                    "MT-SVR candidate %d/%d | REUSED | s-CTR %.1f ps",
+                    sequence,
+                    len(candidates),
+                    float(metrics["ctr_ps"]),
+                )
+        else:
+            residual_parts: list[np.ndarray] = []
+            score_parts: list[np.ndarray] = []
+            for train_pool, score_idx in splits:
+                estimator = make_pipeline(
+                    StandardScaler(),
+                    SVR(
+                        kernel=params["kernel"],
+                        C=params["C"],
+                        epsilon=params["epsilon_ps"],
+                        gamma=params["gamma"],
+                    ),
+                )
+                estimator.fit(
+                    features[np.ix_(train_pool, columns)],
+                    target[train_pool],
+                )
+                correction = estimator.predict(
+                    features[np.ix_(score_idx, columns)]
+                )
+                residual_parts.append(
+                    led_ps[score_idx]
+                    - correction
+                    - float(dataset.true_tof_ps)
+                )
+                score_parts.append(np.asarray(score_idx, dtype=np.int64))
+
+            combined, metrics, fold_ctrs = _selection_metric_summary(residual_parts)
+            score_indices = np.concatenate(score_parts)
+            _save_selection_cache(
+                cache_npz,
+                cache_json,
+                cache_key=cache_key,
+                metrics=metrics,
+                fold_ctrs=fold_ctrs,
+                score_indices=score_indices,
+                residual=combined,
             )
-            estimator.fit(
-                features[np.ix_(train_pool, columns)],
-                target[train_pool],
-            )
-            correction = estimator.predict(
-                features[np.ix_(score_idx, columns)]
-            )
-            residual_parts.append(
-                led_ps[score_idx]
-                - correction
-                - float(dataset.true_tof_ps)
-            )
-            score_parts.append(np.asarray(score_idx, dtype=np.int64))
-        combined, metrics, fold_ctrs = _selection_metric_summary(residual_parts)
+
         if result_rows is not None:
             result_rows.append(
                 {
@@ -1107,6 +1570,7 @@ def _select_multithreshold(
                     **metrics,
                 }
             )
+
         item = {
             "candidate_id": candidate_id,
             "window": window,
@@ -1114,30 +1578,37 @@ def _select_multithreshold(
             "features": features,
             "led_ps": led_ps,
             "target_correction": target,
-            "score_indices": np.concatenate(score_parts),
+            "score_indices": score_indices,
             "score_residual": combined,
             "metrics": metrics,
             "fold_ctrs": fold_ctrs,
             "window_id": codebooks["window"][window["id"]],
+            "resume_cache_key": cache_key,
         }
         if best is None or float(metrics["ctr_ps"]) < float(best["metrics"]["ctr_ps"]):
             best = item
+
     if best is None:
         logger.warning(
             "No multithreshold candidate covers the complete selection population | mode=%s",
             mode,
         )
         return None
+
     if result_rows is not None:
         for row in result_rows:
             if (
-                int(row.get("stage", -1)) == _STAGE_OOF
-                and int(row.get("file_id", -1)) == file_id
-                and int(row.get("mode_id", -1)) == mode_id
-                and int(row.get("model_id", -1)) == model_id
-                and int(row.get("candidate_id", -2)) == int(best["candidate_id"])
+                int(float(row.get("stage", -1))) == _STAGE_OOF
+                and int(float(row.get("file_id", -1))) == file_id
+                and int(float(row.get("mode_id", -1))) == mode_id
+                and int(float(row.get("model_id", -1))) == model_id
             ):
-                row["selected"] = 1
+                row["selected"] = int(
+                    int(float(row.get("candidate_id", -2)))
+                    == int(best["candidate_id"])
+                )
+        _flush_progress_rows(result_rows)
+
     logger.info(
         "Selected multithreshold SVR | mode=%s | s-CTR %.1f ps | thresholds=%s",
         mode,
@@ -1145,6 +1616,7 @@ def _select_multithreshold(
         thresholds[best["params"]["threshold_indices"]].tolist(),
     )
     return best
+
 
 
 def _multithreshold_evaluate(
@@ -1515,7 +1987,22 @@ def _repair_additive_artifacts(
     manifest["reporting"] = copy.deepcopy(config.get("reporting", {}))
     manifest["last_resume_repaired"] = repaired
     atomic_json(output / "manifest.json", manifest)
-    atomic_json(output / "config_resolved.json", {k: v for k, v in config.items() if not str(k).startswith("_")})
+    atomic_json(
+        output / "config_resolved.json",
+        {k: v for k, v in config.items() if not str(k).startswith("_")},
+    )
+    atomic_json(
+        output / "run_state.json",
+        {
+            "schema_version": 1,
+            "experiment": config["experiment"]["name"],
+            "core_hash": _resume_state_hash(config),
+            "artifact_hash": config.get("_artifact_hash"),
+            "config_hash": config.get("_config_hash"),
+            "status": "complete",
+            "row_count": int(manifest.get("row_count", 0)),
+        },
+    )
     logger.info("Additive resume | repaired %d missing artifacts; numeric results preserved", len(repaired))
     return {"output_dir": str(output), "row_count": int(manifest.get("row_count", 0)), "resumed": True, "repaired_artifacts": repaired}
 
@@ -1589,6 +2076,18 @@ def run_study(
             f"in {config['data']['root_folder']}"
         )
 
+    run_state_path = _check_or_create_run_state(
+        config,
+        output,
+        resume=resume,
+        logger=logger,
+    )
+    if resume and results_path.is_file():
+        logger.info(
+            "Partial run resume | loading progressive results from %s",
+            results_path,
+        )
+
     codebooks = {
         "file": {path.name: index for index, path in enumerate(root_files)},
         "mode": {
@@ -1618,7 +2117,11 @@ def run_study(
 
     candidate_ids: dict[str, int] = {}
     candidate_manifest: dict[str, Any] = {}
-    rows: list[dict[str, Any]] = []
+    initial_rows = _read_csv_rows(results_path) if resume else []
+    rows: list[dict[str, Any]] = _ProgressiveResultRows(
+        results_path,
+        initial_rows,
+    )
     report_rows: list[dict[str, Any]] = []
     nested_rows: list[dict[str, Any]] = []
     normalization_cache: dict[str, Normalization] = {}
@@ -2281,33 +2784,158 @@ def run_study(
                     checkpoint_root
                     / f"f{file_id}_m{mode_id}_model{model_id}__resume_model.pt"
                 )
-                (
-                    residual,
-                    metrics,
-                    meta,
-                    xai_profile,
-                    train_residual,
-                ) = _waveform_evaluate_selected(
+                final_cache_payload = _final_cache_payload(
                     config,
                     dataset,
-                    development,
-                    blind,
-                    file_id=file_id,
                     mode=mode,
-                    window=chosen["window"],
-                    variant=chosen["variant"],
-                    subsampling=chosen["subsampling"],
                     space=space,
-                    overrides=chosen["overrides"],
-                    candidate_id=chosen["candidate_id"],
-                    work_dir=final_dir,
-                    logger=logger,
-                    normalization_cache=normalization_cache,
-                    checkpoint_path=checkpoint,
-                    resume_model_path=resume_model,
-                    compute_xai=True,
-                    return_train_residual=True,
+                    chosen=chosen,
+                    development=development,
+                    blind=blind,
                 )
+                final_cache_key = canonical_hash(final_cache_payload)
+                final_cache_npz, final_cache_json = _candidate_cache_paths(
+                    config,
+                    file_id=file_id,
+                    mode_id=mode_id,
+                    model_name=space["id"],
+                    cache_key=final_cache_key,
+                    kind="final",
+                )
+                cached_final = _load_final_cache(
+                    final_cache_npz,
+                    final_cache_json,
+                    cache_key=final_cache_key,
+                )
+                # A reusable final cache is only considered complete when the
+                # persistent model artifacts also exist. This guarantees that a
+                # later XAI-only resume can enrich the experiment without fit.
+                if cached_final is not None and checkpoint.is_file() and resume_model.is_file():
+                    (
+                        residual,
+                        metrics,
+                        meta,
+                        xai_profile,
+                        train_residual,
+                    ) = cached_final
+                    logger.info(
+                        "Final model REUSED | %s | mode=%s | candidate=%d",
+                        space["id"],
+                        mode,
+                        int(chosen["candidate_id"]),
+                    )
+
+                    xai_cfg = config.get("reporting", {}).get("xai", {}) or {}
+                    if bool(xai_cfg.get("enabled", False)) and xai_profile is None:
+                        try:
+                            saved_model = torch.load(
+                                resume_model,
+                                map_location="cpu",
+                                weights_only=False,
+                            )
+                        except TypeError:
+                            saved_model = torch.load(
+                                resume_model,
+                                map_location="cpu",
+                            )
+                        source = input_variant_dataset_view(
+                            dataset,
+                            chosen["variant"],
+                        )
+                        input_waveforms, target = CHANNEL_MODES[mode]
+                        xai_view = prediction_window_dataset_view(
+                            source,
+                            input_waveforms=input_waveforms,
+                            target=target,
+                            before_ns=float(chosen["window"]["before_ns"]),
+                            after_ns=float(chosen["window"]["after_ns"]),
+                        )
+                        xai_cfg_model = _candidate_training_config(
+                            config,
+                            space,
+                            chosen["overrides"],
+                            mode=mode,
+                            subsampling=chosen["subsampling"],
+                            train_dir=output / ".resume_xai",
+                            seed=_seed_for(
+                                base_seed,
+                                file_id,
+                                mode,
+                                space["id"],
+                                "partial_resume_xai",
+                            ),
+                            final=False,
+                        )
+                        normalization = Normalization.from_dict(
+                            meta["normalization"]
+                        )
+                        xai_profile = _integrated_gradient_profile(
+                            saved_model,
+                            normalization,
+                            xai_cfg_model,
+                            xai_view,
+                            blind,
+                            max_events=int(xai_cfg.get("max_events", 512)),
+                            steps=int(
+                                xai_cfg.get(
+                                    "integrated_gradient_steps",
+                                    16,
+                                )
+                            ),
+                        )
+                        del saved_model
+                        _save_final_cache(
+                            final_cache_npz,
+                            final_cache_json,
+                            cache_key=final_cache_key,
+                            residual=residual,
+                            train_residual=train_residual,
+                            metrics=metrics,
+                            meta=meta,
+                            xai_profile=xai_profile,
+                        )
+                else:
+                    (
+                        residual,
+                        metrics,
+                        meta,
+                        xai_profile,
+                        train_residual,
+                    ) = _waveform_evaluate_selected(
+                        config,
+                        dataset,
+                        development,
+                        blind,
+                        file_id=file_id,
+                        mode=mode,
+                        window=chosen["window"],
+                        variant=chosen["variant"],
+                        subsampling=chosen["subsampling"],
+                        space=space,
+                        overrides=chosen["overrides"],
+                        candidate_id=chosen["candidate_id"],
+                        work_dir=final_dir,
+                        logger=logger,
+                        normalization_cache=normalization_cache,
+                        checkpoint_path=checkpoint,
+                        resume_model_path=resume_model,
+                        compute_xai=True,
+                        return_train_residual=True,
+                    )
+                    if train_residual is None:
+                        raise RuntimeError(
+                            f"Final {space['id']} evaluation did not return train residuals"
+                        )
+                    _save_final_cache(
+                        final_cache_npz,
+                        final_cache_json,
+                        cache_key=final_cache_key,
+                        residual=residual,
+                        train_residual=train_residual,
+                        metrics=metrics,
+                        meta=meta,
+                        xai_profile=xai_profile,
+                    )
                 if train_residual is None:
                     raise RuntimeError(
                         f"Final {space['id']} evaluation did not return train residuals"
@@ -2805,7 +3433,23 @@ def run_study(
         },
     }
     atomic_json(manifest_path, manifest)
-    atomic_json(output / "config_resolved.json", {k: v for k, v in config.items() if not str(k).startswith("_")})
+    atomic_json(
+        output / "config_resolved.json",
+        {k: v for k, v in config.items() if not str(k).startswith("_")},
+    )
+    atomic_json(
+        run_state_path,
+        {
+            "schema_version": 1,
+            "experiment": config["experiment"]["name"],
+            "core_hash": _resume_state_hash(config),
+            "artifact_hash": config.get("_artifact_hash"),
+            "config_hash": config.get("_config_hash"),
+            "status": "complete",
+            "row_count": len(rows),
+        },
+    )
+    _flush_progress_rows(rows)
     logger.info("Study complete | rows=%d | %s", len(rows), output)
     return {
         "output_dir": str(output),
