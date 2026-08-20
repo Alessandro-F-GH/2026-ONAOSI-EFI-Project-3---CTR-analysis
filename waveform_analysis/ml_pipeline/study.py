@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -77,22 +78,80 @@ def _voltage_from_name(name: str, pattern: str) -> float:
     except (IndexError, KeyError):
         return float(match.group(1))
 
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def _pending_csv_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}.pending{path.suffix}")
+
+
+def _write_csv(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    logger: Any | None = None,
+    retries: int = 6,
+    retry_delay_s: float = 0.20,
+) -> bool:
+    """Atomically publish a CSV without letting a Windows file lock kill a run.
+
+    Windows refuses ``os.replace`` when the destination is open in applications
+    such as Excel.  Candidate/model caches are the authoritative resume state,
+    while this CSV is a progressive human-readable view.  We therefore retry
+    transient locks and, if the destination remains locked, preserve the newest
+    complete snapshot as ``<stem>.pending.csv``.  A later flush/resume merges the
+    pending snapshot back into the canonical CSV.
+
+    Returns True when ``path`` was successfully published, False when the latest
+    snapshot had to be parked in the pending sidecar.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
     fields: list[str] = []
     for row in rows:
         for key in row:
             if key not in fields:
                 fields.append(key)
+
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-    os.replace(temporary, path)
+        if fields:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    last_error: PermissionError | None = None
+    for attempt in range(max(0, int(retries)) + 1):
+        try:
+            os.replace(temporary, path)
+            pending = _pending_csv_path(path)
+            try:
+                pending.unlink(missing_ok=True)
+                for stale in path.parent.glob(f"{path.stem}.pending.*{path.suffix}"):
+                    stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return True
+        except PermissionError as exc:
+            last_error = exc
+            if attempt < int(retries):
+                time.sleep(float(retry_delay_s) * (attempt + 1))
+
+    pending = _pending_csv_path(path)
+    try:
+        os.replace(temporary, pending)
+    except PermissionError:
+        # Very unusual: both canonical and pending files are locked. Keep a
+        # uniquely named complete snapshot rather than failing the experiment.
+        stamp = int(time.time() * 1000)
+        pending = path.with_name(f"{path.stem}.pending.{stamp}{path.suffix}")
+        os.replace(temporary, pending)
+
+    if logger is not None:
+        logger.warning(
+            "Could not update %s because it is locked by another process; "
+            "latest progressive snapshot saved to %s. Training will continue. "
+            "Close the CSV in Excel/preview to allow the next flush to publish it.",
+            path,
+            pending,
+        )
+    return False
 
 
 # Increment this if the on-disk resume artifact semantics change.
@@ -118,6 +177,34 @@ def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
         return [dict(row) for row in csv.DictReader(stream)]
 
 
+def _merge_result_rows(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge progressive snapshots with later groups taking precedence."""
+    merged: list[dict[str, Any]] = []
+    positions: dict[tuple[int, int, int, int, int], int] = {}
+    for group in groups:
+        for row in group:
+            key = _result_row_key(row)
+            if key in positions:
+                merged[positions[key]] = row
+            else:
+                positions[key] = len(merged)
+                merged.append(row)
+    return merged
+
+
+def _read_progressive_rows(path: Path) -> list[dict[str, Any]]:
+    """Read canonical results plus any newer sidecar left by a file lock."""
+    groups = [_read_csv_rows(path)]
+    pending = _pending_csv_path(path)
+    if pending.is_file():
+        groups.append(_read_csv_rows(pending))
+    # Also recover rare uniquely named pending snapshots. Lexicographic order is
+    # chronological because their suffix is a millisecond timestamp.
+    for candidate in sorted(path.parent.glob(f"{path.stem}.pending.*{path.suffix}")):
+        groups.append(_read_csv_rows(candidate))
+    return _merge_result_rows(*groups)
+
+
 class _ProgressiveResultRows(list[dict[str, Any]]):
     """Result rows that atomically refresh results.csv after every completed step.
 
@@ -126,9 +213,16 @@ class _ProgressiveResultRows(list[dict[str, Any]]):
     previous row instead of creating duplicates.
     """
 
-    def __init__(self, path: Path, initial: list[dict[str, Any]] | None = None):
+    def __init__(
+        self,
+        path: Path,
+        initial: list[dict[str, Any]] | None = None,
+        *,
+        logger: Any | None = None,
+    ):
         super().__init__(initial or [])
         self.path = path
+        self.logger = logger
 
     def append(self, row: dict[str, Any]) -> None:  # type: ignore[override]
         key = _result_row_key(row)
@@ -141,7 +235,7 @@ class _ProgressiveResultRows(list[dict[str, Any]]):
         self.flush()
 
     def flush(self) -> None:
-        _write_csv(self.path, list(self))
+        _write_csv(self.path, list(self), logger=self.logger)
 
 
 def _flush_progress_rows(rows: list[dict[str, Any]] | None) -> None:
@@ -261,6 +355,43 @@ def _save_selection_cache(
     )
 
 
+def _restore_cached_metrics(values: Any) -> dict[str, Any]:
+    """Restore numeric metric semantics after strict JSON serialization.
+
+    ``atomic_json`` writes non-finite floating-point values as JSON ``null``.
+    Selection/final caches legitimately contain NaN diagnostics (for example
+    ``ctr_err_ps`` for a one-split holdout).  On reload those values therefore
+    become ``None`` and must be converted back to NaN before report code calls
+    ``float(...)``.  This keeps existing v1 caches reusable.
+    """
+    if not isinstance(values, dict):
+        raise ValueError("Cached metrics must be a JSON object")
+    restored = dict(values)
+    numeric_keys = {
+        "ctr_ps",
+        "ctr_err_ps",
+        "mean_ps",
+        "std_ps",
+        "rmse_ps",
+        "bias_ps",
+        "dev_ndof",
+        "bin_ps",
+        "phase_ps",
+        "phase_ctr_std_ps",
+    }
+    for key in numeric_keys:
+        if key not in restored:
+            continue
+        value = restored[key]
+        if value is None or value == "":
+            restored[key] = float("nan")
+        else:
+            restored[key] = float(value)
+    if "n" in restored:
+        restored["n"] = int(restored["n"])
+    return restored
+
+
 def _load_selection_cache(
     npz_path: Path,
     json_path: Path,
@@ -280,8 +411,8 @@ def _load_selection_cache(
         with np.load(npz_path) as arrays:
             score_indices = np.asarray(arrays["score_indices"], dtype=np.int64)
             residual = np.asarray(arrays["residual"], dtype=np.float64)
-        metrics = dict(meta["metrics"])
-        fold_ctrs = [float(value) for value in meta.get("fold_ctrs", [])]
+        metrics = _restore_cached_metrics(meta["metrics"])
+        fold_ctrs = [float(value) for value in meta.get("fold_ctrs", []) if value is not None]
         if score_indices.size != residual.size:
             return None
         return score_indices, residual, metrics, fold_ctrs
@@ -379,7 +510,7 @@ def _load_final_cache(
                 )
         return (
             residual,
-            dict(meta_file["metrics"]),
+            _restore_cached_metrics(meta_file["metrics"]),
             dict(meta_file["meta"]),
             xai_profile,
             train_residual,
@@ -2026,6 +2157,29 @@ def run_study(
     nested_path = output / "nested_results.csv"
     manifest_path = output / "manifest.json"
 
+    # Recover the newest complete progressive snapshot before deciding whether
+    # this is a completed additive-resume run. This matters on Windows when a
+    # previous process finished while results.csv was open in Excel: the newest
+    # snapshot then lives in results.pending.csv rather than the locked file.
+    if resume:
+        pending_candidates = [
+            _pending_csv_path(results_path),
+            *sorted(output.glob(f"{results_path.stem}.pending.*{results_path.suffix}")),
+        ]
+        if any(path.is_file() for path in pending_candidates):
+            recovered_rows = _read_progressive_rows(results_path)
+            if recovered_rows:
+                published = _write_csv(
+                    results_path,
+                    recovered_rows,
+                    logger=logger,
+                )
+                if published:
+                    logger.info(
+                        "Recovered pending progressive results into %s",
+                        results_path,
+                    )
+
     if resume and results_path.is_file() and manifest_path.is_file():
         with manifest_path.open("r", encoding="utf-8") as stream:
             manifest = json.load(stream)
@@ -2082,10 +2236,11 @@ def run_study(
         resume=resume,
         logger=logger,
     )
-    if resume and results_path.is_file():
+    if resume and (results_path.is_file() or _pending_csv_path(results_path).is_file()):
         logger.info(
-            "Partial run resume | loading progressive results from %s",
+            "Partial run resume | loading progressive results from %s%s",
             results_path,
+            (" + pending snapshot" if _pending_csv_path(results_path).is_file() else ""),
         )
 
     codebooks = {
@@ -2117,10 +2272,11 @@ def run_study(
 
     candidate_ids: dict[str, int] = {}
     candidate_manifest: dict[str, Any] = {}
-    initial_rows = _read_csv_rows(results_path) if resume else []
+    initial_rows = _read_progressive_rows(results_path) if resume else []
     rows: list[dict[str, Any]] = _ProgressiveResultRows(
         results_path,
         initial_rows,
+        logger=logger,
     )
     report_rows: list[dict[str, Any]] = []
     nested_rows: list[dict[str, Any]] = []
@@ -3322,7 +3478,7 @@ def run_study(
         mt_feature_cache.clear()
 
     shutil.rmtree(work_root, ignore_errors=True)
-    _write_csv(results_path, rows)
+    _write_csv(results_path, list(rows), logger=logger)
     if nested_rows:
         write_report_csv(nested_path, nested_rows)
     write_summary_results(summary_path, report_rows)
@@ -3395,6 +3551,7 @@ def run_study(
         "selection_store_dir": config["preprocessing"]["selection_store_dir"],
         "materialized_window_ns": config["preprocessing"]["materialized_window_ns"],
         "row_count": len(rows),
+        "results_csv_pending": _pending_csv_path(results_path).is_file(),
         "codebooks": codebooks,
         "candidate_parameters": candidate_manifest,
         "final_models": final_metadata,
