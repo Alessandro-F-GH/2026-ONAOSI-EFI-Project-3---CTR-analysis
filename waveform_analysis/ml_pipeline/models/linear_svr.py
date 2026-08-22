@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import sys
+
 import math
 import warnings
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 import torch
 from torch import nn
 
-from utils.plots import plot_best_fit
-
+from utils_fit.plotting import plot_gaussian_fit
 from ..common import atomic_json, write_csv_rows
 from ..input_transform import component_subsampling_indices
 from ..training_context import TrainingContext
@@ -607,12 +612,12 @@ def train(context: TrainingContext) -> dict[str, Any]:
         context.plot_dir.mkdir(parents=True, exist_ok=True)
         dpi = int(config.get("plotting", {}).get("dpi", 180))
         _plot_epsilon_scan(rows, context.plot_dir / "epsilon_scan.png", dpi)
-        plot_best_fit(
+        plot_gaussian_fit(
             train_fit,
             context.plot_dir / "best_train_gaussian_fit.png",
             dpi=dpi,
         )
-        plot_best_fit(
+        plot_gaussian_fit(
             validation_fit,
             context.plot_dir / "best_validation_gaussian_fit.png",
             dpi=dpi,

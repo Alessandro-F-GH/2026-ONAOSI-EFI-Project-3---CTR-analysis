@@ -6,7 +6,6 @@ from typing import Iterable
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .fit import FitResult
 from .photopeak import PhotopeakResult
 from .signal import INVALID_TIME_FS
 
@@ -442,116 +441,6 @@ def plot_scan(
         axis.legend(handles, labels, loc="best")
         figure.tight_layout()
         _save_figure(figure, path, dpi)
-
-
-def plot_best_fit(result: FitResult, path: Path, *, dpi: int) -> None:
-    if not result.success or result.edges_ps.size < 2:
-        return
-
-    edges_ps = np.asarray(result.edges_ps, dtype=np.float64)
-    counts = np.asarray(result.counts, dtype=np.float64)
-    expected = np.asarray(result.expected, dtype=np.float64)
-    centers = 0.5 * (edges_ps[:-1] + edges_ps[1:])
-    widths = np.diff(edges_ps)
-
-    if counts.size != widths.size or expected.size != centers.size:
-        # Keep the plotting layer fail-safe: malformed fit arrays should not
-        # crash an otherwise completed waveform analysis.
-        return
-
-    fit_width_ps = max(
-        float(result.fit_high_ps - result.fit_low_ps),
-        float(np.median(widths)) if widths.size else 1.0,
-    )
-    margin_ps = max(
-        0.08 * fit_width_ps,
-        2.0 * float(np.median(widths)) if widths.size else 1.0,
-    )
-    plot_low_ps = float(result.fit_low_ps) - margin_ps
-    plot_high_ps = float(result.fit_high_ps) + margin_ps
-
-    with plt.rc_context(_PLOT_STYLE):
-        figure, axis = plt.subplots(figsize=(9.2, 6.1))
-        histogram = _histogram_bar(axis, edges_ps, counts)
-        fit_interval = axis.axvspan(
-            result.fit_low_ps,
-            result.fit_high_ps,
-            alpha=0.12,
-            color=_RANGE_COLOR,
-            label="Fit range",
-        )
-        gaussian_line, = axis.plot(
-            centers,
-            expected,
-            linewidth=2.2,
-            color=_FIT_COLOR,
-            label="Gaussian fit",
-        )
-
-        area_events = _safe_optional_float(
-            result, "area_events", "fit_area_events", "area"
-        )
-        fit_lines = ["Gaussian fit"]
-        if area_events is not None:
-            fit_lines.append(f"A={area_events:.1f} ev")
-        fit_lines.extend(
-            [
-                f"μ={result.mean_ps:.1f} ps",
-                f"σ={result.sigma_ps:.1f} ps",
-                f"CTR={result.ctr_ps:.1f} ps",
-            ]
-        )
-        ctr_error_ps = _safe_optional_float(result, "ctr_error_ps")
-        if ctr_error_ps is not None and ctr_error_ps >= 0.0:
-            fit_lines[-1] += f" ± {ctr_error_ps:.1f} ps"
-        fit_lines.append(f"χ²/ndof={_fmt3(result.chi2_ndof)}")
-        fit_label = "\n".join(fit_lines)
-
-        plot_legend = axis.legend(
-            handles=[histogram, fit_interval],
-            labels=["Data", "Fit range"],
-            loc="upper left",
-        )
-        axis.add_artist(plot_legend)
-        axis.legend(
-            handles=[gaussian_line],
-            labels=[fit_label],
-            loc="upper right",
-        )
-
-        selected_count = int(result.n_selected)
-        total_count = int(result.n_total)
-        valid_count = int(result.n_valid)
-        selected_fraction = (
-            100.0 * selected_count / total_count if total_count else 0.0
-        )
-        selection_label = (
-            f"selected={_fmt3(selected_count)} ({selected_fraction:.1f}%)\n"
-            f"rejected={_fmt3(total_count - selected_count)}\n"
-            f"valid timing pairs={_fmt3(valid_count)}\n"
-            f"fit=[{_fmt3(result.fit_low_ps)}, "
-            f"{_fmt3(result.fit_high_ps)}] ps"
-        )
-        axis.text(
-            0.02,
-            0.04,
-            selection_label,
-            transform=axis.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=11.5,
-            bbox=_annotation_box(),
-        )
-
-        axis.set_title(
-            f"{result.method} — parameter {_fmt3(result.parameter)} — Timing fit"
-        )
-        axis.set_xlabel("Time difference [ps]")
-        axis.set_ylabel("Events / bin")
-        axis.set_xlim(plot_low_ps, plot_high_ps)
-        figure.tight_layout()
-        _save_figure(figure, path, dpi)
-
 
 def plot_toa_for_parameter(
     times_a_fs: np.ndarray,

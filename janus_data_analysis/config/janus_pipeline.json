@@ -1,10 +1,10 @@
 {
   "paths": {
-    "input_dir": "data/07-13",
-    "output_dir": "outputs/07-13"
+    "input_dir": "data/07-10",
+    "output_dir": "outputs/07-10"
   },
   "files": {
-    "data_pattern": "Run*[Ll]ist.dat",
+    "data_pattern": "Run*list.dat",
     "recursive": false
   },
   "runs": {
@@ -84,7 +84,7 @@
     "minimum_events": 20
   },
   "fit": {
-    "min_events": 20,
+    "min_events": 100,
     "min_histogram_bins": 8,
     "max_histogram_bins": 160,
     "min_bin_width_lsb": 2,
@@ -102,7 +102,14 @@
     "outlier_minimum_scale_lsb": 2.0,
     "outlier_bin_width_lsb": 8,
     "outlier_seed_half_width_bins": 3,
-    "outlier_minimum_core_events": 20
+    "outlier_minimum_core_events": 20,
+    "adaptive_binning": {
+      "enabled": true,
+      "bins_per_fwhm": 10.0,
+      "min_bin_ps": 1.0,
+      "max_bin_ps": 25.0,
+      "phase_count": 8
+    }
   },
   "plots": {
     "matching_train": {

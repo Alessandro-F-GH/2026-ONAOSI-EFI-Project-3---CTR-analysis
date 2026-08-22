@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import sys
+
 import math
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from utils_fit import fit_delta_times_ps
+from utils_fit.io import load_fit_csv, write_fit_csv
+from utils_fit.plotting import plot_gaussian_fit
 
 from .binary_io import (
     atomic_write_csv,
@@ -18,7 +28,6 @@ from .binary_io import (
 from .cache import CACHE_SCHEMA_VERSION, load_state, mark_stage, save_state, signature, stage_migratable, stage_valid_any
 from .config import stage_config
 from .tabular import table_path
-from .fitting import fit_timing, load_fit_csv, write_fit_csv
 from .matching import (
     load_model,
     load_total_cache,
@@ -38,7 +47,6 @@ from .plotting import (
     plot_matching_total,
     plot_matching_training,
     plot_peak_selection,
-    plot_timing_fit,
 )
 from .preprocessing import (
     preprocess_binary,
@@ -69,6 +77,7 @@ SUMMARY_FIELDS = [
     "AcquisitionMode",
     "E_th",
     "T_th",
+    "fit_metric",
     "gaussian_area_events",
     "gaussian_area_error_events",
     "gaussian_mean_ps",
@@ -142,25 +151,26 @@ def _number(value: Any) -> float | str:
     return number if math.isfinite(number) else ""
 
 
-def _summary_row(run, run_info, fit, toa_lsb_ps: float| None, average_delay_corrected_alignments: int) -> dict[str, Any]:
+def _summary_row(run, run_info, fit, toa_lsb_ps: float | None, average_delay_corrected_alignments: int) -> dict[str, Any]:
+    del toa_lsb_ps  # Common FitResult is already expressed in ps.
     row: dict[str, Any] = {
         "run_id": run.run_id,
         "Voltage": run.voltage,
         "AcquisitionMode": run_info.acquisition_mode,
         "E_th": run_info.energy_threshold_mv,
         "T_th": run_info.timing_threshold_mv,
-        "gaussian_area_events": _number(fit.area_events),
-        "gaussian_area_error_events": _number(fit.area_error_events),
-        "gaussian_mean_ps": _number(fit.mean_lsb * toa_lsb_ps),
-        "gaussian_mean_error_ps": _number(fit.mean_error_lsb * toa_lsb_ps),
-        "gaussian_sigma_ps": _number(fit.sigma_lsb * toa_lsb_ps),
-        "gaussian_sigma_error_ps": _number(fit.sigma_error_lsb * toa_lsb_ps),
-        "CTR_ps": _number(2.355 * fit.sigma_lsb * toa_lsb_ps),
-        "CTR_error_ps": _number(2.355 * fit.sigma_error_lsb * toa_lsb_ps),
+        "fit_metric": "common_bin_integrated_gaussian_all_events",
+        "gaussian_area_events": _number(fit.n_fit),
+        "gaussian_area_error_events": "",
+        "gaussian_mean_ps": _number(fit.mean_ps),
+        "gaussian_mean_error_ps": _number(fit.mean_error_ps),
+        "gaussian_sigma_ps": _number(fit.sigma_ps),
+        "gaussian_sigma_error_ps": _number(fit.sigma_error_ps),
+        "CTR_ps": _number(fit.ctr_ps),
+        "CTR_error_ps": _number(fit.ctr_error_ps),
         "average_delay_corrected_alignments": int(average_delay_corrected_alignments),
     }
     return row
-
 
 def _load_summary(path: Path) -> dict[str, dict[str, str]]:
     if not path.exists():
@@ -1063,10 +1073,20 @@ def run_pipeline(cfg: dict) -> None:
                 raise RuntimeError("Fit is disabled and no valid cached result exists")
             else:
                 start = time.perf_counter()
-                fit = fit_timing(
-                    measurements.timing_lsb[selection.final_mask],
-                    cfg["fit"],
+                timing_ps = (
+                    measurements.timing_lsb[selection.final_mask].astype(np.float64)
+                    * float(toa_lsb_ps)
                 )
+                fit = fit_delta_times_ps(
+                    timing_ps,
+                    method="Pico-TDC LED",
+                    parameter=float(run_info.timing_threshold_mv),
+                    n_total=int(measurements.size),
+                    n_selected=int(np.count_nonzero(selection.final_mask)),
+                    config=cfg["fit"],
+                )
+                if not fit.success:
+                    raise RuntimeError(f"Common Gaussian fit failed: {fit.message}")
                 write_fit_csv(
                     fit_path, fit, cfg["analysis_output"]["diagnostic_mode"]
                 )
@@ -1105,12 +1125,12 @@ def run_pipeline(cfg: dict) -> None:
                     )
                 else:
                     start = time.perf_counter()
-                    plot_timing_fit(
-                        timing_plot_path,
-                        run.run_id,
+                    plot_gaussian_fit(
                         fit,
-                        toa_lsb_ps,
-                        cfg,
+                        timing_plot_path,
+                        dpi=int(cfg["plots"]["dpi"]),
+                        title=f"{run.run_id} — Pico-TDC timing fit",
+                        xlabel="ch7 − ch3 [ps]",
                     )
                     mark_stage(
                         state,

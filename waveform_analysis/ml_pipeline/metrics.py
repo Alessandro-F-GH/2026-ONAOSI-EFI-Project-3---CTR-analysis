@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import sys
+
 from typing import Any
 
 import numpy as np
 
-from utils.fit import FitResult, fit_delta_times_integer_fs
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from utils_fit import FitResult, fit_delta_times_integer_fs
 
 
 def fit_times_ps(values_ps: np.ndarray, method: str, fit_config: dict[str, Any]) -> FitResult:

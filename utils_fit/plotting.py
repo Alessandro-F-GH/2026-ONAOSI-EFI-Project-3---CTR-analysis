@@ -10,14 +10,14 @@ from .gaussian import FitResult
 
 
 def plot_gaussian_fit(
-    result: FitResult,
+    result: FitResult | None,
     path: str | Path,
     *,
     dpi: int = 180,
     title: str | None = None,
     xlabel: str = "Time difference [ps]",
 ) -> None:
-    if not result.success or result.edges_ps.size < 2:
+    if result is None or not result.success or result.edges_ps.size < 2:
         return
     edges = np.asarray(result.edges_ps, dtype=np.float64)
     counts = np.asarray(result.counts, dtype=np.float64)

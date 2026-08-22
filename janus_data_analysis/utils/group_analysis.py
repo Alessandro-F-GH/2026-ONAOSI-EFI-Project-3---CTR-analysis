@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import hashlib
 import math
 import os
@@ -10,6 +12,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from utils_fit import fit_delta_times_ps
+from utils_fit.io import load_fit_csv, write_fit_csv
+from utils_fit.plotting import plot_gaussian_fit
 
 from .binary_io import (
     HEADER_SIZE,
@@ -25,7 +35,6 @@ from .binary_io import (
 from .cache import load_state, mark_stage, save_state, signature, stage_valid_any
 from .config import stage_config
 from .tabular import table_path
-from .fitting import fit_timing, load_fit_csv, write_fit_csv
 from .matching import (
     MatchingSamples,
     load_model,
@@ -51,7 +60,6 @@ from .plotting import (
     plot_matching_total,
     plot_matching_training,
     plot_peak_selection,
-    plot_timing_fit,
 )
 from .preprocessing import preprocess_binary, preprocess_streaming_from_index
 from .selection import (
@@ -126,6 +134,7 @@ GROUP_SUMMARY_FIELDS = [
     "AcquisitionMode",
     "E_th",
     "T_th",
+    "fit_metric",
     "measurement_mode",
     "toa_lsb_ps",
     "tot_lsb_ps",
@@ -776,6 +785,7 @@ def _build_summary_row(
         "AcquisitionMode": first.acquisition_mode,
         "E_th": first.energy_threshold_mv,
         "T_th": first.timing_threshold_mv,
+        "fit_metric": "common_bin_integrated_gaussian_all_events",
         "measurement_mode": first.measurement_mode,
         "toa_lsb_ps": first.toa_lsb_ps,
         "tot_lsb_ps": first.tot_lsb_ps,
@@ -802,18 +812,18 @@ def _build_summary_row(
         "average_delay_b_std_ps": model_b.delay_std_lsb * toa_lsb_ps,
         "average_delay_b_training_events": model_b.training_samples,
         "fit_success": int(bool(fit.success)),
-        "fit_status": fit.status,
-        "gaussian_area_events": _finite_number(fit.area_events),
-        "gaussian_area_error_events": _finite_number(fit.area_error_events),
-        "gaussian_mean_ps": _finite_number(fit.mean_lsb * toa_lsb_ps),
-        "gaussian_mean_error_ps": _finite_number(fit.mean_error_lsb * toa_lsb_ps),
-        "gaussian_sigma_ps": _finite_number(fit.sigma_lsb * toa_lsb_ps),
-        "gaussian_sigma_error_ps": _finite_number(fit.sigma_error_lsb * toa_lsb_ps),
-        "CTR_ps": _finite_number(2.355 * fit.sigma_lsb * toa_lsb_ps),
-        "CTR_error_ps": _finite_number(2.355 * fit.sigma_error_lsb * toa_lsb_ps),
-        "chi_square": _finite_number(fit.chi_square),
+        "fit_status": "success" if fit.success else str(fit.message),
+        "gaussian_area_events": _finite_number(fit.n_fit),
+        "gaussian_area_error_events": "",
+        "gaussian_mean_ps": _finite_number(fit.mean_ps),
+        "gaussian_mean_error_ps": _finite_number(fit.mean_error_ps),
+        "gaussian_sigma_ps": _finite_number(fit.sigma_ps),
+        "gaussian_sigma_error_ps": _finite_number(fit.sigma_error_ps),
+        "CTR_ps": _finite_number(fit.ctr_ps),
+        "CTR_error_ps": _finite_number(fit.ctr_error_ps),
+        "chi_square": _finite_number(fit.chi2),
         "ndof": fit.ndof,
-        "reduced_chi_square": _finite_number(fit.reduced_chi_square),
+        "reduced_chi_square": _finite_number(fit.chi2_ndof),
         "average_delay_corrected_alignments": count_model_corrected_alignments(
             matching_total_rows,
             center_a_lsb=selection.alignment_a_center_lsb,
@@ -1336,7 +1346,20 @@ def run_compatible_group_analysis(
         _log(name, "fit", "SKIPPED — cached fit is valid")
     else:
         start = time.perf_counter()
-        fit = fit_timing(measurements.timing_lsb[selection.final_mask], cfg["fit"])
+        timing_ps = (
+            measurements.timing_lsb[selection.final_mask].astype(np.float64)
+            * float(first.toa_lsb_ps)
+        )
+        fit = fit_delta_times_ps(
+            timing_ps,
+            method="Pico-TDC LED grouped",
+            parameter=float(first.timing_threshold_mv),
+            n_total=int(measurements.size),
+            n_selected=int(np.count_nonzero(selection.final_mask)),
+            config=cfg["fit"],
+        )
+        if not fit.success:
+            raise RuntimeError(f"Common Gaussian fit failed: {fit.message}")
         write_fit_csv(
             fit_path, fit, cfg["analysis_output"]["diagnostic_mode"]
         )
@@ -1351,8 +1374,12 @@ def run_compatible_group_analysis(
         if overwrite or not stage_valid_any(
             state, "plot_timing_fit", [plot_signature], [timing_plot_path]
         ):
-            plot_timing_fit(
-                timing_plot_path, name, fit, first.toa_lsb_ps, cfg
+            plot_gaussian_fit(
+                fit,
+                timing_plot_path,
+                dpi=int(cfg["plots"]["dpi"]),
+                title=f"{name} — Pico-TDC grouped timing fit",
+                xlabel="ch7 − ch3 [ps]",
             )
             mark_stage(
                 state,

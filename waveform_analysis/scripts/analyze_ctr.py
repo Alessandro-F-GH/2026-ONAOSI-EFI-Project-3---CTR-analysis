@@ -10,11 +10,15 @@ from typing import Any
 import numpy as np
 
 PROJECT = Path(__file__).resolve().parents[1]
+REPO_ROOT = PROJECT.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
 from utils.config import config_copy, load_config
-from utils.fit import FitResult, choose_best, scan_timing_grid
+from utils_fit import FitResult, choose_best, scan_timing_grid
+from utils_fit.plotting import plot_gaussian_fit
 from utils.io import event_count, read_metadata
 from utils.pipeline import (
     build_selection,
@@ -23,7 +27,6 @@ from utils.pipeline import (
     save_features,
 )
 from utils.plots import (
-    plot_best_fit,
     plot_energy_correlation,
     plot_energy_photopeaks,
     plot_noise_distributions,
@@ -190,7 +193,7 @@ def main() -> None:
 
     timing_channel_numbers = [int(item) + 1 for item in timing_channels]
     if best_led is not None:
-        plot_best_fit(best_led, args.output / "best_led_fit.png", dpi=dpi)
+        plot_gaussian_fit(best_led, args.output / "best_led_fit.png", dpi=dpi)
         led_index = _index_of_parameter(led_parameters, best_led.parameter)
         plot_toa_for_parameter(
             features["t_led_a_fs"],
@@ -204,7 +207,7 @@ def main() -> None:
             bins=int(plot_config["toa_bins"]),
         )
     if best_cfd is not None:
-        plot_best_fit(best_cfd, args.output / "best_cfd_fit.png", dpi=dpi)
+        plot_gaussian_fit(best_cfd, args.output / "best_cfd_fit.png", dpi=dpi)
         cfd_index = _index_of_parameter(cfd_parameters, best_cfd.parameter)
         plot_toa_for_parameter(
             features["t_cfd_a_fs"],

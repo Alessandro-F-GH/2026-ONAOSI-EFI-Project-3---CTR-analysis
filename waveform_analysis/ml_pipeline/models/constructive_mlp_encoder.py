@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import copy
 import hashlib
 import math
@@ -8,11 +10,14 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 import torch
 from torch import nn
 
-from utils.plots import plot_best_fit
-
+from utils_fit.plotting import plot_gaussian_fit
 from ..common import atomic_json, write_csv_rows
 from ..losses import mse_residual_loss, var_bias_loss, var_bias_value_from_metrics
 from ..plots import plot_training_history
@@ -806,12 +811,12 @@ def train(context: TrainingContext) -> dict[str, Any]:
             context.plot_dir / "constructive_growth.png",
             dpi,
         )
-        plot_best_fit(
+        plot_gaussian_fit(
             train_fit,
             context.plot_dir / "best_train_gaussian_fit.png",
             dpi=dpi,
         )
-        plot_best_fit(
+        plot_gaussian_fit(
             validation_fit,
             context.plot_dir / "best_validation_gaussian_fit.png",
             dpi=dpi,

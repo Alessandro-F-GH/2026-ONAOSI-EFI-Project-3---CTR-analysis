@@ -71,7 +71,14 @@
     "convergence_tolerance_ps": 0.01,
     "min_events": 100,
     "minimum_fit_bins": 9,
-    "minimum_sigma_bins": 0.5
+    "minimum_sigma_bins": 0.5,
+    "adaptive_binning": {
+      "enabled": true,
+      "bins_per_fwhm": 10.0,
+      "min_bin_ps": 1.0,
+      "max_bin_ps": 25.0,
+      "phase_count": 8
+    }
   },
   "plot": {
     "dpi": 180,

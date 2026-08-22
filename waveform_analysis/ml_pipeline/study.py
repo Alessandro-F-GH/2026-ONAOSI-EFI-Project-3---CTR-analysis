@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import copy
 import csv
 import gc
@@ -16,12 +18,16 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 import torch
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
-from utils.fit import FitResult
+from utils_fit import FitResult
 from .common import atomic_json, canonical_hash
 from .dataset import PreparedDataset
 from .metrics import FWHM_PER_SIGMA, ctr_bootstrap_uncertainty, fit_times_ps, residual_metrics

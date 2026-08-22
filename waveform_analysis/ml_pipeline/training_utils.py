@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import sys
+
 from typing import Any
 
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 import torch
 from torch.utils.data import ConcatDataset, DataLoader
 
-from utils.fit import FitResult
-
+from utils_fit import FitResult
 from .dataset import PreparedDataset
 from .metrics import FWHM_PER_SIGMA, distribution_metrics, fit_times_ps
 from .torch_data import CorrectionDataset, Normalization

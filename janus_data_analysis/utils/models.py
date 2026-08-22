@@ -131,24 +131,3 @@ class SelectionResult:
     alignment_a_scale_lsb: float
     alignment_b_center_lsb: float
     alignment_b_scale_lsb: float
-
-
-@dataclass(slots=True, frozen=True)
-class FitResult:
-    success: bool
-    status: str
-    area_events: float
-    area_error_events: float
-    mean_lsb: float
-    mean_error_lsb: float
-    sigma_lsb: float
-    sigma_error_lsb: float
-    fit_low_lsb: float
-    fit_high_lsb: float
-    bin_width_lsb: int
-    histogram_edges_lsb: np.ndarray
-    histogram_counts: np.ndarray
-    expected_counts: np.ndarray
-    chi_square: float
-    ndof: int
-    reduced_chi_square: float

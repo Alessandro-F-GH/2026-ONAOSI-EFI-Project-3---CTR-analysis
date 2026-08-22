@@ -9,7 +9,6 @@ import numpy as np
 from .models import (
     EnergyMeasurements,
     EnergySelectionResult,
-    FitResult,
     Measurements,
     SelectionResult,
 )
@@ -69,93 +68,6 @@ def plot_peak_selection(
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=int(cfg["plots"]["dpi"]))
     plt.close(fig)
-
-
-def plot_timing_fit(
-    path: str | Path,
-    run_id: str,
-    fit: FitResult,
-    toa_lsb_ps: float,
-    cfg: dict,
-) -> None:
-    edges_ps = fit.histogram_edges_lsb * toa_lsb_ps
-    widths_ps = np.diff(edges_ps)
-    fit_low_ps = fit.fit_low_lsb * toa_lsb_ps
-    fit_high_ps = fit.fit_high_lsb * toa_lsb_ps
-    bin_width_ps = float(np.median(widths_ps)) if widths_ps.size else toa_lsb_ps
-    fit_width_ps = max(fit_high_ps - fit_low_ps, bin_width_ps)
-    margin_ps = max(0.08 * fit_width_ps, 2.0 * bin_width_ps)
-    plot_low_ps = fit_low_ps - margin_ps
-    plot_high_ps = fit_high_ps + margin_ps
-
-    mean_ps = fit.mean_lsb * toa_lsb_ps
-    sigma_ps = fit.sigma_lsb * toa_lsb_ps
-    ctr_ps = 2.355 * sigma_ps
-    x_grid_ps = np.linspace(plot_low_ps, plot_high_ps, 1200)
-    sigma_lsb = max(float(fit.sigma_lsb), 1e-12)
-    x_grid_lsb = x_grid_ps / toa_lsb_ps
-    gaussian_counts = (
-        fit.area_events
-        * fit.bin_width_lsb
-        / (math.sqrt(2.0 * math.pi) * sigma_lsb)
-        * np.exp(-0.5 * ((x_grid_lsb - fit.mean_lsb) / sigma_lsb) ** 2)
-    )
-
-    if math.isfinite(fit.reduced_chi_square):
-        quality = f"χ²/ndof={fit.reduced_chi_square:.1f}"
-    else:
-        quality = "χ²/ndof=n/a"
-    fit_label = (
-        "Gaussian fit\n"
-        f"A={fit.area_events:.1f} ev\n"
-        f"μ={mean_ps:.1f} ps\n"
-        f"σ={sigma_ps:.1f} ps\n"
-        f"CTR={ctr_ps:.1f} ps\n"
-        f"{quality}"
-    )
-    plt.rcParams.update({'font.size': 16})
-    fig, axis = plt.subplots(figsize=(9.0, 5.8))
-    histogram = axis.bar(
-        edges_ps[:-1],
-        fit.histogram_counts,
-        width=widths_ps,
-        align="edge",
-        alpha=0.65,
-        color="tab:blue",
-        label="Data",
-    )
-    fit_interval = axis.axvspan(
-        fit_low_ps,
-        fit_high_ps,
-        alpha=0.12,
-        color="tab:green",
-        label="Fit range",
-    )
-    gaussian_line, = axis.plot(
-        x_grid_ps,
-        gaussian_counts,
-        linewidth=2.2,
-        color="tab:orange",
-        label=fit_label,
-    )
-    axis.set_xlim(plot_low_ps, plot_high_ps)
-    axis.set_xlabel("ch7 − ch3 [ps]")
-    axis.set_ylabel("Events")
-    axis.set_title(f"{run_id} — Timing fit")
-    axis.grid(alpha=0.2)
-
-    plot_legend = axis.legend(
-        handles=[histogram, fit_interval],
-        loc="upper left",
-    )
-    axis.add_artist(plot_legend)
-    axis.legend(handles=[gaussian_line], loc="upper right")
-
-    fig.tight_layout()
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=int(cfg["plots"]["dpi"]))
-    plt.close(fig)
-
 
 def _matching_annotation(model) -> str:
     return (
