@@ -32,10 +32,10 @@
     "top_corrections_k": 3,
     "worst_corrections_k": 3,
     "ctr_uncertainty_bootstrap_samples": 1000,
-    "window_scan_bars": false,
+    "window_scan_bars": true,
     "xai": {
-      "enabled": false,
-      "max_events": 512,
+      "enabled": true,
+      "max_events": 1024,
       "integrated_gradient_steps": 16
     }
   },

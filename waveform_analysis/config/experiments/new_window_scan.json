@@ -1,0 +1,95 @@
+{
+  "extends": "../profiles/ctr_default.json",
+  "data_config": "../data/converted_runs_07_13.json",
+  "preprocessing_config": "../preprocessing/default_ctr.json",
+
+  "experiment": {
+    "name": "window_scan_new",
+    "output_dir": "results/studies/window_scan_new"
+  },
+
+  "models": ["linear_svr"],
+
+  "modes": {
+    "energy_to_energy": {
+      "enabled": true,
+      "cfd": true
+    },
+    "energy_to_timing": {
+      "enabled": false,
+      "cfd": false
+    },
+    "timing_to_timing": {
+      "enabled": true,
+      "cfd": false
+    }
+  },
+
+  "windows_ns": [
+    {
+      "id": "m2_p0",
+      "start_ns": -2.0,
+      "end_ns": 0.0
+    },
+    {
+      "id": "m2_p1",
+      "start_ns": -2.0,
+      "end_ns": 1.0
+    },
+    {
+      "id": "m2_p3",
+      "start_ns": -2.0,
+      "end_ns": 3.0
+    },
+    {
+      "id": "m2_p10",
+      "start_ns": -2.0,
+      "end_ns": 10.0
+    },
+    {
+      "id": "m2_p15",
+      "start_ns": -2.0,
+      "end_ns": 15.0
+    },
+    {
+      "id": "m2_p20",
+      "start_ns": -2.0,
+      "end_ns": 20.0
+    },
+    {
+      "id": "m2_p25",
+      "start_ns": -2.0,
+      "end_ns": 25.0
+    },
+    {
+      "id": "m2_p30",
+      "start_ns": -2.0,
+      "end_ns": 30.0
+    },
+    {
+      "id": "m2_p35",
+      "start_ns": -2.0,
+      "end_ns": 35.0
+    },
+    {
+      "id": "m2_p40",
+      "start_ns": -2.0,
+      "end_ns": 40.0
+    },
+    {
+      "id": "m2_p50",
+      "start_ns": -2.0,
+      "end_ns": 50.0
+    },
+    {
+      "id": "m2_p60",
+      "start_ns": -2.0,
+      "end_ns": 60.0
+    }
+  ],
+
+  "multithreshold": {
+    "enabled": false
+  }
+  
+}

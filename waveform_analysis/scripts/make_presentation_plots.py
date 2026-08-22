@@ -450,62 +450,281 @@ def plot_timing_waveform_example(
     ax.grid(alpha=0.20)
     _save(fig, output / "data_timing_waveform_example.pdf", dpi)
 
-
 def plot_led_cfd_example(
-    dataset: PreparedDataset, event: int, output: Path, dpi: int, detector: int = 0
+    dataset: PreparedDataset,
+    event: int,
+    output: Path,
+    dpi: int,
 ) -> None:
     if dataset.energy_led_time_fs is None or dataset.energy_cfd_time_fs is None:
         raise RuntimeError("Prepared dataset has no energy LED/CFD timestamps")
+
     anchors = dataset.energy_window_anchor_time_fs
     if anchors is None:
         anchors = dataset.window_anchor_time_fs
     if anchors is None:
         raise RuntimeError("Prepared dataset has no energy window-anchor timestamps")
 
+    # ------------------------------------------------------------------
+    # Waveforms
+    # ------------------------------------------------------------------
     t_ps = np.asarray(dataset.relative_time_ps, dtype=np.float64)
     t_ns = t_ps / 1000.0
-    y = np.asarray(dataset.windows_mV[event, detector], dtype=np.float64)
 
+    waves = np.asarray(dataset.windows_mV[event], dtype=np.float64)
+    y1 = waves[0]
+    y2 = waves[1]
+
+    # ------------------------------------------------------------------
+    # LED / CFD settings
+    # ------------------------------------------------------------------
     led_threshold = _energy_led_threshold(dataset)
     cfd_fraction = _energy_cfd_fraction(dataset)
-    amplitude = float(np.asarray(dataset.amplitude_mV)[event, detector])
-    cfd_threshold = amplitude * cfd_fraction
 
-    anchor_fs = float(np.asarray(anchors)[event, detector])
-    led_ns = (
-        float(np.asarray(dataset.energy_led_time_fs)[event, detector]) - anchor_fs
-    ) / 1.0e6
-    cfd_ns = (
-        float(np.asarray(dataset.energy_cfd_time_fs)[event, detector]) - anchor_fs
-    ) / 1.0e6
+    amplitude = np.asarray(dataset.amplitude_mV, dtype=np.float64)
+    cfd_threshold_1 = float(amplitude[event, 0]) * cfd_fraction
+    cfd_threshold_2 = float(amplitude[event, 1]) * cfd_fraction
 
-    left, right = _crossing_xlim(
-        [led_ns * 1000.0, cfd_ns * 1000.0],
-        t_ps,
-        pad_before_ns=0.7,
-        pad_after_ns=1.2,
+    anchor_fs = np.asarray(anchors, dtype=np.float64)[event]
+    led_fs = np.asarray(dataset.energy_led_time_fs, dtype=np.float64)[event]
+    cfd_fs = np.asarray(dataset.energy_cfd_time_fs, dtype=np.float64)[event]
+
+    # ------------------------------------------------------------------
+    # Common event-time reference
+    #
+    # Prepared waveforms are expressed relative to their own native anchors.
+    # Shift both onto the same time axis so their actual timing separation
+    # is visible.
+    # ------------------------------------------------------------------
+    reference_fs = 0.5 * (float(led_fs[0]) + float(led_fs[1]))
+
+    x1_ns = t_ns + (float(anchor_fs[0]) - reference_fs) / 1.0e6
+    x2_ns = t_ns + (float(anchor_fs[1]) - reference_fs) / 1.0e6
+
+    led_1_ns = (float(led_fs[0]) - reference_fs) / 1.0e6
+    led_2_ns = (float(led_fs[1]) - reference_fs) / 1.0e6
+
+    cfd_1_ns = (float(cfd_fs[0]) - reference_fs) / 1.0e6
+    cfd_2_ns = (float(cfd_fs[1]) - reference_fs) / 1.0e6
+
+    # ------------------------------------------------------------------
+    # Compact presentation window around all four crossings
+    # ------------------------------------------------------------------
+    crossings_ns = np.asarray(
+        [led_1_ns, led_2_ns, cfd_1_ns, cfd_2_ns],
+        dtype=np.float64,
     )
-    local = (t_ns >= left) & (t_ns <= right)
-    local_peak = float(np.nanmax(y[local])) if np.any(local) else float(np.nanmax(y))
 
-    fig, ax = plt.subplots(figsize=(8.8, 4.1))
-    ax.plot(t_ns, y, linewidth=1.8, label="energy waveform")
-    ax.axhline(led_threshold, linestyle="--", linewidth=1.2,
-               label=f"LED threshold ({led_threshold:g} mV)")
-    ax.axhline(cfd_threshold, linestyle=":", linewidth=1.4,
-               label=f"CFD level ({100*cfd_fraction:g}% amplitude)")
-    ax.scatter([led_ns], [led_threshold], s=46, zorder=5, label="LED crossing")
-    ax.scatter([cfd_ns], [cfd_threshold], s=46, zorder=5, marker="s", label="CFD crossing")
+    left = float(np.min(crossings_ns)) - 0.20
+    right = float(np.max(crossings_ns)) + 0.10
+
+    # Do not exceed available waveform support.
+    left = max(left, float(min(np.nanmin(x1_ns), np.nanmin(x2_ns))))
+    right = min(right, float(max(np.nanmax(x1_ns), np.nanmax(x2_ns))))
+
+    local1 = (x1_ns >= left) & (x1_ns <= right)
+    local2 = (x2_ns >= left) & (x2_ns <= right)
+
+    local_min = min(
+        0.0,
+        float(np.nanmin(y1[local1])) if np.any(local1) else float(np.nanmin(y1)),
+        float(np.nanmin(y2[local2])) if np.any(local2) else float(np.nanmin(y2)),
+    )
+
+    local_max = max(
+        float(np.nanmax(y1[local1])) if np.any(local1) else float(np.nanmax(y1)),
+        float(np.nanmax(y2[local2])) if np.any(local2) else float(np.nanmax(y2)),
+        led_threshold,
+        cfd_threshold_1,
+        cfd_threshold_2,
+    )
+
+    amplitude_span = max(1.0, local_max - local_min)
+
+    # Extra vertical space for Δt annotations.
+    ymin = local_min - 0.06 * amplitude_span
+    ymax = local_max - 0.1 * amplitude_span
+
+    # ------------------------------------------------------------------
+    # Colors
+    # ------------------------------------------------------------------
+    waveform_1_color = "tab:blue"
+    waveform_2_color = "tab:orange"
+
+    # Crossing/estimator colors deliberately differ from waveform colors.
+    led_color = "crimson"
+    cfd_color = "forestgreen"
+
+    # ------------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(9.2, 4.7))
+
+    ax.plot(
+        x1_ns,
+        y1,
+        linewidth=1.9,
+        color=waveform_1_color,
+        label="Detector 1 waveform",
+        zorder=2,
+    )
+    ax.plot(
+        x2_ns,
+        y2,
+        linewidth=1.9,
+        color=waveform_2_color,
+        label="Detector 2 waveform",
+        zorder=2,
+    )
+
+    # ------------------------------------------------------------------
+    # LED threshold + crossings
+    # ------------------------------------------------------------------
+    ax.axhline(
+        led_threshold,
+        linestyle="--",
+        linewidth=1.25,
+        color=led_color,
+        alpha=0.85,
+        label=f"LED threshold ({led_threshold:g} mV)",
+        zorder=1,
+    )
+
+    ax.scatter(
+        [led_1_ns, led_2_ns],
+        [led_threshold, led_threshold],
+        s=60,
+        marker="o",
+        color=led_color,
+        edgecolors="white",
+        linewidths=0.8,
+        zorder=6,
+        label="LED crossings",
+    )
+
+    # ------------------------------------------------------------------
+    # CFD crossings
+    # ------------------------------------------------------------------
+    ax.scatter(
+        [cfd_1_ns, cfd_2_ns],
+        [cfd_threshold_1, cfd_threshold_2],
+        s=60,
+        marker="s",
+        color=cfd_color,
+        edgecolors="white",
+        linewidths=0.8,
+        zorder=6,
+        label="CFD crossings",
+    )
+
+    # ------------------------------------------------------------------
+    # Vertical guides from the crossing points
+    # ------------------------------------------------------------------
+    for x in (led_1_ns, led_2_ns):
+        ax.vlines(
+            x,
+            ymin,
+            led_threshold,
+            color=led_color,
+            linestyle="--",
+            linewidth=2,
+            alpha=0.45,
+            zorder=0,
+        )
+
+    for x, level in (
+        (cfd_1_ns, cfd_threshold_1),
+        (cfd_2_ns, cfd_threshold_2),
+    ):
+        ax.vlines(
+            x,
+            ymin,
+            level,
+            color=cfd_color,
+            linestyle=":",
+            linewidth=2,
+            alpha=0.45,
+            zorder=0,
+        )
+
+    # ------------------------------------------------------------------
+    # Explicit Δt_LED and Δt_CFD annotations
+    # ------------------------------------------------------------------
+    y_led_arrow = 1
+    y_cfd_arrow = 2
+
+    ax.annotate(
+        "",
+        xy=(led_1_ns, y_led_arrow),
+        xytext=(led_2_ns, y_led_arrow),
+        arrowprops=dict(
+            arrowstyle="<->",
+            color=led_color,
+            linewidth=1.7,
+        ),
+        zorder=5,
+    )
+
+    ax.text(
+        0.5 * (led_1_ns + led_2_ns),
+        y_led_arrow + 0.025 * amplitude_span,
+        r"$\Delta t_{\mathrm{LED}}$",
+        color=led_color,
+        ha="center",
+        va="bottom",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    ax.annotate(
+        "",
+        xy=(cfd_1_ns, y_cfd_arrow),
+        xytext=(cfd_2_ns, y_cfd_arrow),
+        arrowprops=dict(
+            arrowstyle="<->",
+            color=cfd_color,
+            linewidth=1.7,
+        ),
+        zorder=5,
+    )
+
+    ax.text(
+        0.5 * (cfd_1_ns + cfd_2_ns),
+        y_cfd_arrow + 0.025 * amplitude_span,
+        r"$\Delta t_{\mathrm{CFD}}$",
+        color=cfd_color,
+        ha="center",
+        va="bottom",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    # ------------------------------------------------------------------
+    # Final formatting
+    # ------------------------------------------------------------------
     ax.set_xlim(left, right)
-    lower = min(0.0, float(np.nanmin(y[local])) if np.any(local) else 0.0)
-    upper = max(local_peak, led_threshold, cfd_threshold)
-    ax.set_ylim(lower - 0.08 * max(1.0, upper - lower), upper * 1.10)
-    ax.set_xlabel("Time relative to native LED anchor [ns]")
+    ax.set_ylim(ymin, ymax)
+
+    ax.set_xlabel("Time [ns]")
     ax.set_ylabel("Voltage [mV]")
-    ax.set_title("LED and CFD: interpolated crossings on the rising edge")
-    ax.grid(alpha=0.20)
-    ax.legend(frameon=False, ncol=2)
-    _save(fig, output / "led_cfd_waveform_schematic.pdf", dpi)
+    ax.set_title("LED/CFD timing example")
+
+    ax.grid(alpha=0.18)
+
+    ax.legend(
+        frameon=False,
+        loc="upper left",
+        ncol=2,
+        fontsize=9,
+        columnspacing=1.0,
+        handlelength=2.0,
+    )
+
+    _save(
+        fig,
+        output / "led_cfd_waveform_schematic.pdf",
+        dpi,
+    )
 
 def _selected_window_from_run(
     run_manifest: dict[str, Any], rows: list[dict[str, str]], dataset: PreparedDataset
