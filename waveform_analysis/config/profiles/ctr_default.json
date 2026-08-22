@@ -1,0 +1,45 @@
+{
+  "model_spaces_dir": "config/model_spaces",
+  "validation": {
+    "strategy": "holdout",
+    "seed": 20260813,
+    "blind_fraction": 0.2,
+    "holdout_fraction": 0.2,
+    "early_stop_fraction": 0.15,
+    "n_splits": 5,
+    "nested": {
+      "outer_folds": 5,
+      "inner_strategy": "holdout",
+      "inner_holdout_fraction": 0.2,
+      "inner_folds": 5
+    }
+  },
+  "fit": {
+    "min_events": 100,
+    "adaptive_binning": {
+      "enabled": true,
+      "bins_per_fwhm": 10.0,
+      "min_bin_ps": 1.0,
+      "max_bin_ps": 25.0,
+      "phase_count": 8
+    }
+  },
+  "reporting": {
+    "dpi": 180,
+    "voltage_pattern": "(?P<voltage>\\d+(?:\\.\\d+)?)V",
+    "save_final_fit_plots": true,
+    "max_ctr_to_led_ratio": 1.5,
+    "top_corrections_k": 3,
+    "worst_corrections_k": 3,
+    "ctr_uncertainty_bootstrap_samples": 1000,
+    "window_scan_bars": false,
+    "xai": {
+      "enabled": false,
+      "max_events": 512,
+      "integrated_gradient_steps": 16
+    }
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}

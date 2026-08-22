@@ -1,0 +1,12 @@
+{
+  "root_folder": "processed_data/converted_runs_07-13",
+  "root_glob": "*-*.root",
+  "recursive": false,
+  "true_tof_ps": 0.0,
+  "channels": {
+    "energy": [1, 2],
+    "polarities": [1, 1],
+    "timing": [3, 4],
+    "timing_polarities": [1, 1]
+  }
+}

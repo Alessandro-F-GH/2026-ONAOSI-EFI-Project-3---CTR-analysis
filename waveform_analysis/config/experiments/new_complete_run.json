@@ -1,0 +1,120 @@
+{
+  "experiment": {
+    "name": "fixed_window_additive_example",
+    "output_dir": "results/studies/fixed_window_additive_example"
+  },
+  "data": {
+    "root_folder": "processed_data/converted_runs_07-13",
+    "root_glob": "*V-*.root",
+    "recursive": false,
+    "true_tof_ps": 0.0,
+    "channels": {
+      "energy": [1, 2],
+      "polarities": [1, 1],
+      "timing": [3, 4],
+      "timing_polarities": [1, 1]
+    }
+  },
+  "modes": {
+    "energy_to_energy": {
+      "enabled": true,
+      "cfd": true
+    },
+    "energy_to_timing": {
+      "enabled": false,
+      "cfd": false
+    },
+    "timing_to_timing": {
+      "enabled": true,
+      "cfd": false
+    }
+  },
+  "models": ["linear_svr", "cnn"],
+  "model_spaces_dir": "config/model_spaces",
+  "windows_ns": [
+    {"id": "m2_p60", "start_ns": -2.0, "end_ns": 60.0}
+  ],
+  "preprocessing": {
+    "selection_store_dir": "processed_data/selected_events",
+    "prepared_dir": "processed_data/ml_prepared",
+    "materialized_window_ns": {"before": 5.0, "after": 60.0},
+    "input_variant_by_channel": {"energy": "denoised", "timing": "raw"},
+    "subsampling_factors": [8],
+    "common": {
+    "baseline_samples": 500,
+    "search_trigger_threshold_mV": 50.0,
+    "analysis_crop_ns": {
+      "before": 5.0,
+      "after": 60.0
+    }
+  },
+    "timing": {"search_trigger_threshold_mV": 100.0},
+    "selection": {
+      "baseline_rmse_robust_z": 5.0,
+      "minimum_events": 500,
+      "led_outlier_rejection": {"enabled": true, "zscore_limit": 4.0}
+    },
+    "photopeak": {
+      "enabled": true,
+      "histogram_bin_mV": 1.0,
+      "search_quantile_min": 0.2,
+      "smoothing_sigma_bins": 2.0,
+      "initial_half_width_mV": 15.0,
+      "iteration_sigma": 2.5,
+      "max_iterations": 6,
+      "convergence_tolerance_mV": 0.01,
+      "selection_sigma_low": -2.0,
+      "selection_sigma_high": 4.0
+    },
+    "denoising": {
+      "enabled": true,
+      "method": "butterworth_lowpass",
+      "cutoff_GHz": 1.0,
+      "order": 4
+    }
+  },
+  "validation": {
+    "strategy": "holdout",
+    "seed": 20260813,
+    "blind_fraction": 0.2,
+    "holdout_fraction": 0.2,
+    "early_stop_fraction": 0.15,
+    "n_splits": 5
+  },
+  "fit": {
+    "min_events": 100,
+    "adaptive_binning": {
+      "enabled": true,
+      "bins_per_fwhm": 10.0,
+      "min_bin_ps": 1.0,
+      "max_bin_ps": 25.0,
+      "phase_count": 8
+    }
+  },
+  "multithreshold": {
+    "enabled": true,
+    "window_id": "m2_p60",
+    "thresholds_mV": [5.0, 10.0, 20.0, 50.0, 100.0],
+    "min_thresholds": 5,
+    "max_thresholds": 5,
+    "kernels": ["linear", "rbf"],
+    "C_values": [1.0, 10.0, 100.0],
+    "epsilon_values_ps": [0.0, 10.0, 20.0, 30.0, 40.0],
+    "gamma_values": ["scale"]
+  },
+  "reporting": {
+    "dpi": 180,
+    "save_final_fit_plots": true,
+    "max_ctr_to_led_ratio": 1.5,
+    "top_corrections_k": 3,
+    "worst_corrections_k": 3,
+    "ctr_uncertainty_bootstrap_samples": 1000,
+    "window_scan_bars": false,
+    "xai": {
+      "enabled": false,
+      "max_events": 512,
+      "integrated_gradient_steps": 16
+    }
+  },
+  "logging": {"level": "INFO"}
+}

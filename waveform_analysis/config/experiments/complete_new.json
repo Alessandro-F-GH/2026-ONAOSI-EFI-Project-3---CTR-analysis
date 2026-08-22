@@ -1,0 +1,54 @@
+{
+  "extends": "../profiles/ctr_default.json",
+  "data_config": "../data/converted_runs_07_13.json",
+  "preprocessing_config": "../preprocessing/default_ctr.json",
+
+  "experiment": {
+    "name": "complete_new",
+    "output_dir": "results/studies/complete_new_07-13"
+  },
+
+  "models": ["linear_svr", "cnn"],
+
+  "modes": {
+    "energy_to_energy": {
+      "enabled": true,
+      "cfd": true
+    },
+    "energy_to_timing": {
+      "enabled": false,
+      "cfd": false
+    },
+    "timing_to_timing": {
+      "enabled": true,
+      "cfd": false
+    }
+  },
+
+  "windows_ns": [
+    {
+      "id": "m2_p60",
+      "start_ns": -2.0,
+      "end_ns": 60.0
+    }
+  ],
+
+  "multithreshold": {
+    "enabled": true,
+    "window_id": "m2_p60",
+    "thresholds_mV": [5.0, 10.0, 20.0, 50.0, 100.0],
+    "min_thresholds": 1,
+    "max_thresholds": 5,
+    "kernels": ["linear", "rbf"],
+    "C_values": [1.0, 100.0],
+    "epsilon_values_ps": [0.0, 60.0],
+    "gamma_values": ["scale"],
+    "chunk_size": 2048
+  },
+
+  "reporting": {
+    "xai": {
+      "enabled": true
+    }
+  }
+}

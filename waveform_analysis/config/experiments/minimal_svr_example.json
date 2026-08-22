@@ -1,0 +1,19 @@
+{
+  "extends": "../profiles/ctr_default.json",
+  "data_config": "../data/converted_runs_07_13.json",
+  "preprocessing_config": "../preprocessing/default_ctr.json",
+
+  "experiment": {
+    "name": "svr_m2_p60",
+    "output_dir": "results/studies/svr_m2_p60"
+  },
+
+  "models": ["linear_svr"],
+  "modes": {
+    "energy_to_energy": {"enabled": true, "cfd": true},
+    "timing_to_timing": {"enabled": true, "cfd": false}
+  },
+  "windows_ns": [
+    {"id": "m2_p60", "start_ns": -2.0, "end_ns": 60.0}
+  ]
+}

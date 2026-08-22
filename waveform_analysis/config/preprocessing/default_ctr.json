@@ -1,0 +1,68 @@
+{
+  "selection_store_dir": "processed_data/selected_events",
+  "prepared_dir": "processed_data/ml_prepared",
+  "materialized_window_ns": {
+    "before": 5.0,
+    "after": 60.0
+  },
+  "cleanup_raw_cache": true,
+  "materialization_chunk_size": 4096,
+  "input_variant_by_channel": {
+    "energy": "denoised",
+    "timing": "raw"
+  },
+  "subsampling_factors": [
+    1
+  ],
+  "common": {
+    "baseline_samples": 500,
+    "search_trigger_threshold_mV": 50.0,
+    "analysis_crop_ns": {
+      "before": 5.0,
+      "after": 60.0
+    },
+    "led_threshold_mV": 10.0,
+    "cfd_fraction": 0.045
+  },
+  "energy": {},
+  "timing": {
+    "search_trigger_threshold_mV": 100.0
+  },
+  "selection": {
+    "baseline_rmse_robust_z": 5.0,
+    "energy_trigger_index_range": null,
+    "minimum_events": 500,
+    "led_outlier_rejection": {
+      "enabled": true,
+      "zscore_limit": 4.0
+    }
+  },
+  "photopeak": {
+    "enabled": true,
+    "histogram_bin_mV": 1.0,
+    "search_quantile_min": 0.2,
+    "smoothing_sigma_bins": 2.0,
+    "initial_half_width_mV": 15.0,
+    "iteration_sigma": 2.5,
+    "max_iterations": 6,
+    "convergence_tolerance_mV": 0.01,
+    "selection_sigma_low": -2.0,
+    "selection_sigma_high": 4.0
+  },
+  "denoising": {
+    "enabled": true,
+    "method": "butterworth_lowpass",
+    "cutoff_GHz": 1.0,
+    "order": 4
+  },
+  "io": {
+    "step_size": "128 MB",
+    "max_events": 0,
+    "progress_every": 1000
+  },
+  "parallelization": {
+    "preprocessing_backend": "process",
+    "preprocessing_workers": 8,
+    "preprocessing_chunksize": 8
+  }
+}

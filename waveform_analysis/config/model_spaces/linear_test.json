@@ -1,5 +1,5 @@
 {
-  "id": "linear_svr",
+  "id": "linear_test",
   "model_type": "linear_svr",
   "base_train_config": {
     "model": {
@@ -39,19 +39,14 @@
         "type": "categorical",
         "values": [
           
-          1.0,
-          
-          100
-        ]
+          1.0
+                ]
       },
       "model.epsilon_values": {
         "type": "categorical",
         "values": [
           [
-            10.0
-          ],
-          [
-            60.0
+            0.0
           ]
         ]
       }
